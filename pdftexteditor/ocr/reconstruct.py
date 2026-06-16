@@ -36,6 +36,17 @@ _X_RATIO_SANS = 0.52       # x-height / em (Helvetica-class)
 _DEFAULT_GAP_EM = 0.06     # fallback inter-glyph gap
 _DEFAULT_SPACE_EM = 0.30   # fallback inter-word gap
 
+# An OCR line box bounds the recognized ink. A mixed-case line spans roughly the
+# whole em (ascender to descender); an all-caps line spans about the cap height
+# (~0.72 em). Sizing each line from its box height by these ratios is far more
+# reliable than the per-line x-height: on an all-caps or sparse line there are no
+# true x-height letters, so the connected-component "x-height" lands at cap
+# height and xh/x_ratio overestimates the em ~1.5-2x, rendering the line giant
+# and overlapping its neighbors. The x-height only refines the estimate when it
+# agrees with the box.
+_BOX_EM_MIXED = 0.98       # box height / em for a mixed-case line
+_BOX_EM_CAPS = 0.72        # box height / em for an all-caps line
+
 
 @dataclass
 class LineBox:
@@ -95,6 +106,26 @@ def _serif_guess(samples: "dict[str, GlyphSample]") -> bool:
     return statistics.median(contrasts) > 1.8
 
 
+def _line_em_px(box_h: float, text: str, x_height_px: float,
+                x_ratio: float) -> float:
+    """Estimate the font em (pixels) for one OCR line.
+
+    Anchored to the OCR box height, which is a reliable signal: an all-caps line
+    spans about the cap height (~0.72 em), a mixed-case line about the whole em.
+    The measured x-height refines the estimate ONLY on a mixed-case line where it
+    agrees with the box. Using x-height alone (the old behavior) over-sized
+    all-caps / sparse lines ~1.5-2x, because their connected-component "x-height"
+    lands at cap height, so the line rendered far taller than its box and
+    overlapped its neighbors."""
+    letters = [c for c in text if c.isalpha()]
+    caps = bool(letters) and sum(c.isupper() for c in letters) / len(letters) > 0.7
+    em_box = box_h / (_BOX_EM_CAPS if caps else _BOX_EM_MIXED)
+    em_xh = (x_height_px / x_ratio) if x_height_px else 0.0
+    if (not caps) and em_xh and 0.75 * em_box <= em_xh <= 1.25 * em_box:
+        return em_xh
+    return em_box
+
+
 def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
                      base_font_serif: str, base_font_sans: str,
                      family_label: str = "Scanned Text") -> "ReconResult | None":
@@ -128,19 +159,26 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
         seg = segment_line(strip, ln.text)
         if seg is None or not seg.words:
             continue
-        em_px = (seg.x_height_px / x_ratio) if seg.x_height_px else (y1i - y0i) * 0.8
+        em_px = _line_em_px(y1i - y0i, ln.text, seg.x_height_px, x_ratio)
         if em_px <= 1:
             continue
         em_list.append(em_px)
         if seg.space_px:
             space_em_list.append(seg.space_px / em_px)
-        first_x = seg.words[0].x0
-        origin_px = (x0i + first_x, y0i + seg.baseline_y)
-        # Cover rect: the recognized line's pixel box, padded, in display points.
+        # One editable box per WORD, not per line, so editing one word never
+        # disturbs its neighbors. Each box is placed invisibly over the kept scan
+        # and carries its own scanned-ink rect (display points) as the cover that
+        # is used ONLY if the word is later edited. word coords are line-local.
         pad = max(2.0, 0.06 * em_px)
-        cover_pt = ((x0 - pad) / ppi, (y0 - pad) / ppi,
-                    (x1 + pad) / ppi, (y1 + pad) / ppi)
-        raw_lines.append((origin_px, ln.text, em_px, ln.confidence, cover_pt))
+        baseline_px = y0i + seg.baseline_y
+        for w in seg.words:
+            if not w.text.strip():
+                continue
+            w_origin_px = (x0i + w.x0, baseline_px)
+            w_cover_pt = ((x0i + w.x0 - pad) / ppi, (y0i + w.top - pad) / ppi,
+                          (x0i + w.x1 + pad) / ppi, (y0i + w.bottom + pad) / ppi)
+            raw_lines.append(
+                (w_origin_px, w.text, em_px, ln.confidence, w_cover_pt))
         glyphs = sorted(seg.glyphs, key=lambda g: g.x0)
         for i, g in enumerate(glyphs):
             baseline_row = g.baseline_y - g.top_y
