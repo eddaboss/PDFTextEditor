@@ -725,6 +725,11 @@ def test_menu_completion(failures: list) -> None:
         titles = [a.text() for a in w.menu_bar.actions()]
         check(failures, "menu.titles", titles == MENU_TITLES,
               f"menubar titles {titles}")
+        # The bar is forced non-native so File/Edit/View… live IN the window
+        # on macOS too (Clay-styled), not in the global menu bar.
+        check(failures, "menu.in_window",
+              w.menu_bar.isNativeMenuBar() is False,
+              f"menu bar is native: {w.menu_bar.isNativeMenuBar()}")
         # Open Recent: a submenu right after Open….
         file_acts = w.menu_file.actions()
         recent_act = w.menu_open_recent.menuAction()
@@ -737,10 +742,12 @@ def test_menu_completion(failures: list) -> None:
               f"Close Tab shortcut {w.act_close.shortcut().toString()!r}")
         check(failures, "menu.close_home", w.act_close in file_acts,
               "Close Tab is not in the File menu")
-        # Help: Keyboard Shortcuts… (Cmd+/) + About (AboutRole).
+        # Help: Settings… + Keyboard Shortcuts… (Cmd+/) + About (AboutRole).
+        # With the non-native bar, the PreferencesRole Settings item is no
+        # longer hoisted into a macOS app menu, so it stays here in-window.
         help_acts = [a for a in w.menu_help.actions() if not a.isSeparator()]
         check(failures, "menu.help",
-              help_acts == [w.act_shortcuts, w.act_about],
+              help_acts == [w.act_preferences, w.act_shortcuts, w.act_about],
               f"Help menu actions {[a.text() for a in help_acts]}")
         check(failures, "menu.help_key",
               w.act_shortcuts.shortcut() == QKeySequence("Ctrl+/"),

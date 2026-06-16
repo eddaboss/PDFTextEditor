@@ -288,13 +288,29 @@ class SettingsDialog(QWidget):
     def _store(self) -> QSettings:
         return QSettings("eddaboss", "PDF Text Editor")
 
-    def _rebuild_account(self) -> None:
-        lay = self._account_box.layout()
+    @staticmethod
+    def _clear_layout(lay) -> None:
+        """Empty a layout, deleting widgets nested in sub-layouts too. A plain
+        ``takeAt`` loop that only deletes ``item.widget()`` misses the buttons
+        that live inside the signed-in row's QHBoxLayout, leaving an orphaned,
+        default-sized (640x480) QPushButton parented to the account box; styled
+        as a bordered control it then renders as a stray box behind the real
+        content on every rebuild. Recurse so nothing is left behind."""
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()
-            if w:
+            if w is not None:
+                w.setParent(None)
                 w.deleteLater()
+            else:
+                sub = item.layout()
+                if sub is not None:
+                    SettingsDialog._clear_layout(sub)
+                    sub.deleteLater()
+
+    def _rebuild_account(self) -> None:
+        lay = self._account_box.layout()
+        self._clear_layout(lay)
         token = self._store().value(_TOKEN_KEY, "")
         if token:
             email = self._store().value(_EMAIL_KEY, "") or "your account"

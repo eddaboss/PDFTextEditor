@@ -828,6 +828,33 @@ def global_stylesheet() -> str:
     }}
     QStatusBar#MainStatus::item {{ border: none; }}
 
+    /* --- In-window menu bar ------------------------------------------ */
+    /* The File/Edit/View... bar, forced non-native so it lives in the window
+       on macOS too. Warm chrome with a hairline base, terracotta hover, to
+       match the toolbar and the QMenu dropdowns below. */
+    QMenuBar {{
+        background: {CHROME_BG};
+        border: none;
+        border-bottom: 1px solid {CHROME_BORDER};
+        padding: 2px 8px;
+        color: {TEXT_PRIMARY};
+        font-size: {UI_FONT_SIZE}px;
+    }}
+    QMenuBar::item {{
+        background: transparent;
+        padding: 5px 10px;
+        border-radius: {BUTTON_RADIUS}px;
+        color: {TEXT_PRIMARY};
+    }}
+    QMenuBar::item:selected {{
+        background: {ACCENT_HOVER};
+        color: {ACCENT};
+    }}
+    QMenuBar::item:pressed {{
+        background: {WASH_PRESSED};
+        color: {TEXT_PRIMARY};
+    }}
+
     /* --- Menus ------------------------------------------------------- */
     QMenu {{
         background: {CHROME_BG};
