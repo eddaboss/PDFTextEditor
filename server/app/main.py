@@ -59,7 +59,11 @@ def _startup() -> None:
 # Railway's health check, and the token-protected publish flow keep working.
 _GATE_COOKIE = "pdfte_gate"
 _GATE_OPEN_PREFIXES = ("/updates", "/health", "/api/version", "/api/publish",
-                       "/api/repo-state", "/_gate/")
+                       "/api/repo-state", "/_gate/",
+                       # The desktop app calls the account API directly and has
+                       # no way to carry the site-gate cookie, so these stay open
+                       # (they have their own auth + rate limiting).
+                       "/api/auth", "/api/onboard", "/api/account")
 
 
 def _gate_token() -> str:
