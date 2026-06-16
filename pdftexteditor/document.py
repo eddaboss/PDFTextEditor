@@ -426,8 +426,16 @@ class NewBox:
     dir: tuple = (1.0, 0.0)
     # OCR cover: a TEXT-space rect + paper color (x0,y0,x1,y1,r,g,b) painted
     # UNDER the text at bake time so the scanned glyphs are replaced, not
-    # doubled. Empty for ordinary added boxes.
+    # doubled. Empty for ordinary added boxes. Painted only when the box is
+    # VISIBLE (render_mode 0); an invisible OCR overlay carries its cover unused
+    # until the word is edited.
     cover: tuple = ()
+    # PDF text render mode at bake: 0 = fill (visible, normal text), 3 = invisible
+    # (in the content stream, so selectable/searchable, but draws no marks). OCR
+    # adds its text render_mode=3 over the untouched scan image so the page stays
+    # pixel-identical to the scan; editing a word flips it to 0 so the cover then
+    # whites out the scanned word and the replacement shows. Ordinary boxes stay 0.
+    render_mode: int = 0
 
     @property
     def edit_key(self) -> tuple:
@@ -1960,6 +1968,12 @@ class PDFDocument:
                 return
             before = self._newbox_state(key)
             updated = replace(cur, text=new_text)
+            # An invisible OCR overlay (render_mode 3) that the user edits becomes
+            # real, visible text: flip it to fill so it draws, and its cover now
+            # paints, whiting out the scanned word it replaces. Untouched OCR
+            # words stay invisible over the original scan pixels.
+            if cur.render_mode != 0:
+                updated = replace(updated, render_mode=0)
             updated = replace(updated, bbox=self._newbox_bbox(updated))
             after = _BoxState(newbox=updated, exists=True)
             self._push_command(key, None, "text", before, after,
@@ -2261,7 +2275,8 @@ class PDFDocument:
     # --- add (NEW) ---
     def add_box(self, page: int, origin: tuple, text: str, family: str,
                 size: float, color: tuple, bold: bool, italic: bool,
-                direction: tuple = (1.0, 0.0), cover: tuple = ()) -> NewBox:
+                direction: tuple = (1.0, 0.0), cover: tuple = (),
+                render_mode: int = 0) -> NewBox:
         """Create a NewBox at baseline ``origin`` (PDF points) with the given
         style, compute its bbox from ``resolve_family`` metrics (BUILD_SPEC
         §1.6), register it, push an 'add' command, and return it. The caller
@@ -2274,7 +2289,8 @@ class PDFDocument:
         box = NewBox(page_index=page, box_id=box_id, origin=tuple(origin),
                      bbox=(0.0, 0.0, 0.0, 0.0), text=text, font_family=family,
                      size=size, color=tuple(color), bold=bold, italic=italic,
-                     dir=tuple(direction), cover=tuple(cover))
+                     dir=tuple(direction), cover=tuple(cover),
+                     render_mode=int(render_mode))
         box = replace(box, bbox=self._newbox_bbox(box))
         key = box.edit_key
         before = _BoxState(newbox=None, exists=False)
@@ -3722,8 +3738,11 @@ class PDFDocument:
                 continue
             # OCR cover: paint the scanned text region in the paper color FIRST
             # (its own committed shape, so it sits under the text shape) so the
-            # rebuilt text replaces the scan glyphs instead of doubling them.
-            if box.cover and len(box.cover) == 7:
+            # edited text replaces the scan glyphs instead of doubling them. Only
+            # for a VISIBLE box: an invisible OCR overlay (render_mode 3) must let
+            # the untouched scan show through, so it carries its cover unused
+            # until the word is edited (which flips it visible).
+            if box.render_mode == 0 and box.cover and len(box.cover) == 7:
                 x0, y0, x1, y1, r, g, b = box.cover
                 page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                color=(r, g, b), fill=(r, g, b), width=0)
@@ -3731,7 +3750,7 @@ class PDFDocument:
                                        box.text)
             fontname = self._register_resolved(engine, page, rf, registered)
             self._insert_run(shape, box.origin, box.text, box.size, fontname,
-                             box.color, box.dir)
+                             box.color, box.dir, render_mode=box.render_mode)
         shape.commit()                  # no-op when nothing was drawn
         # Placed images AFTER the text Shape commit and BEFORE the annot tail
         # (images & signatures §2.4(2); the bake-order contract): drawn after
@@ -4669,9 +4688,12 @@ class PDFDocument:
         fontname: str,
         color: tuple,
         direction: tuple,
+        render_mode: int = 0,
     ) -> None:
         """Draw one run at its baseline ``origin`` into the page's batch
-        ``shape``, preserving writing direction.
+        ``shape``, preserving writing direction. ``render_mode`` is the PDF text
+        render mode (0 = fill/visible, 3 = invisible-but-selectable, used for the
+        OCR text layer placed over a kept scan image).
 
         BATCHING (perf foundation M3): runs accumulate on ONE ``fitz.Shape``
         per page bake, committed once by the ``_apply_page_edits`` caller.
@@ -4698,13 +4720,14 @@ class PDFDocument:
         if abs(angle) < 1e-3:
             shape.insert_text(
                 point, text, fontsize=fontsize, fontname=fontname, color=color,
+                render_mode=render_mode,
             )
             return
         # Rotate about the baseline origin so the run pivots in place.
         morph = (point, fitz.Matrix(angle))
         shape.insert_text(
             point, text, fontsize=fontsize, fontname=fontname,
-            color=color, morph=morph,
+            color=color, morph=morph, render_mode=render_mode,
         )
 
     @staticmethod
@@ -4877,11 +4900,16 @@ class PDFDocument:
         for box in newbox_map.values():
             if box.page_index != page_index or box.deleted:
                 continue
+            if box.render_mode == 0 and box.cover and len(box.cover) == 7:
+                x0, y0, x1, y1, r, g, b = box.cover
+                page.draw_rect(fitz.Rect(x0, y0, x1, y1),
+                               color=(r, g, b), fill=(r, g, b), width=0)
             rf = engine.resolve_family(box.font_family, box.bold, box.italic,
                                        box.text)
             fontname = PDFDocument._register_resolved(engine, page, rf, registered)
             PDFDocument._insert_run(shape, box.origin, box.text, box.size,
-                                    fontname, box.color, (1.0, 0.0))
+                                    fontname, box.color, box.dir,
+                                    render_mode=box.render_mode)
         shape.commit()                  # no-op when nothing was drawn
         # Placed images after the text, before the annot tail -- mirroring
         # ``_apply_page_edits`` exactly (images & signatures §2.4(2)).

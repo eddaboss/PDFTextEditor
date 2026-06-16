@@ -165,13 +165,20 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
         em_list.append(em_px)
         if seg.space_px:
             space_em_list.append(seg.space_px / em_px)
-        first_x = seg.words[0].x0
-        origin_px = (x0i + first_x, y0i + seg.baseline_y)
-        # Cover rect: the recognized line's pixel box, padded, in display points.
+        # One editable box per WORD, not per line, so editing one word never
+        # disturbs its neighbors. Each box is placed invisibly over the kept scan
+        # and carries its own scanned-ink rect (display points) as the cover that
+        # is used ONLY if the word is later edited. word coords are line-local.
         pad = max(2.0, 0.06 * em_px)
-        cover_pt = ((x0 - pad) / ppi, (y0 - pad) / ppi,
-                    (x1 + pad) / ppi, (y1 + pad) / ppi)
-        raw_lines.append((origin_px, ln.text, em_px, ln.confidence, cover_pt))
+        baseline_px = y0i + seg.baseline_y
+        for w in seg.words:
+            if not w.text.strip():
+                continue
+            w_origin_px = (x0i + w.x0, baseline_px)
+            w_cover_pt = ((x0i + w.x0 - pad) / ppi, (y0i + w.top - pad) / ppi,
+                          (x0i + w.x1 + pad) / ppi, (y0i + w.bottom + pad) / ppi)
+            raw_lines.append(
+                (w_origin_px, w.text, em_px, ln.confidence, w_cover_pt))
         glyphs = sorted(seg.glyphs, key=lambda g: g.x0)
         for i, g in enumerate(glyphs):
             baseline_row = g.baseline_y - g.top_y
