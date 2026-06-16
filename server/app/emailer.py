@@ -79,8 +79,13 @@ def _send_via_resend(to: str, subject: str, text_body: str,
     }).encode("utf-8")
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=payload, method="POST",
+        # A real User-Agent is required: Cloudflare fronts api.resend.com and
+        # blocks the default "Python-urllib/x.y" signature with HTTP 403 error
+        # 1010, so the mail never reaches Resend.
         headers={"Authorization": f"Bearer {config.RESEND_API_KEY}",
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 "Accept": "application/json",
+                 "User-Agent": "PDFTextEditor-Server (+https://pdf-for-free.com)"})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return 200 <= r.status < 300
