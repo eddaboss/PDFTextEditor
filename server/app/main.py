@@ -428,6 +428,11 @@ h2{font-size:clamp(28px,3.6vw,44px)}
   font-size:13.5px;line-height:1.5;background:var(--ink);color:#f3e9dd;padding:12px 14px;
   border-radius:10px;overflow-x:auto;white-space:nowrap;-webkit-user-select:all;user-select:all}
 .macopen .micro{margin-top:22px}
+.opengrid{display:grid;grid-template-columns:1fr 1fr;gap:clamp(28px,4.5vw,56px);margin-top:28px}
+.osh{font-family:var(--display);font-size:18px;color:var(--clay-press);margin:0;
+  padding-bottom:10px;border-bottom:1px solid var(--line)}
+.opencol .steps{margin-top:16px;max-width:none}
+@media(max-width:680px){.opengrid{grid-template-columns:1fr;gap:34px}}
 
 /* the asterisk section */
 .catch{border-top:1px solid var(--line)}
@@ -601,22 +606,37 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
     </div>
   </section>
 
-  <section id=mac class=macopen>
-    <h2>Opening it on a Mac the first time</h2>
-    <p class=sub>It is a free app I sign myself, not through Apple's paid developer
-      program, so the first time you open it macOS adds one extra step. You only
+  <section id=open class=macopen>
+    <h2>Opening it the first time</h2>
+    <p class=sub>It is a free app I sign myself, not through a paid developer
+      program, so the first launch shows a warning on Mac and on Windows. You only
       do this once.</p>
-    <ol class=steps>
-      <li><div>Open the <b>.dmg</b> and drag <b>__APPNAME__</b> into your
-        <b>Applications</b> folder.</div></li>
-      <li><div>If macOS says the app is damaged or cannot be opened, open the
-        <b>Terminal</b> app and paste this line, then press Return:
-        <code class=cmd>xattr -dr com.apple.quarantine "/Applications/__APPNAME__.app"</code></div></li>
-      <li><div>Open <b>__APPNAME__</b> normally. It opens straight away every time
-        after that.</div></li>
-    </ol>
-    <p class=micro>No Terminal? Control-click the app in Applications, choose
-      <b>Open</b>, then <b>Open</b> again in the dialog.</p>
+    <div class=opengrid>
+      <div class=opencol>
+        <h3 class=osh>macOS</h3>
+        <ol class=steps>
+          <li><div>Open the <b>.dmg</b> and drag <b>__APPNAME__</b> into your
+            <b>Applications</b> folder.</div></li>
+          <li><div>If macOS says the app is damaged or cannot be opened, open the
+            <b>Terminal</b> app and paste this line, then press Return:
+            <code class=cmd>xattr -dr com.apple.quarantine "/Applications/__APPNAME__.app"</code></div></li>
+          <li><div>Open <b>__APPNAME__</b> normally. It opens every time after that.</div></li>
+        </ol>
+        <p class=micro>No Terminal? Control-click the app in Applications, choose
+          <b>Open</b>, then <b>Open</b> again.</p>
+      </div>
+      <div class=opencol>
+        <h3 class=osh>Windows</h3>
+        <ol class=steps>
+          <li><div>Run the downloaded <b>.exe</b> installer.</div></li>
+          <li><div>If <b>Microsoft Defender SmartScreen</b> says "Windows protected
+            your PC," click <b>More info</b>, then <b>Run anyway</b>.</div></li>
+          <li><div>Finish installing and open <b>__APPNAME__</b> normally.</div></li>
+        </ol>
+        <p class=micro>Or right-click the <b>.exe</b>, choose <b>Properties</b>,
+          tick <b>Unblock</b>, then <b>OK</b> before running.</p>
+      </div>
+    </div>
   </section>
 
   <section class=catch>
