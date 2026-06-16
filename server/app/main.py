@@ -63,7 +63,9 @@ _GATE_OPEN_PREFIXES = ("/updates", "/health", "/api/version", "/api/publish",
                        # The desktop app calls the account API directly and has
                        # no way to carry the site-gate cookie, so these stay open
                        # (they have their own auth + rate limiting).
-                       "/api/auth", "/api/onboard", "/api/account")
+                       "/api/auth", "/api/onboard", "/api/account",
+                       # Release/admin paths are token-protected, not cookie-gated.
+                       "/api/admin")
 
 
 def _gate_token() -> str:
@@ -1319,3 +1321,20 @@ def publish(authorization: str = Header(default=""),
         # platform's repo and the other installer intact.
         tar.extractall(str(DATA_DIR), filter="data")
     return {"ok": True, "channel": CHANNEL}
+
+
+@app.post("/api/admin/wipe-updates")
+def wipe_updates(authorization: str = Header(default="")) -> dict:
+    """DESTRUCTIVE, token-protected: clear the update tree and installers so the
+    next release republishes a single clean baseline. Used to prune accumulated
+    or broken archives off the volume (they otherwise only ever grow). Run this
+    once, then trigger a release; existing installs then pull one full update and
+    patch normally from the fresh baseline."""
+    _check_publish_token(authorization)
+    wiped = []
+    for d in (UPDATES_DIR, INSTALLERS_DIR):
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+            wiped.append(d.name)
+    ensure_dirs()
+    return {"ok": True, "wiped": wiped, "channel": CHANNEL}

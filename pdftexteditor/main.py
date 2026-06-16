@@ -124,6 +124,20 @@ def _maybe_onboard(window) -> None:
     QTimer.singleShot(600, _show)
 
 
+def _update_check_due() -> bool:
+    """Throttle the on-launch update check to once a day so we are not hitting the
+    update server on every single launch. The manual check in Settings is
+    unaffected. Returns True (and records 'now') when a check is due."""
+    from PySide6.QtCore import QDateTime, QSettings
+    s = QSettings("eddaboss", "PDF Text Editor")
+    now = QDateTime.currentMSecsSinceEpoch()
+    last = int(s.value("update/last_check_ms", 0) or 0)
+    if now - last < 24 * 60 * 60 * 1000:
+        return False
+    s.setValue("update/last_check_ms", now)
+    return True
+
+
 def main() -> int:
     # Must run before any window renders text so Core Graphics picks it up.
     _disable_macos_font_smoothing()
@@ -172,7 +186,7 @@ def main() -> int:
     # On-launch update check (installed builds only): non-blocking; offers a
     # one-click install when a newer signed release exists on this channel.
     from . import __version__, updater
-    if updater.updates_supported():
+    if updater.updates_supported() and _update_check_due():
         window._update_checker = updater.UpdateChecker()
         window._update_checker.available.connect(
             lambda meta: _prompt_update(window, meta))
