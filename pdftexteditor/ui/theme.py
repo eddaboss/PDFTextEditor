@@ -521,7 +521,12 @@ def global_stylesheet() -> str:
     QFrame#ZoomBar QToolButton#ZoomStepBtn:disabled {{ color: {TEXT_TERTIARY}; }}
     QFrame#ZoomBar QToolButton#ZoomButton {{
         border: none; background: transparent;
-        min-width: 44px; padding: 0px 4px; color: {TEXT_PRIMARY};
+        min-width: 58px; padding: 0px 2px 0px 6px; color: {TEXT_PRIMARY};
+    }}
+    /* Show a small dropdown caret so the % reads as the zoom selector. */
+    QFrame#ZoomBar QToolButton#ZoomButton::menu-indicator {{
+        subcontrol-origin: padding; subcontrol-position: right center;
+        right: 3px; width: 8px; height: 8px;
     }}
     QFrame#ZoomBar QToolButton#ZoomButton:hover {{
         background: {WASH_HOVER}; border-radius: {BUTTON_RADIUS}px;
