@@ -31,6 +31,10 @@ JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "720"))  # 30 days
 # Shared secret the release pipeline presents to POST /api/publish. Empty means
 # publishing is disabled (safer default until the token is configured).
 PUBLISH_TOKEN = os.environ.get("PUBLISH_TOKEN", "")
+# When set, the human-facing site and the installer download sit behind a shared
+# password (see the gate in main.py). Set it on the dev environment so the public
+# cannot install the dev build; leave it empty in production so prod stays open.
+SITE_PASSWORD = os.environ.get("PDFTE_SITE_PASSWORD", "")
 
 # --- accounts: email, links, throttling -------------------------------------
 # The site's own public origin (e.g. https://pdftexteditor.up.railway.app), used

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Block PII / secrets from being committed (see scripts/pii_guard.py).
+# Enable once per clone:  git config core.hooksPath .githooks
+# Emergency bypass (discouraged):  git commit --no-verify
+set -euo pipefail
+PY="$(command -v python3 || true)"
+[ -x ".venv/bin/python" ] && PY=".venv/bin/python"
+if [ -z "$PY" ]; then
+  echo "pre-commit: python3 not found; skipping PII scan" >&2
+  exit 0
+fi
+exec "$PY" scripts/pii_guard.py --staged
