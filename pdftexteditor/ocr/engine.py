@@ -18,6 +18,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import pack
+
+
+class OcrPackMissing(RuntimeError):
+    """RapidOCR is selected but its downloadable OCR component is not installed.
+    The UI catches this to offer the one-time download."""
+
 
 @dataclass
 class OcrLine:
@@ -54,12 +61,22 @@ class RapidOcrEngine(OcrEngine):
     _engine = None
     _lock = threading.Lock()
 
+    @staticmethod
+    def available() -> bool:
+        """True once the downloadable OCR component is installed + importable."""
+        return pack.ensure_on_path()
+
     @classmethod
     def _session(cls):
         if cls._engine is None:
             with cls._lock:
                 if cls._engine is None:
-                    from rapidocr_onnxruntime import RapidOCR
+                    pack.ensure_on_path()
+                    try:
+                        from rapidocr_onnxruntime import RapidOCR
+                    except ImportError as exc:
+                        raise OcrPackMissing(
+                            "The OCR component is not installed.") from exc
                     cls._engine = RapidOCR()
         return cls._engine
 

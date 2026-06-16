@@ -9,27 +9,36 @@ None when no text is recovered.
 
 from __future__ import annotations
 
-import numpy as np
+from . import pack
+from .engine import OcrLine, OcrPackMissing, get_engine
 
-from .engine import OcrLine, get_engine
-from .reconstruct import LineBox, ReconResult, reconstruct_page
+# Put an already-downloaded OCR pack on sys.path as soon as the package loads, so
+# a returning user's OCR just works. The heavy reconstruct deps (opencv, vtracer)
+# and the RapidOCR engine live in that pack, so this module imports them LAZILY
+# (inside recognize_and_reconstruct, after the pack is confirmed on the path);
+# importing pdftexteditor.ocr itself never pulls the pack in.
+pack.ensure_on_path()
 
 __all__ = [
-    "OcrLine", "LineBox", "ReconResult",
-    "get_engine", "reconstruct_page", "recognize_and_reconstruct",
+    "OcrLine", "OcrPackMissing", "pack",
+    "get_engine", "recognize_and_reconstruct",
 ]
 
 
 def recognize_and_reconstruct(
-    image_rgb: "np.ndarray", dpi: float,
+    image_rgb, dpi: float,
     base_font_serif: str, base_font_sans: str,
     engine_name: str = "auto",
     family_label: str = "Scanned Text",
-) -> "ReconResult | None":
+):
     """Recognize ``image_rgb`` (page raster at ``dpi``) and rebuild it as editable
     text in a scan-built font. ``base_font_serif`` / ``base_font_sans`` are font
     file paths used to borrow glyphs the page never showed. Pure CPU; safe to run
-    on a worker thread."""
+    on a worker thread. Raises ``OcrPackMissing`` if the downloadable OCR
+    component is not installed (the UI offers the download before calling this)."""
+    if not pack.ensure_on_path():
+        raise OcrPackMissing("The OCR component is not installed.")
+    from .reconstruct import reconstruct_page  # needs the pack (opencv, vtracer)
     engine = get_engine(engine_name)
     lines = engine.recognize(image_rgb)
     if not lines:

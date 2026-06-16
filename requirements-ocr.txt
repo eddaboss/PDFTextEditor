@@ -1,0 +1,11 @@
+# OCR pack: the optional, separately-versioned OCR component, NOT bundled in the
+# base app. The release pipeline `pip install --target`s this into a per-platform
+# zip and hosts it; the app downloads it on first OCR use (pdftexteditor/ocr/
+# pack.py) and adds it to sys.path. Bump pack.PACK_VERSION when these change.
+#
+# CI (tests) installs this alongside requirements.txt so the OCR tests can run;
+# the release BUILD does not, so it never lands in the bundle.
+rapidocr-onnxruntime==1.2.3
+onnxruntime==1.26.0
+vtracer==0.6.15
+opencv-python==4.13.0.92

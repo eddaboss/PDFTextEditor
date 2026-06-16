@@ -58,7 +58,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # NON-BREAKING for now: the OCR pack deps are still installed, so OCR
+          # stays bundled and working. To SLIM the installer, drop
+          # `-r requirements-ocr.txt` here and add the pack build+upload step
+          # (build the per-platform pack, host it gate-exempt so pack.py can
+          # fetch it). See requirements-ocr.txt + pdftexteditor/ocr/pack.py.
+          pip install -r requirements.txt -r requirements-ocr.txt
           pip install pyinstaller pillow requests tufup
 
       - name: Build app
