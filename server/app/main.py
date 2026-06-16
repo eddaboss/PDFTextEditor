@@ -521,7 +521,7 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
 .dlcard h3{font-family:var(--display);font-size:23px;margin:0 6px 8px 0}
 .dlintro{font-size:14.5px;color:var(--ink2);margin:0 0 18px}
 .dlfield{width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:10px;
-  font:inherit;font-size:15px;background:#fff;color:var(--ink)}
+  font:inherit;font-size:15px;background:#fff;color:var(--ink);margin:0 0 12px}
 .dlfield:focus{outline:2px solid var(--clay);outline-offset:1px;border-color:var(--clay)}
 .dlcheck{display:flex;gap:10px;align-items:flex-start;margin:16px 0 20px;
   font-size:14px;color:var(--ink2);line-height:1.5;cursor:pointer}
