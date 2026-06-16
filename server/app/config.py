@@ -43,16 +43,20 @@ SITE_PASSWORD = os.environ.get("PDFTE_SITE_PASSWORD", "")
 # the request's own base URL wherever a request is in hand.
 PUBLIC_BASE_URL = os.environ.get("PDFTE_PUBLIC_URL", "").rstrip("/")
 
-# Outbound email (SMTP). With no SMTP_HOST set, the app does not fail: it logs the
-# message body to stdout instead, so the whole account flow is testable locally
-# and in CI without a mail provider. Point these at any SMTP relay for real mail.
+# Outbound email. Preferred provider is Resend (HTTP API): set RESEND_API_KEY and
+# mail is sent through it. Otherwise, if SMTP_HOST is set the message goes over
+# SMTP; with neither set, the body is logged to stdout so the whole account flow
+# stays testable locally and in CI with no mail provider.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 # "starttls" (587, default), "ssl" (465), or "none" (unencrypted, dev relays).
 SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "starttls").lower()
-EMAIL_FROM = os.environ.get("EMAIL_FROM", "no-reply@pdftexteditor.app")
+# The From address must be on a domain verified with the mail provider. Resend is
+# set up for pdf-for-free.com, so default the sender there.
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "no-reply@pdf-for-free.com")
 EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "PDF Text Editor")
 
 # How long the emailed links stay valid.
