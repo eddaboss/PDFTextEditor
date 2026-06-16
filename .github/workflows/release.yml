@@ -3,22 +3,41 @@ name: Release
 # Each platform builds, packages an installer, signs a new tufup bundle, and
 # merges it onto its channel volume. A push to master publishes to the STABLE
 # channel; a push to dev publishes to the DEV channel (CHANNEL is derived from
-# the ref below). Both only fire when a build-affecting path changes.
+# the ref below).
+#
+# A release fires ONLY when the version file changes, so day-to-day pushes to dev
+# do not cut a build (test those with a local ./build_app.sh; the backend
+# redeploys on every push regardless). To publish an update, bump
+# pdftexteditor/__version__ -- the build always packages whatever code is on the
+# branch at that point.
 on:
   push:
     branches: [master, dev]
     paths:
-      - 'pdftexteditor/**'
-      - 'PDFTextEditor.spec'
-      - 'requirements.txt'
-      - 'build_icon.py'
-      - 'launch.py'
-      - 'release/**'
-      - '.github/workflows/release.yml'
+      - 'pdftexteditor/__init__.py'
   workflow_dispatch:
 
 jobs:
+  reset:
+    # One-shot volume clean. When a release commit message contains
+    # [reset-updates], wipe this channel's update tree + installers FIRST, so the
+    # build below republishes a single clean baseline (drops accumulated/broken
+    # archives). A normal release skips this step entirely.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wipe update volume
+        if: contains(github.event.head_commit.message, '[reset-updates]')
+        env:
+          API: ${{ github.ref == 'refs/heads/master' && secrets.API_URL_PROD || secrets.API_URL_DEV }}
+          TOKEN: ${{ github.ref == 'refs/heads/master' && secrets.PUBLISH_TOKEN_PROD || secrets.PUBLISH_TOKEN_DEV }}
+        run: |
+          echo "Wiping update volume for a clean baseline..."
+          curl -fsS -X POST "$API/api/admin/wipe-updates" \
+            -H "Authorization: Bearer $TOKEN"
+          echo
+
   release:
+    needs: [reset]
     strategy:
       fail-fast: false
       matrix:
