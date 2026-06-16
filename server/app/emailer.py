@@ -1,16 +1,20 @@
-"""Outbound email over SMTP, with a no-config dev fallback.
+"""Outbound email with a no-config dev fallback.
 
-If ``SMTP_HOST`` is set the message is sent through that relay; otherwise the
-message is logged to stdout and nothing leaves the box. That keeps the entire
-account flow runnable on a laptop and in CI with no mail provider, while a single
-environment variable switches on real delivery in production.
+Provider order: if ``RESEND_API_KEY`` is set, send through Resend's HTTP API; else
+if ``SMTP_HOST`` is set, send over SMTP; otherwise log the message to stdout and
+nothing leaves the box. That keeps the whole account flow runnable on a laptop and
+in CI with no mail provider, while one environment variable switches on real
+delivery in production.
 
-Only the standard library is used (``smtplib`` + ``email.message``), so there is
-no new dependency to install.
+Only the standard library is used (``urllib`` / ``smtplib``), so there is no new
+dependency to install.
 """
+import json
 import logging
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 from email.message import EmailMessage
 from email.utils import formataddr
 
@@ -20,9 +24,11 @@ log = logging.getLogger("pdfte.email")
 
 
 def send_email(to: str, subject: str, text_body: str, html_body: str) -> bool:
-    """Send one message. Returns True if handed to an SMTP server, False if it
-    was only logged (no SMTP configured) or delivery failed. Never raises, so a
-    mail hiccup cannot break the request that triggered it."""
+    """Send one message. Returns True if it was handed to a mail provider, False
+    if it was only logged (no provider configured) or delivery failed. Never
+    raises, so a mail hiccup cannot break the request that triggered it."""
+    if config.RESEND_API_KEY:
+        return _send_via_resend(to, subject, text_body, html_body)
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = formataddr((config.EMAIL_FROM_NAME, config.EMAIL_FROM))
@@ -57,6 +63,34 @@ def _login_and_send(server: smtplib.SMTP, msg: EmailMessage) -> None:
     if config.SMTP_USER:
         server.login(config.SMTP_USER, config.SMTP_PASSWORD)
     server.send_message(msg)
+
+
+def _send_via_resend(to: str, subject: str, text_body: str,
+                     html_body: str) -> bool:
+    """Send one message through Resend's HTTP API. Returns True on a 2xx. Never
+    raises. Logs the provider error (not the recipient) on failure so a bad key
+    or unverified domain is diagnosable without putting an address in the logs."""
+    payload = json.dumps({
+        "from": formataddr((config.EMAIL_FROM_NAME, config.EMAIL_FROM)),
+        "to": [to],
+        "subject": subject,
+        "text": text_body,
+        "html": html_body,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {config.RESEND_API_KEY}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        log.error("[email:resend] HTTP %s: %s (subject=%s)", e.code, body, subject)
+        return False
+    except Exception:  # noqa: BLE001 - never let mail failure break the flow
+        log.exception("[email:resend] send failed (subject=%s)", subject)
+        return False
 
 
 # --- the two messages the account system sends ------------------------------
