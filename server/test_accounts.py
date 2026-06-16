@@ -250,6 +250,44 @@ def test_consent_requires_agreement(client):
     assert r.status_code == 400
 
 
+def test_setup_code_round_trip(client):
+    r = client.post("/api/consent",
+                    json={"email": "coded@example.com", "agreed": True},
+                    headers=_ip("10.2.0.1"))
+    assert r.status_code == 200
+    code = r.json()["setup_code"]
+    assert code and "-" in code
+
+    # The desktop app redeems the code for the email it was agreed with.
+    c = client.post("/api/onboard/claim", json={"code": code},
+                    headers=_ip("10.2.0.2"))
+    assert c.status_code == 200
+    assert c.json()["email"] == "coded@example.com"
+
+    # Single use: a second claim of the same code fails.
+    again = client.post("/api/onboard/claim", json={"code": code},
+                        headers=_ip("10.2.0.3"))
+    assert again.status_code == 404
+
+
+def test_setup_code_normalizes_case_and_dashes(client):
+    r = client.post("/api/consent",
+                    json={"email": "casey@example.com", "agreed": True},
+                    headers=_ip("10.2.0.4"))
+    code = r.json()["setup_code"]
+    munged = code.lower().replace("-", "")  # how a careless paste might look
+    c = client.post("/api/onboard/claim", json={"code": munged},
+                    headers=_ip("10.2.0.5"))
+    assert c.status_code == 200
+    assert c.json()["email"] == "casey@example.com"
+
+
+def test_claim_invalid_code(client):
+    c = client.post("/api/onboard/claim", json={"code": "ZZZZ-ZZZZ"},
+                    headers=_ip("10.2.0.6"))
+    assert c.status_code == 404
+
+
 def test_auth_pages_prefill_from_query(client):
     # The pages read ?email= client-side (no server-side echo, so no XSS).
     for path in ("/login", "/signup", "/forgot"):

@@ -46,3 +46,9 @@ def login(email: str, password: str):
 
 def me(token: str):
     return _request("/api/auth/me", "GET", token=token)
+
+
+def claim_setup_code(code: str):
+    """Redeem a setup code from the download gate for the email it carries, so
+    the account fields can be pre-filled. Returns ``(status, {"email": ...})``."""
+    return _request("/api/onboard/claim", "POST", {"code": code})

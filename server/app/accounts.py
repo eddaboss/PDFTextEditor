@@ -26,7 +26,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import config, emailer, models, security
 from .account_models import (PURPOSE_RESET, PURPOSE_VERIFY, EmailToken,
-                             RateEvent, run_migrations, utcnow)
+                             OnboardCode, RateEvent, run_migrations, utcnow)
 from .db import SessionLocal, engine, get_db
 
 log = logging.getLogger("pdfte.accounts")
@@ -132,6 +132,20 @@ def _mark_verified(db: Session, user: "models.User") -> None:
         db.commit()
 
 
+# --- setup codes (download gate -> desktop app email pre-fill) ---------------
+def issue_setup_code(db: Session, email: str) -> str:
+    """Mint a fresh setup code for an email and add it to the session (the caller
+    commits). Drops any earlier unused code for the same email. Returns the
+    display code to show the user; only the hash is stored."""
+    db.execute(delete(OnboardCode).where(
+        OnboardCode.email == email, OnboardCode.used_at.is_(None)))
+    display, code_hash = security.new_setup_code()
+    db.add(OnboardCode(
+        email=email, code_hash=code_hash,
+        expires_at=utcnow() + timedelta(hours=config.ONBOARD_CODE_TTL_HOURS)))
+    return display
+
+
 # --- brute-force throttle (per client IP, DB-backed) ------------------------
 def _client_ip(request: Request) -> str:
     fwd = request.headers.get("x-forwarded-for", "")
@@ -172,6 +186,8 @@ def _throttle_rules() -> dict:
              config.REGISTER_WINDOW_MINUTES),
         ("POST", "/api/auth/password/forgot"):
             ("reset", config.RESET_MAX_REQUESTS, config.RESET_WINDOW_MINUTES),
+        ("POST", "/api/onboard/claim"):
+            ("onboard", config.ONBOARD_MAX_ATTEMPTS, config.ONBOARD_WINDOW_MINUTES),
     }
 
 
@@ -203,6 +219,10 @@ class ChangePasswordIn(BaseModel):
     new_password: str = Field(min_length=8, max_length=200)
 
 
+class ClaimCodeIn(BaseModel):
+    code: str = Field(min_length=4, max_length=32)
+
+
 @router.get("/api/account")
 def account_info(user: "models.User" = Depends(current_user)) -> dict:
     return {
@@ -212,6 +232,20 @@ def account_info(user: "models.User" = Depends(current_user)) -> dict:
         "email_verified": bool(user.email_verified),
         "created_at": user.created_at.isoformat() if user.created_at else None,
     }
+
+
+@router.post("/api/onboard/claim")
+def claim_setup_code(body: ClaimCodeIn, db: Session = Depends(get_db)) -> dict:
+    """Redeem a setup code (shown at the download gate) for the email it carries,
+    so the desktop app can pre-fill it. Single-use; the claim path is throttled
+    so the short code space cannot be swept to harvest addresses."""
+    rec = db.scalar(select(OnboardCode).where(
+        OnboardCode.code_hash == security.hash_setup_code(body.code)))
+    if not rec or rec.used_at is not None or rec.expires_at < utcnow():
+        raise HTTPException(404, "That setup code is invalid or has expired.")
+    rec.used_at = utcnow()
+    db.commit()
+    return {"email": rec.email}
 
 
 @router.post("/api/auth/verify/send")
@@ -403,6 +437,18 @@ margin:6px auto 16px;font-size:27px;font-weight:800}
 .big.ok{background:rgba(63,107,67,.14);color:#3F6B43}
 .big.no{background:rgba(155,44,26,.12);color:#9B2C1A}
 hr.div{border:none;border-top:1px solid var(--line);margin:22px 0}
+.codebox{background:rgba(194,100,63,.08);border:1px solid rgba(194,100,63,.28);
+border-radius:12px;padding:14px 16px;margin:0 0 22px}
+.codettl{font-size:11.5px;font-weight:700;letter-spacing:.05em;
+text-transform:uppercase;color:var(--clay-press);margin-bottom:9px}
+.coderow{display:flex;align-items:center;gap:10px}
+.codeval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:20px;
+font-weight:700;letter-spacing:.08em;color:var(--ink);background:#fff;
+border:1px solid var(--line);border-radius:8px;padding:8px 12px;flex:1;text-align:center}
+.codecopy{background:var(--clay-fill);color:#fff;border:0;border-radius:8px;
+padding:9px 15px;font:inherit;font-weight:600;font-size:14px;cursor:pointer}
+.codecopy:hover{background:var(--clay-press)}
+.codehint{font-size:13px;color:var(--ink2);margin-top:10px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
@@ -421,9 +467,24 @@ async function api(path,opts){
   return data;
 }
 function show(el,text,kind){el.textContent=text;el.className='msg'+(kind?' '+kind:'');}
+function renderSetupCode(){
+  var box=document.getElementById('codebox');if(!box)return;
+  var code;try{code=sessionStorage.getItem('pdfte_setup_code');}catch(e){}
+  if(!code)return;
+  box.innerHTML='<div class=codettl>Desktop app setup code</div>'
+    +'<div class=coderow><code class=codeval></code><button type=button class=codecopy>Copy</button></div>'
+    +'<div class=codehint>Open PDF Text Editor and paste this in the account panel to fill in your email.</div>';
+  box.querySelector('.codeval').textContent=code;
+  box.hidden=false;
+  box.querySelector('.codecopy').addEventListener('click',function(){
+    var b=this;try{navigator.clipboard.writeText(code);}catch(e){}
+    b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);
+  });
+}
 """
 
 _SIGNUP = """
+<div id=codebox class=codebox hidden></div>
 <form id=f autocomplete=on>
   <label>Email<input id=email type=email required autocomplete=email></label>
   <label>Name <span style="font-weight:500;color:var(--ink3)">(optional)</span><input id=name autocomplete=name></label>
@@ -438,6 +499,7 @@ _SIGNUP = """
   var q=new URLSearchParams(location.search);
   if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('name').focus();}
   if(q.get('from')==='download'){show(msg,'Your download is starting. Create your account to finish setting up.','ok');}
+  renderSetupCode();
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Creating your account...','');
     var email=document.getElementById('email').value.trim();
@@ -454,6 +516,7 @@ _SIGNUP = """
 """
 
 _LOGIN = """
+<div id=codebox class=codebox hidden></div>
 <form id=f>
   <label>Email<input id=email type=email required autocomplete=email></label>
   <label>Password<input id=pw type=password required autocomplete=current-password></label>
@@ -468,6 +531,7 @@ _LOGIN = """
   var q=new URLSearchParams(location.search);
   if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('pw').focus();}
   if(q.get('from')==='download'){show(msg,'Your download is starting. Sign in to finish setting up.','ok');}
+  renderSetupCode();
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Signing in...','');
     try{

@@ -241,6 +241,18 @@ class SettingsDialog(QDialog):
             lay.addWidget(self._hint(
                 "Optional. The editor works fully without an account; sign in "
                 "to carry settings across devices later."))
+            # Setup code from the website's download gate: redeem it to fill in
+            # the email you agreed with, so you do not have to retype it.
+            lay.addWidget(self._hint(
+                "Have a setup code from the website? Paste it to fill in your email."))
+            self._code = QLineEdit()
+            self._code.setPlaceholderText("Setup code")
+            cr = QHBoxLayout()
+            cr.addWidget(self._code, 1)
+            b_code = QPushButton("Apply")
+            b_code.clicked.connect(self._apply_setup_code)
+            cr.addWidget(b_code)
+            lay.addLayout(cr)
             self._email = QLineEdit()
             self._email.setPlaceholderText("Email")
             self._pw = QLineEdit()
@@ -259,6 +271,30 @@ class SettingsDialog(QDialog):
             lay.addLayout(r)
             self._acct_status = self._hint("")
             lay.addWidget(self._acct_status)
+
+    def _apply_setup_code(self) -> None:
+        code = self._code.text().strip()
+        if not code:
+            self._acct_status.setText("Enter your setup code.")
+            return
+        self._acct_status.setText("Checking your code…")
+        self._run_async(lambda: cloud.claim_setup_code(code),
+                        self._on_setup_code)
+
+    def _on_setup_code(self, result) -> None:
+        if not isinstance(result, tuple) or len(result) != 2:
+            self._acct_status.setText("Something went wrong.")
+            return
+        status, body = result
+        if status == 200 and isinstance(body, dict) and body.get("email"):
+            self._email.setText(body["email"])
+            self._pw.setFocus()
+            self._acct_status.setText(
+                "Email filled in. Add a password to sign in or create your "
+                "account.")
+        else:
+            msg = body.get("detail") if isinstance(body, dict) else ""
+            self._acct_status.setText(msg or "That setup code did not work.")
 
     def _auth(self, fn) -> None:
         email = self._email.text().strip()

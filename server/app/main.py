@@ -183,13 +183,16 @@ def record_consent(body: ConsentIn, request: Request,
         ip=ip,
         user_agent=request.headers.get("user-agent", "")[:1000],
     ))
+    # A setup code the desktop app can redeem to pre-fill this email (see
+    # accounts.claim_setup_code). The page shows it on the destination it lands on.
+    setup_code = accounts.issue_setup_code(db, email)
     db.commit()
     info = (json.loads(RELEASE_INFO.read_text("utf-8"))
             if RELEASE_INFO.exists() else {})
     # has_account lets the page route an agreeing visitor to sign-in (an account
     # already uses this email) or create-account (it does not), both pre-filled.
     return {"ok": True, "terms_version": TERMS_VERSION,
-            "has_account": account is not None,
+            "has_account": account is not None, "setup_code": setup_code,
             "mac": info.get("mac"), "windows": info.get("windows")}
 
 
@@ -669,6 +672,8 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
       .then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j.detail||'Could not record agreement');});return r.json();})
       .then(function(d){
         var addr=email.value.trim();
+        // Carry the setup code to the page we land on, where it is shown for the app.
+        if(d&&d.setup_code){try{sessionStorage.setItem('pdfte_setup_code',d.setup_code);}catch(e){}}
         // Start the real download without leaving the page: an attachment loaded
         // in a hidden frame downloads while we send the page on to the account.
         if(target){var f=document.createElement('iframe');f.style.display='none';f.src=target;document.body.appendChild(f);}

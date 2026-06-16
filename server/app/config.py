@@ -64,6 +64,13 @@ REGISTER_WINDOW_MINUTES = int(os.environ.get("REGISTER_WINDOW_MINUTES", "60"))
 RESET_MAX_REQUESTS = int(os.environ.get("RESET_MAX_REQUESTS", "5"))
 RESET_WINDOW_MINUTES = int(os.environ.get("RESET_WINDOW_MINUTES", "60"))
 
+# Setup codes: the short code shown at the download gate that the desktop app
+# redeems to pre-fill the email. Single-use, short-lived, and the claim endpoint
+# is throttled so the code space cannot be swept to harvest addresses.
+ONBOARD_CODE_TTL_HOURS = int(os.environ.get("ONBOARD_CODE_TTL_HOURS", "24"))
+ONBOARD_MAX_ATTEMPTS = int(os.environ.get("ONBOARD_MAX_ATTEMPTS", "20"))
+ONBOARD_WINDOW_MINUTES = int(os.environ.get("ONBOARD_WINDOW_MINUTES", "10"))
+
 # Extra browser origins allowed to call the API (comma-separated). Empty is the
 # safe default: the account pages are served by this same app, so same-origin
 # fetches need no CORS at all. Set this only if the landing page is ever hosted
