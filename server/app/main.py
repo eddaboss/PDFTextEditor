@@ -551,13 +551,70 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
 .dlgo:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
 .dlerr{margin:12px 0 0;font-size:13.5px;color:#b3402a;font-weight:500}
 
-/* entrance motion (enhances already-visible content) */
-.rise{animation:rise .7s cubic-bezier(.16,1,.3,1) both}
+/* ============================ MOTION ============================
+   Calm + editorial: ease-out only, never bounce. Everything is progressive
+   enhancement -- the page is fully visible without JS (reveal initial states
+   only arm once <html> gets .motion-ready), and reduced-motion collapses it. */
+:root{
+  --ease-out:cubic-bezier(.22,1,.36,1);   /* ease-out-quint */
+  --ease-soft:cubic-bezier(.16,1,.3,1);    /* ease-out-expo  */
+}
+/* hero first-load entrance (the one rehearsed moment) */
+.rise{animation:rise .7s var(--ease-soft) both}
 .rise.d1{animation-delay:.06s}.rise.d2{animation-delay:.12s}
 .rise.d3{animation-delay:.18s}.rise.d4{animation-delay:.24s}
 @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+
+/* scroll reveals -- only armed after JS adds .motion-ready, so no-JS ships visible */
+html.motion-ready [data-rv]{opacity:0;
+  transition:opacity .7s var(--ease-out),transform .7s var(--ease-out)}
+html.motion-ready [data-rv=up]{transform:translateY(22px)}
+html.motion-ready [data-rv=scale]{transform:scale(.975)}
+html.motion-ready [data-rv].rv-in{opacity:1;transform:none}
+/* staggered children for card grids / lists (legit sibling stagger, capped) */
+html.motion-ready [data-rvs]>*{opacity:0;transform:translateY(16px);
+  transition:opacity .6s var(--ease-out),transform .6s var(--ease-out)}
+html.motion-ready [data-rvs].rv-in>*{opacity:1;transform:none}
+html.motion-ready [data-rvs].rv-in>*:nth-child(2){transition-delay:.06s}
+html.motion-ready [data-rvs].rv-in>*:nth-child(3){transition-delay:.12s}
+html.motion-ready [data-rvs].rv-in>*:nth-child(4){transition-delay:.18s}
+html.motion-ready [data-rvs].rv-in>*:nth-child(5){transition-delay:.24s}
+html.motion-ready [data-rvs].rv-in>*:nth-child(6){transition-delay:.30s}
+
+/* hover micro-interactions */
+.catchitem,.paiditem{transition:transform .2s var(--ease-out),
+  box-shadow .2s var(--ease-out),border-color .2s var(--ease-out)}
+.catchitem:hover,.paiditem:hover{transform:translateY(-3px);
+  border-color:rgba(194,100,63,.4);
+  box-shadow:0 16px 34px -18px var(--shadow),0 4px 10px -6px var(--shadow2)}
+.frow{transition:border-top-color .2s var(--ease-out)}
+.frow:hover{border-top-color:var(--clay)}
+.frow .ic{transition:background .2s var(--ease-out),transform .2s var(--ease-out)}
+.frow:hover .ic{background:rgba(194,100,63,.2);transform:scale(1.07)}
+.cmd{transition:box-shadow .2s var(--ease-out)}
+.cmd:hover{box-shadow:0 8px 20px -10px rgba(42,37,32,.55)}
+.checks li{transition:transform .2s var(--ease-out)}
+.checks li:hover{transform:translateX(3px)}
+.btn:active{transform:scale(.98)}
+
+/* header gains a touch more weight once you scroll past the hero */
+header{transition:box-shadow .25s var(--ease-out),background .25s var(--ease-out)}
+header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
+  background:color-mix(in srgb,var(--paper) 94%,transparent)}
+
+/* modal entrances: backdrop fades, card eases up */
+.lmodal,.dlmodal{animation:backdropIn .25s var(--ease-out)}
+.lcard,.dlcard{animation:cardIn .34s var(--ease-out) both}
+@keyframes backdropIn{from{opacity:0}to{opacity:1}}
+@keyframes cardIn{from{opacity:0;transform:translateY(10px) scale(.97)}
+  to{opacity:1;transform:none}}
+
 @media(prefers-reduced-motion:reduce){
-  .rise{animation:none}.caret{animation:none}html{scroll-behavior:auto}}
+  .rise,.lmodal,.dlmodal,.lcard,.dlcard{animation:none}
+  .caret{animation:none}html{scroll-behavior:auto}
+  html.motion-ready [data-rv],html.motion-ready [data-rvs]>*{
+    opacity:1;transform:none;transition:none}
+  *{transition-duration:.01ms !important;animation-duration:.01ms !important}}
 </style></head><body>
 
 <header><div class="wrap bar">
@@ -830,6 +887,47 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
       }).then(function(c){showCode(c.code);}).catch(function(e2){go.textContent='Sign in & download';fail(e2.message);});
     }
   });
+})();
+</script>
+<script>
+/* Motion: progressive enhancement. The page is fully visible without JS; reveal
+   initial states only arm once <html> gets .motion-ready. The hero keeps its own
+   rehearsed .rise entrance, so it is skipped here. */
+(function(){
+  var R=document.documentElement;
+  var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  var secs=document.querySelectorAll('main > .wrap > section');
+  for(var i=0;i<secs.length;i++){
+    var s=secs[i];
+    if(s.classList.contains('hero'))continue;
+    if(s.classList.contains('bandwrap')){               // drenched panel: eases up in scale
+      var band=s.querySelector('.band');
+      if(band)band.setAttribute('data-rv','scale');
+      continue;
+    }
+    s.querySelectorAll(':scope > h2, :scope > .sub, :scope > .paidnote, :scope > .micro, :scope > .cta, :scope > .donatebox')
+      .forEach(function(el){el.setAttribute('data-rv','up');});           // headers + closers slide up
+    s.querySelectorAll(':scope .opengrid, :scope .catchgrid, :scope .paidgrid, :scope .feat')
+      .forEach(function(el){el.setAttribute('data-rvs','');});            // grids stagger their children
+  }
+  R.classList.add('motion-ready');
+  var hdr=document.querySelector('header'),ticking=false;
+  function onScroll(){
+    if(ticking)return;ticking=true;
+    requestAnimationFrame(function(){
+      if(hdr)hdr.classList.toggle('scrolled',window.scrollY>8);ticking=false;});
+  }
+  window.addEventListener('scroll',onScroll,{passive:true});onScroll();
+  var items=[].slice.call(document.querySelectorAll('[data-rv],[data-rvs]'));
+  if(reduce||!('IntersectionObserver'in window)){      // no-motion / no-IO: reveal everything now
+    items.forEach(function(el){el.classList.add('rv-in');});return;
+  }
+  var io=new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if(e.isIntersecting){e.target.classList.add('rv-in');io.unobserve(e.target);}
+    });
+  },{rootMargin:'0px 0px -12% 0px',threshold:.12});
+  items.forEach(function(el){io.observe(el);});
 })();
 </script>
 </body></html>"""
