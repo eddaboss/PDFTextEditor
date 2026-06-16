@@ -311,7 +311,7 @@ def test_run_migrations_backfills_existing_users_table():
             "CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR, "
             "password_hash VARCHAR, display_name VARCHAR, created_at TIMESTAMP)"))
         conn.execute(text(
-            "INSERT INTO users (email, password_hash) VALUES ('old@x.com', 'h')"))
+            "INSERT INTO users (email, password_hash) VALUES ('old@example.com', 'h')"))
 
     run_migrations(eng)
     run_migrations(eng)  # idempotent: a second run must not error
@@ -320,5 +320,5 @@ def test_run_migrations_backfills_existing_users_table():
     assert "email_verified" in cols and "email_verified_at" in cols
     with eng.connect() as conn:
         row = conn.execute(text(
-            "SELECT email_verified FROM users WHERE email='old@x.com'")).first()
+            "SELECT email_verified FROM users WHERE email='old@example.com'")).first()
     assert row[0] in (0, False)  # existing rows default to unverified
