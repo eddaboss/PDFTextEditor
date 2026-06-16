@@ -1,12 +1,12 @@
 name: Release
 
-# A push to master publishes to the STABLE channel: each platform builds,
-# packages an installer, signs a new tufup bundle for its platform, and merges
-# it onto the channel volume. Releases fire only on master, so day-to-day pushes
-# to dev never cut a build; use the manual "Run workflow" button for a dev build.
+# Each platform builds, packages an installer, signs a new tufup bundle, and
+# merges it onto its channel volume. A push to master publishes to the STABLE
+# channel; a push to dev publishes to the DEV channel (CHANNEL is derived from
+# the ref below). Both only fire when a build-affecting path changes.
 on:
   push:
-    branches: [master]
+    branches: [master, dev]
     paths:
       - 'pdftexteditor/**'
       - 'PDFTextEditor.spec'
