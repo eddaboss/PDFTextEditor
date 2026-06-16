@@ -8,8 +8,24 @@ on:
     branches: [master, dev]
 
 jobs:
+  pii-scan:
+    name: PII / secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Test the scanner
+        run: python tests/test_pii_guard.py
+      - name: Scan for PII and secrets
+        run: python scripts/pii_guard.py --all
+
   build:
     name: Build & test (${{ matrix.os }})
+    # Gate the expensive macOS+Windows matrix on the cheap scan so a PII finding
+    # never burns build minutes.
+    needs: pii-scan
     strategy:
       fail-fast: false
       matrix:
