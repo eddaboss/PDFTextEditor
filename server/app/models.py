@@ -3,7 +3,7 @@ door is open for future opt-in features (cloud storage, etc.) without reshaping
 this."""
 import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -16,6 +16,14 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     display_name: Mapped[str] = mapped_column(String(120), default="")
+    # Whether the email address has been confirmed via a verification link. It
+    # gates nothing in the app today; it is the foundation for any future opt-in
+    # feature that needs a confirmed address. New rows added to an existing table
+    # are backfilled by account_models.run_migrations().
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false")
+    email_verified_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
 

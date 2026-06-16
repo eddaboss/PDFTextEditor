@@ -32,6 +32,45 @@ JWT_TTL_HOURS = int(os.environ.get("JWT_TTL_HOURS", "720"))  # 30 days
 # publishing is disabled (safer default until the token is configured).
 PUBLISH_TOKEN = os.environ.get("PUBLISH_TOKEN", "")
 
+# --- accounts: email, links, throttling -------------------------------------
+# The site's own public origin (e.g. https://pdftexteditor.up.railway.app), used
+# to build the verify / reset links we email. Set it per Railway environment so
+# the dev site links to the dev host and prod to prod. When empty we fall back to
+# the request's own base URL wherever a request is in hand.
+PUBLIC_BASE_URL = os.environ.get("PDFTE_PUBLIC_URL", "").rstrip("/")
+
+# Outbound email (SMTP). With no SMTP_HOST set, the app does not fail: it logs the
+# message body to stdout instead, so the whole account flow is testable locally
+# and in CI without a mail provider. Point these at any SMTP relay for real mail.
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+# "starttls" (587, default), "ssl" (465), or "none" (unencrypted, dev relays).
+SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "starttls").lower()
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "no-reply@pdftexteditor.app")
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME", "PDF Text Editor")
+
+# How long the emailed links stay valid.
+VERIFY_TOKEN_TTL_HOURS = int(os.environ.get("VERIFY_TOKEN_TTL_HOURS", "48"))
+RESET_TOKEN_TTL_HOURS = int(os.environ.get("RESET_TOKEN_TTL_HOURS", "2"))
+
+# Brute-force throttling on the sensitive POST endpoints, counted per client IP
+# over a rolling window. Generous enough never to bother a real person.
+LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "10"))
+LOGIN_WINDOW_MINUTES = int(os.environ.get("LOGIN_WINDOW_MINUTES", "15"))
+REGISTER_MAX_ATTEMPTS = int(os.environ.get("REGISTER_MAX_ATTEMPTS", "8"))
+REGISTER_WINDOW_MINUTES = int(os.environ.get("REGISTER_WINDOW_MINUTES", "60"))
+RESET_MAX_REQUESTS = int(os.environ.get("RESET_MAX_REQUESTS", "5"))
+RESET_WINDOW_MINUTES = int(os.environ.get("RESET_WINDOW_MINUTES", "60"))
+
+# Extra browser origins allowed to call the API (comma-separated). Empty is the
+# safe default: the account pages are served by this same app, so same-origin
+# fetches need no CORS at all. Set this only if the landing page is ever hosted
+# on a different origin than the API.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",")
+                if o.strip()]
+
 
 def ensure_dirs() -> None:
     for d in (UPDATES_DIR, METADATA_DIR, TARGETS_DIR, INSTALLERS_DIR):

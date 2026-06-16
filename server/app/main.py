@@ -27,7 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import models, security
+from . import accounts, models, security
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, METADATA_DIR,
                      PUBLISH_TOKEN, RELEASE_INFO, TARGETS_DIR, UPDATES_DIR,
                      ensure_dirs)
@@ -36,6 +36,11 @@ from .db import Base, engine, get_db
 ensure_dirs()  # before StaticFiles mounts below need the directories
 
 app = FastAPI(title="PDF Text Editor backend", docs_url=None, redoc_url=None)
+
+# The account system (email verification, password reset, password change, a
+# brute-force throttle, optional CORS, and the account pages) lives in
+# accounts.py and wires itself in with this one call.
+accounts.install(app)
 
 
 @app.on_event("startup")
