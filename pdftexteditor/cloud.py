@@ -46,3 +46,9 @@ def login(email: str, password: str):
 
 def me(token: str):
     return _request("/api/auth/me", "GET", token=token)
+
+
+def claim_setup_code(code: str):
+    """Redeem a one-time sign-in code from the website for a session token, so
+    the app signs in with no password. Returns ``(status, {"token", "user"})``."""
+    return _request("/api/onboard/claim", "POST", {"code": code})

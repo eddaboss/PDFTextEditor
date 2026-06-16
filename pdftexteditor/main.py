@@ -107,6 +107,23 @@ def _prompt_update(window, meta) -> None:
             "The update is ready. Quit and reopen to finish updating.")
 
 
+def _maybe_onboard(window) -> None:
+    """First launch only: offer to redeem a website sign-in code, or sign in /
+    create an account. Optional and skippable; shown once, never if already
+    signed in. Uses a short timer so the main window paints first."""
+    from PySide6.QtCore import QSettings
+    s = QSettings("eddaboss", "PDF Text Editor")
+    if s.value("account/token", "") or s.value("account/onboarded", False,
+                                                type=bool):
+        return
+    s.setValue("account/onboarded", True)  # show it at most once
+
+    def _show():
+        from .ui.onboarding_dialog import OnboardingDialog
+        OnboardingDialog(window).exec()
+    QTimer.singleShot(600, _show)
+
+
 def main() -> int:
     # Must run before any window renders text so Core Graphics picks it up.
     _disable_macos_font_smoothing()
@@ -149,6 +166,9 @@ def main() -> int:
     recovered = window._offer_recovery()
     if not cli_paths and not recovered:
         window._restore_session()
+    # First-run account onboarding (optional, skippable): redeem a website
+    # sign-in code, or sign in / create an account. Shown once.
+    _maybe_onboard(window)
     # On-launch update check (installed builds only): non-blocking; offers a
     # one-click install when a newer signed release exists on this channel.
     from . import __version__, updater
