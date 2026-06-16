@@ -2854,17 +2854,19 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(self.act_save.isEnabled())
         self.act_save.changed.connect(
             lambda: self.save_button.setEnabled(self.act_save.isEnabled()))
-        self.save_caret = QToolButton()
+        # A QPushButton (NOT a QToolButton): a QToolButton with a menu ignored
+        # setFixedSize and rendered 42px tall -- 8px past the 34px Save half --
+        # which is what made the split look broken. A QPushButton honours
+        # setFixedSize (same as the Save half) AND shows its menu via setMenu, so
+        # the two halves are the exact same height and read as one pill.
+        self.save_caret = QPushButton()
         self.save_caret.setObjectName("SaveCaret")
-        self.save_caret.setFixedSize(27, 34)       # 27 wide, fill the 34px split
+        self.save_caret.setFixedSize(28, 34)       # matches the 34px Save half
         self.save_caret.setCursor(Qt.PointingHandCursor)
         self.save_caret.setToolTip("Save options")
-        self.save_caret.setAutoRaise(True)
-        self.save_caret.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.save_caret.setIconSize(QSize(15, 15))
         self.save_caret.setIcon(self._caret_icon_white)
+        self.save_caret.setIconSize(QSize(15, 15))
         self.save_caret.setProperty("dirty", False)
-        self.save_caret.setPopupMode(QToolButton.InstantPopup)
         self.save_caret.setMenu(self._build_save_menu())
         savl.addWidget(self.save_button)
         savl.addWidget(self.save_caret)
