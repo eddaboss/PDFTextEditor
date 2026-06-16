@@ -55,7 +55,13 @@ import sys
 
 # The project's own contact address is intentional; everything else is flagged.
 ALLOWLIST_EMAILS = {"edw.luko@gmail.com"}
-ALLOWLIST_DOMAINS = {"example.com", "example.org", "example.net", "email.com"}
+# example.* are reserved test domains; the rest are the product's own domains, so
+# a from-address like no-reply@pdftexteditor.app is the product's identity, not PII.
+ALLOWLIST_DOMAINS = {"example.com", "example.org", "example.net", "email.com",
+                     "pdftexteditor.app", "pdf-for-free.com"}
+# System senders are never a person, regardless of domain.
+ALLOWLIST_LOCALPARTS = {"noreply", "no-reply", "donotreply", "do-not-reply",
+                        "mailer-daemon", "postmaster"}
 # "@2x.png" etc. are filenames, not emails -- their "TLD" is a file extension.
 _FILE_EXT_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "icns",
                   "css", "js", "ts", "py", "md", "json", "html", "txt", "pdf",
@@ -351,8 +357,10 @@ def scan_text(path: str, text: str, common_lower=None):
         for m in EMAIL.finditer(line):
             email, domain = m.group(0), m.group(1)
             tld = domain.rsplit(".", 1)[-1].lower()
+            local = email.split("@", 1)[0].lower()
             if (email.lower() in ALLOWLIST_EMAILS
                     or domain.lower() in ALLOWLIST_DOMAINS
+                    or local in ALLOWLIST_LOCALPARTS
                     or tld in _FILE_EXT_TLDS):
                 continue
             findings.append((EMAIL_RULE, "email address", line_no, idx, email, "email address"))

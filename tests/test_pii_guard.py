@@ -76,6 +76,11 @@ def test_context_gating_keeps_precision():
 def test_allowlisted_email_not_flagged():
     line = _mk("contact ", "edw.luko", "@", "gmail.com")
     assert "email" not in _rules(line), "allowlisted email should not flag"
+    # the product's own from-address and system senders are not personal PII
+    assert "email" not in _rules(_mk("EMAIL_FROM = ", "no-reply", "@", "pdftexteditor.app"))
+    assert "email" not in _rules(_mk("from ", "noreply", "@", "mailer.acme.io"))
+    # a real personal-looking email on a non-reserved domain still flags
+    assert "email" in _rules(_mk("acct = ", "someuser", "@", "mailbox.org"))
 
 
 def test_foreign_names_caught():
