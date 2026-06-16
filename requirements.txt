@@ -13,11 +13,9 @@ tufup==0.10.0
 # 200MB runtime. macOS only -- the marker makes Windows installs skip it.
 ocrmac==1.0.1 ; sys_platform == "darwin"
 
-# OCR pack (optional component, downloaded on demand): the cross-platform
-# RapidOCR engine + image processing. Excluded from the lean base build and
-# delivered as a separately-versioned download. The ONLY OCR engine on Windows;
-# an optional alternative to Apple Vision on macOS.
-rapidocr-onnxruntime==1.2.3
-onnxruntime==1.26.0
-vtracer==0.6.15
-opencv-python==4.13.0.92
+# OCR pack (optional, separately-versioned, downloaded on demand) lives in
+# requirements-ocr.txt: the cross-platform RapidOCR engine + onnxruntime, plus
+# the reconstruct image stack (opencv, vtracer). It is the bulk of the install
+# size, so it is NOT bundled in the base build; the app downloads it once on
+# first OCR use (see pdftexteditor/ocr/pack.py). Apple Vision recognition on
+# macOS needs no model download, but the reconstruct stack is still in the pack.
