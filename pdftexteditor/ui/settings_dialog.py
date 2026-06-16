@@ -17,7 +17,6 @@ import threading
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -35,43 +34,112 @@ _ENGINE_LABELS = {"applevision": "Apple Vision", "rapidocr": "RapidOCR"}
 _TOKEN_KEY = "account/token"
 _EMAIL_KEY = "account/email"
 
+# Page styling: warm canvas behind white rounded cards, a clay Done button, and
+# tidy inputs. Built from the active theme palette (set at theme import, before
+# this module loads lazily), so it follows the OS light/dark mode.
+_PAGE_QSS = f"""
+#SettingsDialog {{ background: {theme.CANVAS_BG}; }}
+#SettingsHeader {{ background: {theme.CHROME_BG};
+    border-bottom: 1px solid {theme.CHROME_BORDER}; }}
+#SettingsPageTitle {{ color: {theme.TEXT_PRIMARY}; }}
+QPushButton#SettingsDoneButton {{ background: {theme.ACCENT_FILL}; color: #ffffff;
+    border: 0; border-radius: 9px; padding: 8px 22px; font-weight: 600; }}
+QPushButton#SettingsDoneButton:hover {{ background: {theme.ACCENT_PRESSED}; }}
+#SettingsEyebrow {{ color: {theme.PANEL_HEADER}; }}
+#SettingsCard {{ background: {theme.SHEET_WHITE};
+    border: 1px solid {theme.CHROME_BORDER}; border-radius: 14px; }}
+#AccountBody {{ background: transparent; border: none; }}
+#SettingsCard QLabel {{ color: {theme.TEXT_PRIMARY}; background: transparent; }}
+#SettingsCard QLabel#SettingsHint {{ color: {theme.TEXT_SECONDARY}; }}
+#SettingsCard QLineEdit {{ background: {theme.CHROME_BG};
+    border: 1px solid {theme.BORDER_STRONG}; border-radius: 8px; padding: 7px 11px;
+    color: {theme.TEXT_PRIMARY}; }}
+#SettingsCard QLineEdit:focus {{ border: 1px solid {theme.ACCENT}; }}
+#SettingsCard QPushButton {{ background: {theme.PANEL_BG};
+    border: 1px solid {theme.BORDER_STRONG}; border-radius: 8px; padding: 7px 14px;
+    color: {theme.TEXT_PRIMARY}; }}
+#SettingsCard QPushButton:hover {{ background: {theme.CANVAS_BG}; }}
+"""
 
-class SettingsDialog(QDialog):
-    """App settings. ``current_engine`` is the effective OCR engine name;
-    ``on_engine_changed(name)`` persists a new choice; ``is_mac`` gates the OCR
-    chooser (Windows has only RapidOCR)."""
+
+class SettingsDialog(QWidget):
+    """App settings, shown as an in-app PAGE (not a separate window).
+    ``current_engine`` is the effective OCR engine name; ``on_engine_changed``
+    persists a new choice; ``is_mac`` gates the OCR chooser (Windows has only
+    RapidOCR); ``on_close`` returns to the document view (the Done button)."""
 
     # (callback, result) marshalled from a worker thread to the GUI thread.
     _asyncDone = Signal(object, object)
 
     def __init__(self, *, is_mac: bool, current_engine: str,
-                 on_engine_changed, parent=None):
+                 on_engine_changed, on_close=None, parent=None):
         super().__init__(parent)
         self.setObjectName("SettingsDialog")
-        self.setWindowTitle("Settings")
-        self.setModal(False)
         self._on_engine_changed = on_engine_changed
+        self._on_close = on_close
         self._engine_buttons: dict = {}
         self._pending_update = None
         self._asyncDone.connect(lambda cb, res: cb(res))
 
-        col = QVBoxLayout(self)
-        col.setContentsMargins(28, 24, 28, 24)
-        col.setSpacing(14)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        col.addWidget(self._section_title("OCR Engine"))
-        col.addWidget(self._mac_ocr_section(current_engine) if is_mac
-                      else self._windows_ocr_section())
-        col.addWidget(self._divider())
-        col.addWidget(self._section_title("Software Update"))
-        col.addWidget(self._updates_section())
-        col.addWidget(self._divider())
-        col.addWidget(self._section_title("Account"))
+        # Page header: title on the left, a Done button on the right that returns
+        # to the document. Sits in its own bar so the page reads like a page.
+        header = QWidget()
+        header.setObjectName("SettingsHeader")
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(28, 18, 24, 18)
+        title = QLabel("Settings")
+        title.setObjectName("SettingsPageTitle")
+        title.setFont(theme.ui_font(20, semibold=True))
+        hl.addWidget(title)
+        hl.addStretch(1)
+        if on_close is not None:
+            done = QPushButton("Done")
+            done.setObjectName("SettingsDoneButton")
+            done.clicked.connect(on_close)
+            hl.addWidget(done)
+        outer.addWidget(header)
+
+        body = QWidget()
+        col = QVBoxLayout(body)
+        col.setContentsMargins(28, 22, 28, 26)
+        col.setSpacing(16)
+        outer.addWidget(body, 1)
+
+        ocr = (self._mac_ocr_section(current_engine) if is_mac
+               else self._windows_ocr_section())
+        col.addWidget(self._card("OCR engine", ocr))
+        col.addWidget(self._card("Software update", self._updates_section()))
         self._account_box = QWidget()
+        self._account_box.setObjectName("AccountBody")
         QVBoxLayout(self._account_box).setContentsMargins(0, 0, 0, 0)
-        col.addWidget(self._account_box)
+        col.addWidget(self._card("Account", self._account_box))
         col.addStretch(1)
         self._rebuild_account()
+
+        self.setStyleSheet(_PAGE_QSS)
+
+    # -- a titled "card": a muted eyebrow above a white rounded panel ------
+    def _card(self, title: str, content: QWidget) -> QWidget:
+        wrap = QWidget()
+        wl = QVBoxLayout(wrap)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.setSpacing(8)
+        eyebrow = QLabel(title.upper())
+        eyebrow.setObjectName("SettingsEyebrow")
+        eyebrow.setFont(theme.ui_font(11, semibold=True))
+        wl.addWidget(eyebrow)
+        card = QWidget()
+        card.setObjectName("SettingsCard")
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(20, 18, 20, 18)
+        cl.setSpacing(10)
+        cl.addWidget(content)
+        wl.addWidget(card)
+        return wrap
 
     # -- shared builders -------------------------------------------------
     def _section_title(self, text: str) -> QLabel:
