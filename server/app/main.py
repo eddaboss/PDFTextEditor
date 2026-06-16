@@ -10,6 +10,8 @@ One small, public API per environment. Responsibilities:
   * A token-auth publish flow so the release pipeline can push a new signed
     release onto the persistent volume.
 """
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -28,9 +30,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import models, security
-from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, METADATA_DIR,
-                     PUBLISH_TOKEN, RELEASE_INFO, TARGETS_DIR, UPDATES_DIR,
-                     ensure_dirs)
+from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
+                     METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
+                     TARGETS_DIR, UPDATES_DIR, ensure_dirs)
 from .db import Base, engine, get_db
 
 ensure_dirs()  # before StaticFiles mounts below need the directories
@@ -42,6 +44,55 @@ app = FastAPI(title="PDF Text Editor backend", docs_url=None, redoc_url=None)
 def _startup() -> None:
     ensure_dirs()
     Base.metadata.create_all(engine)
+
+
+# --- dev-site password gate -------------------------------------------------
+# When PDFTE_SITE_PASSWORD is set (the dev environment), the human-facing site
+# and the installer download sit behind a shared password so the public cannot
+# install the dev build. Left empty in production, so prod stays open. The
+# machine-to-machine paths below are never gated, so the desktop self-updater,
+# Railway's health check, and the token-protected publish flow keep working.
+_GATE_COOKIE = "pdfte_gate"
+_GATE_OPEN_PREFIXES = ("/updates", "/health", "/api/version", "/api/publish",
+                       "/api/repo-state", "/_gate/")
+
+
+def _gate_token() -> str:
+    """A cookie value that cannot be forged without the deploy's JWT secret, and
+    that changes (invalidating old cookies) if the password is rotated."""
+    return hmac.new(JWT_SECRET.encode(), SITE_PASSWORD.encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _gate_ok(request: Request) -> bool:
+    cookie = request.cookies.get(_GATE_COOKIE, "")
+    return bool(cookie) and hmac.compare_digest(cookie, _gate_token())
+
+
+def _login_page(error: bool = False) -> str:
+    err = "<p class=err>That password did not match. Try again.</p>" if error else ""
+    return _LOGIN_HTML.replace("__LOGO__", _LOGO_SVG).replace("__ERR__", err)
+
+
+@app.middleware("http")
+async def _site_gate(request: Request, call_next):
+    if not SITE_PASSWORD:
+        return await call_next(request)          # gate disabled (production)
+    if request.url.path.startswith(_GATE_OPEN_PREFIXES) or _gate_ok(request):
+        return await call_next(request)
+    return HTMLResponse(_login_page(), status_code=401)
+
+
+@app.post("/_gate/login")
+async def gate_login(request: Request) -> Response:
+    form = await request.form()
+    if SITE_PASSWORD and hmac.compare_digest(str(form.get("password", "")),
+                                             SITE_PASSWORD):
+        resp = Response(status_code=303, headers={"Location": "/"})
+        resp.set_cookie(_GATE_COOKIE, _gate_token(), max_age=60 * 60 * 24 * 30,
+                        httponly=True, samesite="lax", secure=True)
+        return resp
+    return HTMLResponse(_login_page(error=True), status_code=401)
 
 
 # --- tufup update repository (read by the desktop self-updater) -------------
@@ -686,6 +737,56 @@ _LOGO_SVG = (
     '<rect x="548" y="658" width="36" height="10" fill="#E04040"/>'
     '<rect x="548" y="712" width="36" height="10" fill="#E04040"/>'
     '</svg>')
+
+# Branded password gate shown by the dev-site middleware. __LOGO__/__ERR__ are
+# filled by _login_page(); CSS braces are literal (this is not an f-string).
+_LOGIN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>PDF Text Editor &middot; dev preview</title>
+<meta name=robots content="noindex,nofollow">
+<link rel=preconnect href="https://fonts.googleapis.com">
+<link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel=stylesheet>
+<style>
+:root{--paper:#FBF9F5;--panel:#F5F1EA;--canvas:#ECE6DC;--line:#E2DACD;
+--ink:#2A2520;--ink2:#5C5346;--ink3:#897E6E;--clay:#C2643F;--clay-fill:#AA4E2C;--clay-press:#8B3E23;
+--display:"Bricolage Grotesque",ui-sans-serif,system-ui,sans-serif;
+--body:"Hanken Grotesk",ui-sans-serif,-apple-system,Segoe UI,Roboto,system-ui,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;
+background:var(--paper);color:var(--ink);font-family:var(--body)}
+.card{width:100%;max-width:380px;background:var(--panel);border:1px solid var(--line);
+border-radius:20px;padding:36px 32px;text-align:center;
+box-shadow:0 24px 64px -34px rgba(42,37,32,.45)}
+.logo{width:62px;height:62px;margin:0 auto 18px}
+.logo svg{width:100%;height:100%;display:block}
+h1{font-family:var(--display);font-weight:700;font-size:23px;margin:0 0 6px;letter-spacing:-.02em}
+.chan{display:inline-block;font-size:11px;font-weight:600;background:var(--canvas);
+color:var(--ink2);padding:2px 9px;border-radius:999px;margin-left:4px;
+vertical-align:middle;text-transform:uppercase;letter-spacing:.06em}
+p.sub{color:var(--ink2);font-size:15px;margin:0 0 22px;line-height:1.5}
+form{display:flex;flex-direction:column;gap:12px}
+input{font-family:var(--body);font-size:16px;padding:13px 15px;border:1px solid var(--line);
+border-radius:12px;background:var(--paper);color:var(--ink);width:100%}
+input:focus{outline:none;border-color:var(--clay);box-shadow:0 0 0 3px rgba(194,100,63,.16)}
+button{font-family:var(--body);font-weight:600;font-size:16px;padding:13px;border:0;
+border-radius:12px;background:var(--clay-fill);color:#fff;cursor:pointer;transition:background .15s}
+button:hover{background:var(--clay-press)}
+.err{color:#B23A2E;font-size:14px;font-weight:500;margin:2px 0 0}
+.foot{margin:20px 0 0;font-size:12.5px;color:var(--ink3);line-height:1.5}
+</style></head>
+<body><main class=card>
+<div class=logo>__LOGO__</div>
+<h1>PDF Text Editor <span class=chan>dev</span></h1>
+<p class=sub>Development preview. Enter the password to continue.</p>
+<form method=post action="/_gate/login" autocomplete=off>
+<input type=password name=password placeholder="Password" aria-label="Password" autofocus required>
+__ERR__
+<button type=submit>Enter</button>
+</form>
+<p class=foot>Looking for the real thing? Visit <b>pdf-for-free.com</b></p>
+</main></body></html>"""
+
 _CK = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10.5l4 4 8-9"/></svg>'
 _APPLE = ('<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
           '<path d="M17.05 12.04c-.03-2.6 2.13-3.85 2.22-3.91-1.21-1.77-3.1-2.01'
