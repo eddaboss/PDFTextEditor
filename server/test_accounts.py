@@ -226,6 +226,37 @@ def test_account_pages_render(client):
         assert "PDF Text Editor" in resp.text
 
 
+def test_consent_reports_account_existence(client):
+    # No account for this email yet: the gate should route to create-account.
+    r1 = client.post("/api/consent",
+                     json={"email": "visitor@example.com", "agreed": True},
+                     headers=_ip("10.1.0.1"))
+    assert r1.status_code == 200
+    assert r1.json()["has_account"] is False
+
+    _register(client, "visitor@example.com", **_ip("10.1.0.2"))
+
+    # Same email after registering: the gate should route to sign-in.
+    r2 = client.post("/api/consent",
+                     json={"email": "visitor@example.com", "agreed": True},
+                     headers=_ip("10.1.0.3"))
+    assert r2.json()["has_account"] is True
+
+
+def test_consent_requires_agreement(client):
+    r = client.post("/api/consent",
+                    json={"email": "noagree@example.com", "agreed": False},
+                    headers=_ip("10.1.0.4"))
+    assert r.status_code == 400
+
+
+def test_auth_pages_prefill_from_query(client):
+    # The pages read ?email= client-side (no server-side echo, so no XSS).
+    for path in ("/login", "/signup", "/forgot"):
+        html = client.get(path).text
+        assert "URLSearchParams(location.search)" in html
+
+
 def test_run_migrations_backfills_existing_users_table():
     """The path prod actually hits: a users table that predates email_verified.
     create_all never alters it, so run_migrations must add the columns."""

@@ -15,7 +15,8 @@ import datetime
 import logging
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import (APIRouter, BackgroundTasks, Depends, Header, HTTPException,
+                     Request)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -225,18 +226,34 @@ def resend_verification(request: Request,
 
 @router.post("/api/auth/password/forgot")
 def forgot_password(body: ForgotIn, request: Request,
+                    background: BackgroundTasks,
                     db: Session = Depends(get_db)) -> dict:
     """Always answers the same way whether or not the email is on file, so the
-    endpoint cannot be used to discover who has an account."""
+    endpoint cannot be used to discover who has an account. The token mint and
+    email send run in a background task (after the response), so a hit and a miss
+    return in the same time and cannot be told apart by response latency."""
     email = body.email.lower().strip()
     user = db.scalar(select(models.User).where(models.User.email == email))
     if user:
+        background.add_task(_send_password_reset, user.id, _base_url(request))
+    return {"ok": True}
+
+
+def _send_password_reset(user_id: int, base_url: str) -> None:
+    """Off-request work for forgot_password: mint a single-use reset token and
+    email the link, on its own session since the request's session is closed."""
+    db = SessionLocal()
+    try:
+        user = db.get(models.User, user_id)
+        if not user:
+            return
         raw = _replace_token(db, user, PURPOSE_RESET,
                              config.RESET_TOKEN_TTL_HOURS)
-        link = _reset_link(raw, request)
+        link = f"{base_url}/reset?token={raw}" if base_url else ""
         if link:
             emailer.send_reset_email(user.email, link)
-    return {"ok": True}
+    finally:
+        db.close()
 
 
 @router.post("/api/auth/password/reset")
@@ -418,6 +435,9 @@ _SIGNUP = """
 <script>
 (function(){
   var f=document.getElementById('f'),msg=document.getElementById('msg'),go=document.getElementById('go');
+  var q=new URLSearchParams(location.search);
+  if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('name').focus();}
+  if(q.get('from')==='download'){show(msg,'Your download is starting. Create your account to finish setting up.','ok');}
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Creating your account...','');
     var email=document.getElementById('email').value.trim();
@@ -445,6 +465,9 @@ _LOGIN = """
 <script>
 (function(){
   var f=document.getElementById('f'),msg=document.getElementById('msg'),go=document.getElementById('go');
+  var q=new URLSearchParams(location.search);
+  if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('pw').focus();}
+  if(q.get('from')==='download'){show(msg,'Your download is starting. Sign in to finish setting up.','ok');}
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Signing in...','');
     try{
@@ -466,6 +489,8 @@ _FORGOT = """
 <script>
 (function(){
   var f=document.getElementById('f'),msg=document.getElementById('msg'),go=document.getElementById('go');
+  var pre=new URLSearchParams(location.search).get('email');
+  if(pre)document.getElementById('email').value=pre;
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;
     var email=document.getElementById('email').value.trim();

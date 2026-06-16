@@ -186,7 +186,10 @@ def record_consent(body: ConsentIn, request: Request,
     db.commit()
     info = (json.loads(RELEASE_INFO.read_text("utf-8"))
             if RELEASE_INFO.exists() else {})
+    # has_account lets the page route an agreeing visitor to sign-in (an account
+    # already uses this email) or create-account (it does not), both pre-filled.
     return {"ok": True, "terms_version": TERMS_VERSION,
+            "has_account": account is not None,
             "mac": info.get("mac"), "windows": info.get("windows")}
 
 
@@ -664,7 +667,16 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
     fetch('/api/consent',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({email:email.value.trim(),agreed:true})})
       .then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j.detail||'Could not record agreement');});return r.json();})
-      .then(function(){go.textContent='Agree & download';close();if(target)window.location=target;})
+      .then(function(d){
+        var addr=email.value.trim();
+        // Start the real download without leaving the page: an attachment loaded
+        // in a hidden frame downloads while we send the page on to the account.
+        if(target){var f=document.createElement('iframe');f.style.display='none';f.src=target;document.body.appendChild(f);}
+        // Existing account -> sign in; otherwise create one. Email pre-filled either way.
+        var dest=(d&&d.has_account)?'/login':'/signup';
+        go.textContent='Downloading...';
+        setTimeout(function(){window.location=dest+'?email='+encodeURIComponent(addr)+'&from=download';},700);
+      })
       .catch(function(e2){go.disabled=false;go.textContent='Agree & download';err.textContent=e2.message;err.hidden=false;});
   });
 })();
