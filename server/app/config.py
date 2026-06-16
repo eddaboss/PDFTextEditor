@@ -64,10 +64,11 @@ REGISTER_WINDOW_MINUTES = int(os.environ.get("REGISTER_WINDOW_MINUTES", "60"))
 RESET_MAX_REQUESTS = int(os.environ.get("RESET_MAX_REQUESTS", "5"))
 RESET_WINDOW_MINUTES = int(os.environ.get("RESET_WINDOW_MINUTES", "60"))
 
-# Setup codes: the short code shown at the download gate that the desktop app
-# redeems to pre-fill the email. Single-use, short-lived, and the claim endpoint
-# is throttled so the code space cannot be swept to harvest addresses.
-ONBOARD_CODE_TTL_HOURS = int(os.environ.get("ONBOARD_CODE_TTL_HOURS", "24"))
+# Sign-in codes: minted only AFTER a person proves their password (or creates an
+# account) at the download gate, then redeemed once by the desktop app to sign
+# in without retyping the password. Short-lived by design, and the claim path is
+# throttled so the code space cannot be swept.
+ONBOARD_CODE_TTL_HOURS = int(os.environ.get("ONBOARD_CODE_TTL_HOURS", "1"))
 ONBOARD_MAX_ATTEMPTS = int(os.environ.get("ONBOARD_MAX_ATTEMPTS", "20"))
 ONBOARD_WINDOW_MINUTES = int(os.environ.get("ONBOARD_WINDOW_MINUTES", "10"))
 

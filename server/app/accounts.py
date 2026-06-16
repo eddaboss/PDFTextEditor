@@ -132,17 +132,18 @@ def _mark_verified(db: Session, user: "models.User") -> None:
         db.commit()
 
 
-# --- setup codes (download gate -> desktop app email pre-fill) ---------------
-def issue_setup_code(db: Session, email: str) -> str:
-    """Mint a fresh setup code for an email and add it to the session (the caller
-    commits). Drops any earlier unused code for the same email. Returns the
-    display code to show the user; only the hash is stored."""
+# --- one-time sign-in codes (web gate -> desktop app) ------------------------
+def mint_signin_code(db: Session, user: "models.User") -> str:
+    """Mint a fresh one-time sign-in code for an already-authenticated user and
+    commit it. Drops any earlier unused code for that user. Returns the display
+    code to show; only the hash is stored."""
     db.execute(delete(OnboardCode).where(
-        OnboardCode.email == email, OnboardCode.used_at.is_(None)))
+        OnboardCode.user_id == user.id, OnboardCode.used_at.is_(None)))
     display, code_hash = security.new_setup_code()
     db.add(OnboardCode(
-        email=email, code_hash=code_hash,
+        user_id=user.id, code_hash=code_hash,
         expires_at=utcnow() + timedelta(hours=config.ONBOARD_CODE_TTL_HOURS)))
+    db.commit()
     return display
 
 
@@ -223,8 +224,7 @@ class ClaimCodeIn(BaseModel):
     code: str = Field(min_length=4, max_length=32)
 
 
-@router.get("/api/account")
-def account_info(user: "models.User" = Depends(current_user)) -> dict:
+def _user_public(user: "models.User") -> dict:
     return {
         "id": user.id,
         "email": user.email,
@@ -234,18 +234,37 @@ def account_info(user: "models.User" = Depends(current_user)) -> dict:
     }
 
 
+@router.get("/api/account")
+def account_info(user: "models.User" = Depends(current_user)) -> dict:
+    return _user_public(user)
+
+
+@router.post("/api/onboard/code")
+def create_signin_code(user: "models.User" = Depends(current_user),
+                       db: Session = Depends(get_db)) -> dict:
+    """Mint a one-time sign-in code for the signed-in user. The web gate calls
+    this right after a password sign-in (or account creation) so it can show the
+    code to carry into the app. Expires in ONBOARD_CODE_TTL_HOURS."""
+    return {"code": mint_signin_code(db, user),
+            "expires_in_hours": config.ONBOARD_CODE_TTL_HOURS}
+
+
 @router.post("/api/onboard/claim")
-def claim_setup_code(body: ClaimCodeIn, db: Session = Depends(get_db)) -> dict:
-    """Redeem a setup code (shown at the download gate) for the email it carries,
-    so the desktop app can pre-fill it. Single-use; the claim path is throttled
-    so the short code space cannot be swept to harvest addresses."""
+def claim_signin_code(body: ClaimCodeIn, db: Session = Depends(get_db)) -> dict:
+    """Redeem a one-time sign-in code (shown at the gate after a web sign-in) for
+    a fresh session token, so the app signs in with no password. Single-use; the
+    path is throttled so the short code space cannot be swept."""
     rec = db.scalar(select(OnboardCode).where(
         OnboardCode.code_hash == security.hash_setup_code(body.code)))
     if not rec or rec.used_at is not None or rec.expires_at < utcnow():
-        raise HTTPException(404, "That setup code is invalid or has expired.")
+        raise HTTPException(404, "That code is invalid or has expired.")
+    user = db.get(models.User, rec.user_id)
+    if not user:
+        raise HTTPException(404, "That code is invalid or has expired.")
     rec.used_at = utcnow()
     db.commit()
-    return {"email": rec.email}
+    return {"token": security.make_token(user.id, user.email),
+            "user": _user_public(user)}
 
 
 @router.post("/api/auth/verify/send")
@@ -437,18 +456,6 @@ margin:6px auto 16px;font-size:27px;font-weight:800}
 .big.ok{background:rgba(63,107,67,.14);color:#3F6B43}
 .big.no{background:rgba(155,44,26,.12);color:#9B2C1A}
 hr.div{border:none;border-top:1px solid var(--line);margin:22px 0}
-.codebox{background:rgba(194,100,63,.08);border:1px solid rgba(194,100,63,.28);
-border-radius:12px;padding:14px 16px;margin:0 0 22px}
-.codettl{font-size:11.5px;font-weight:700;letter-spacing:.05em;
-text-transform:uppercase;color:var(--clay-press);margin-bottom:9px}
-.coderow{display:flex;align-items:center;gap:10px}
-.codeval{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:20px;
-font-weight:700;letter-spacing:.08em;color:var(--ink);background:#fff;
-border:1px solid var(--line);border-radius:8px;padding:8px 12px;flex:1;text-align:center}
-.codecopy{background:var(--clay-fill);color:#fff;border:0;border-radius:8px;
-padding:9px 15px;font:inherit;font-weight:600;font-size:14px;cursor:pointer}
-.codecopy:hover{background:var(--clay-press)}
-.codehint{font-size:13px;color:var(--ink2);margin-top:10px}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 """
 
@@ -467,24 +474,9 @@ async function api(path,opts){
   return data;
 }
 function show(el,text,kind){el.textContent=text;el.className='msg'+(kind?' '+kind:'');}
-function renderSetupCode(){
-  var box=document.getElementById('codebox');if(!box)return;
-  var code;try{code=sessionStorage.getItem('pdfte_setup_code');}catch(e){}
-  if(!code)return;
-  box.innerHTML='<div class=codettl>Desktop app setup code</div>'
-    +'<div class=coderow><code class=codeval></code><button type=button class=codecopy>Copy</button></div>'
-    +'<div class=codehint>Open PDF Text Editor and paste this in the account panel to fill in your email.</div>';
-  box.querySelector('.codeval').textContent=code;
-  box.hidden=false;
-  box.querySelector('.codecopy').addEventListener('click',function(){
-    var b=this;try{navigator.clipboard.writeText(code);}catch(e){}
-    b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);
-  });
-}
 """
 
 _SIGNUP = """
-<div id=codebox class=codebox hidden></div>
 <form id=f autocomplete=on>
   <label>Email<input id=email type=email required autocomplete=email></label>
   <label>Name <span style="font-weight:500;color:var(--ink3)">(optional)</span><input id=name autocomplete=name></label>
@@ -499,7 +491,6 @@ _SIGNUP = """
   var q=new URLSearchParams(location.search);
   if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('name').focus();}
   if(q.get('from')==='download'){show(msg,'Your download is starting. Create your account to finish setting up.','ok');}
-  renderSetupCode();
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Creating your account...','');
     var email=document.getElementById('email').value.trim();
@@ -516,7 +507,6 @@ _SIGNUP = """
 """
 
 _LOGIN = """
-<div id=codebox class=codebox hidden></div>
 <form id=f>
   <label>Email<input id=email type=email required autocomplete=email></label>
   <label>Password<input id=pw type=password required autocomplete=current-password></label>
@@ -531,7 +521,6 @@ _LOGIN = """
   var q=new URLSearchParams(location.search);
   if(q.get('email')){document.getElementById('email').value=q.get('email');document.getElementById('pw').focus();}
   if(q.get('from')==='download'){show(msg,'Your download is starting. Sign in to finish setting up.','ok');}
-  renderSetupCode();
   f.addEventListener('submit',async function(e){
     e.preventDefault();go.disabled=true;show(msg,'Signing in...','');
     try{

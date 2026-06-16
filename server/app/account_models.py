@@ -49,15 +49,17 @@ class EmailToken(Base):
 
 
 class OnboardCode(Base):
-    """A short setup code minted at the download gate and redeemed once by the
-    desktop app to learn the email the user agreed with. Only the hash is stored;
-    the email is what the app gets back. Single-use and short-lived."""
+    """A one-time sign-in code minted after a person authenticates at the download
+    gate, redeemed once by the desktop app to sign that same user in. Tied to the
+    authenticated user; only the code hash is stored. Single-use and short-lived
+    (about an hour)."""
 
     __tablename__ = "onboard_codes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True)
     code_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
-    email: Mapped[str] = mapped_column(String(320), index=True)
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime)
     used_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime, nullable=True)

@@ -49,6 +49,6 @@ def me(token: str):
 
 
 def claim_setup_code(code: str):
-    """Redeem a setup code from the download gate for the email it carries, so
-    the account fields can be pre-filled. Returns ``(status, {"email": ...})``."""
+    """Redeem a one-time sign-in code from the website for a session token, so
+    the app signs in with no password. Returns ``(status, {"token", "user"})``."""
     return _request("/api/onboard/claim", "POST", {"code": code})

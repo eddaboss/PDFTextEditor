@@ -183,16 +183,13 @@ def record_consent(body: ConsentIn, request: Request,
         ip=ip,
         user_agent=request.headers.get("user-agent", "")[:1000],
     ))
-    # A setup code the desktop app can redeem to pre-fill this email (see
-    # accounts.claim_setup_code). The page shows it on the destination it lands on.
-    setup_code = accounts.issue_setup_code(db, email)
     db.commit()
     info = (json.loads(RELEASE_INFO.read_text("utf-8"))
             if RELEASE_INFO.exists() else {})
-    # has_account lets the page route an agreeing visitor to sign-in (an account
-    # already uses this email) or create-account (it does not), both pre-filled.
+    # has_account tells the gate whether to ask for a password (an account uses
+    # this email) or send a brand-new visitor straight to the download.
     return {"ok": True, "terms_version": TERMS_VERSION,
-            "has_account": account is not None, "setup_code": setup_code,
+            "has_account": account is not None,
             "mac": info.get("mac"), "windows": info.get("windows")}
 
 
@@ -640,49 +637,89 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
 <div class=dlmodal id=dlmodal hidden>
   <div class=dlcard role=dialog aria-modal=true aria-label="Agree and download">
     <button class=lclose type=button data-dl-close aria-label="Close">&times;</button>
-    <h3>Before you download</h3>
-    <p class=dlintro>Add your email and agree to the terms. We link the agreement to your account so it stays on record.</p>
+    <h3 id=dltitle>Before you download</h3>
+    <p class=dlintro id=dlintro>Add your email and agree to the terms. We link the agreement to your account so it stays on record.</p>
     <input class=dlfield type=email id=dlemail placeholder="you@example.com" autocomplete=email>
-    <label class=dlcheck><input type=checkbox id=dlagree> <span>I have read and agree to the <button type=button class=inlinelink data-legal=terms>Terms</button> and <button type=button class=inlinelink data-legal=privacy>Privacy Policy</button>.</span></label>
-    <button class="btn dlgo" type=button id=dlgo disabled>Agree &amp; download</button>
+    <input class=dlfield type=password id=dlpw placeholder="Your password" autocomplete=current-password hidden>
+    <label class=dlcheck id=dlagreerow><input type=checkbox id=dlagree> <span>I have read and agree to the <button type=button class=inlinelink data-legal=terms>Terms</button> and <button type=button class=inlinelink data-legal=privacy>Privacy Policy</button>.</span></label>
+    <button class="btn dlgo" type=button id=dlgo disabled>Agree &amp; continue</button>
+    <a id=dlforgot href="/forgot" style="display:none;font-size:13px;margin-top:10px;color:var(--clay-press);text-decoration:none">Forgot your password?</a>
     <p class=dlerr id=dlerr hidden></p>
+    <div id=dlcode hidden style="margin-top:6px"></div>
   </div>
 </div>
 <script>
 (function(){
   var m=document.getElementById('dlmodal'),email=document.getElementById('dlemail'),
-      agree=document.getElementById('dlagree'),go=document.getElementById('dlgo'),
-      err=document.getElementById('dlerr'),target=null;
-  function valid(){return agree.checked && /\S+@\S+\.\S+/.test(email.value.trim());}
+      pw=document.getElementById('dlpw'),agree=document.getElementById('dlagree'),
+      go=document.getElementById('dlgo'),err=document.getElementById('dlerr'),
+      title=document.getElementById('dltitle'),intro=document.getElementById('dlintro'),
+      agreerow=document.getElementById('dlagreerow'),forgot=document.getElementById('dlforgot'),
+      codebox=document.getElementById('dlcode'),target=null,stage='consent';
+  function emailok(){return /\S+@\S+\.\S+/.test(email.value.trim());}
+  function valid(){return stage==='password'?pw.value.length>0:(agree.checked&&emailok());}
   function sync(){go.disabled=!valid();}
-  email.addEventListener('input',sync);agree.addEventListener('change',sync);
+  email.addEventListener('input',sync);agree.addEventListener('change',sync);pw.addEventListener('input',sync);
   email.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
-  function open(url){target=url;err.hidden=true;sync();m.hidden=false;
-    document.body.style.overflow='hidden';setTimeout(function(){email.focus();},40);}
+  pw.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
+  function resetCard(url){
+    target=url;stage='consent';err.hidden=true;codebox.hidden=true;codebox.innerHTML='';
+    title.textContent='Before you download';
+    intro.textContent='Add your email and agree to the terms. We link the agreement to your account so it stays on record.';
+    intro.style.display='';email.style.display='';email.disabled=false;
+    pw.hidden=true;pw.value='';forgot.style.display='none';agreerow.style.display='';
+    go.style.display='';go.textContent='Agree & continue';sync();
+  }
+  function open(url){resetCard(url);m.hidden=false;document.body.style.overflow='hidden';
+    setTimeout(function(){email.focus();},40);}
   function close(){m.hidden=true;document.body.style.overflow='';}
   document.querySelectorAll('[data-dl]').forEach(function(b){
     b.addEventListener('click',function(){open(b.getAttribute('data-dl'));});});
   document.querySelector('[data-dl-close]').addEventListener('click',close);
   m.addEventListener('click',function(e){if(e.target===m)close();});
   document.addEventListener('keydown',function(e){if(e.key==='Escape'&&!m.hidden)close();});
+  function download(){if(target){var f=document.createElement('iframe');f.style.display='none';f.src=target;document.body.appendChild(f);}}
+  function fail(msg){go.disabled=false;err.textContent=msg;err.hidden=false;}
+  function jpost(url,body,token){
+    var h={'Content-Type':'application/json'};if(token)h['Authorization']='Bearer '+token;
+    return fetch(url,{method:'POST',headers:h,body:JSON.stringify(body)}).then(function(r){
+      return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.detail||'Something went wrong.');return j;});});
+  }
+  function toPassword(){
+    stage='password';agreerow.style.display='none';email.disabled=true;
+    title.textContent='Welcome back';
+    intro.textContent='This email already has an account. Enter your password to sign in and get your app code.';
+    pw.hidden=false;forgot.style.display='inline-block';go.textContent='Sign in & download';
+    err.hidden=true;sync();setTimeout(function(){pw.focus();},30);
+  }
+  function newUser(){
+    download();title.textContent='Your download is starting';
+    intro.innerHTML='No account uses this email yet. Open the app to create one, or <a href="/signup?email='+encodeURIComponent(email.value.trim())+'" style="color:var(--clay-press)">create it on the web</a>.';
+    email.style.display='none';agreerow.style.display='none';go.style.display='none';err.hidden=true;
+  }
+  function showCode(code){
+    download();title.textContent="You're signed in";intro.style.display='none';
+    email.style.display='none';pw.hidden=true;forgot.style.display='none';go.style.display='none';
+    codebox.innerHTML='<div style="font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--clay-press);margin-bottom:8px">Your app sign-in code</div>'
+      +'<div style="display:flex;gap:10px;align-items:center"><code id=dlcv style="font-family:ui-monospace,Menlo,monospace;font-size:22px;font-weight:700;letter-spacing:.08em;background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 12px;flex:1;text-align:center"></code><button type=button id=dlcp class=btn style="padding:10px 14px">Copy</button></div>'
+      +'<div style="font-size:13px;color:var(--ink2);margin-top:10px">Open PDF Text Editor and enter this on the first screen. It expires in an hour.</div>';
+    codebox.querySelector('#dlcv').textContent=code;codebox.hidden=false;
+    document.getElementById('dlcp').addEventListener('click',function(){var b=this;try{navigator.clipboard.writeText(code);}catch(e){}b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);});
+  }
   go.addEventListener('click',function(){
-    if(!valid())return;go.disabled=true;go.textContent='One sec...';err.hidden=true;
-    fetch('/api/consent',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({email:email.value.trim(),agreed:true})})
-      .then(function(r){if(!r.ok)return r.json().then(function(j){throw new Error(j.detail||'Could not record agreement');});return r.json();})
-      .then(function(d){
-        var addr=email.value.trim();
-        // Carry the setup code to the page we land on, where it is shown for the app.
-        if(d&&d.setup_code){try{sessionStorage.setItem('pdfte_setup_code',d.setup_code);}catch(e){}}
-        // Start the real download without leaving the page: an attachment loaded
-        // in a hidden frame downloads while we send the page on to the account.
-        if(target){var f=document.createElement('iframe');f.style.display='none';f.src=target;document.body.appendChild(f);}
-        // Existing account -> sign in; otherwise create one. Email pre-filled either way.
-        var dest=(d&&d.has_account)?'/login':'/signup';
-        go.textContent='Downloading...';
-        setTimeout(function(){window.location=dest+'?email='+encodeURIComponent(addr)+'&from=download';},700);
-      })
-      .catch(function(e2){go.disabled=false;go.textContent='Agree & download';err.textContent=e2.message;err.hidden=false;});
+    if(!valid())return;
+    if(stage==='consent'){
+      go.disabled=true;go.textContent='One sec...';err.hidden=true;
+      jpost('/api/consent',{email:email.value.trim(),agreed:true}).then(function(d){
+        if(d&&d.has_account){toPassword();}else{newUser();}
+      }).catch(function(e2){go.textContent='Agree & continue';fail(e2.message);});
+    }else{
+      go.disabled=true;go.textContent='Signing in...';err.hidden=true;
+      jpost('/api/auth/login',{email:email.value.trim(),password:pw.value}).then(function(d){
+        try{localStorage.setItem('pdfte_token',d.token);}catch(e){}
+        return jpost('/api/onboard/code',{},d.token);
+      }).then(function(c){showCode(c.code);}).catch(function(e2){go.textContent='Sign in & download';fail(e2.message);});
+    }
   });
 })();
 </script>

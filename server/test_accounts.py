@@ -250,36 +250,64 @@ def test_consent_requires_agreement(client):
     assert r.status_code == 400
 
 
-def test_setup_code_round_trip(client):
-    r = client.post("/api/consent",
-                    json={"email": "coded@example.com", "agreed": True},
-                    headers=_ip("10.2.0.1"))
-    assert r.status_code == 200
-    code = r.json()["setup_code"]
-    assert code and "-" in code
+def _auth(client, email, password="password123"):
+    r = _register(client, email, password=password, **_ip("10.2.9.9"))
+    return {"Authorization": f"Bearer {r.json()['token']}"}
 
-    # The desktop app redeems the code for the email it was agreed with.
+
+def test_signin_code_round_trip(client):
+    # The web gate mints a code only after a password sign-in (an authed call).
+    auth = _auth(client, "code1@example.com")
+    m = client.post("/api/onboard/code", headers=auth)
+    assert m.status_code == 200
+    code = m.json()["code"]
+    assert "-" in code and m.json()["expires_in_hours"] == 1
+
+    # The app redeems it for a fresh session token (no password needed).
     c = client.post("/api/onboard/claim", json={"code": code},
-                    headers=_ip("10.2.0.2"))
+                    headers=_ip("10.2.0.1"))
     assert c.status_code == 200
-    assert c.json()["email"] == "coded@example.com"
+    assert c.json()["user"]["email"] == "code1@example.com"
+    token = c.json()["token"]
+    assert client.get("/api/account",
+                      headers={"Authorization": f"Bearer {token}"}
+                      ).status_code == 200
 
     # Single use: a second claim of the same code fails.
-    again = client.post("/api/onboard/claim", json={"code": code},
-                        headers=_ip("10.2.0.3"))
-    assert again.status_code == 404
+    assert client.post("/api/onboard/claim", json={"code": code},
+                       headers=_ip("10.2.0.2")).status_code == 404
 
 
-def test_setup_code_normalizes_case_and_dashes(client):
-    r = client.post("/api/consent",
-                    json={"email": "casey@example.com", "agreed": True},
-                    headers=_ip("10.2.0.4"))
-    code = r.json()["setup_code"]
+def test_mint_signin_code_requires_auth(client):
+    # Minting needs a logged-in user; you cannot get a code for someone else.
+    assert client.post("/api/onboard/code").status_code == 401
+
+
+def test_signin_code_normalizes_case_and_dashes(client):
+    auth = _auth(client, "code2@example.com")
+    code = client.post("/api/onboard/code", headers=auth).json()["code"]
     munged = code.lower().replace("-", "")  # how a careless paste might look
     c = client.post("/api/onboard/claim", json={"code": munged},
-                    headers=_ip("10.2.0.5"))
+                    headers=_ip("10.2.0.3"))
     assert c.status_code == 200
-    assert c.json()["email"] == "casey@example.com"
+    assert c.json()["user"]["email"] == "code2@example.com"
+
+
+def test_signin_code_expires(client):
+    from datetime import timedelta
+
+    from app.account_models import OnboardCode, utcnow
+    from sqlalchemy import update
+
+    auth = _auth(client, "code3@example.com")
+    code = client.post("/api/onboard/code", headers=auth).json()["code"]
+    db = SessionLocal()  # force the code past its expiry, then the claim must fail
+    db.execute(update(OnboardCode).values(
+        expires_at=utcnow() - timedelta(minutes=1)))
+    db.commit()
+    db.close()
+    assert client.post("/api/onboard/claim", json={"code": code},
+                       headers=_ip("10.2.0.4")).status_code == 404
 
 
 def test_claim_invalid_code(client):
