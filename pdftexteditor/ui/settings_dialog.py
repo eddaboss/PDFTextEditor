@@ -258,6 +258,11 @@ class SettingsDialog(QDialog):
             self._pw = QLineEdit()
             self._pw.setPlaceholderText("Password")
             self._pw.setEchoMode(QLineEdit.Password)
+            # Pin the system UI font + height so text renders correctly and fits
+            # (an unset font falls back to Qt's default and clips on macOS).
+            for w in (self._code, self._email, self._pw):
+                w.setFont(theme.ui_font())
+                w.setMinimumHeight(34)
             lay.addWidget(self._email)
             lay.addWidget(self._pw)
             r = QHBoxLayout()

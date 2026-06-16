@@ -87,6 +87,12 @@ class OnboardingDialog(QDialog):
         self._pw.setPlaceholderText("Password")
         self._pw.setEchoMode(QLineEdit.Password)
         self._pw.returnPressed.connect(self._submit_form)
+        # Pin the system UI font + a comfortable height on every field. Without an
+        # explicit font a QLineEdit falls back to Qt's default family, which on
+        # macOS mis-renders (per-glyph fallback) and clips inside the box.
+        for w in (self._code, self._name, self._email, self._pw):
+            w.setFont(theme.ui_font())
+            w.setMinimumHeight(34)
         fl.addWidget(self._name)
         fl.addWidget(self._email)
         fl.addWidget(self._pw)
