@@ -415,6 +415,20 @@ section{padding:clamp(48px,7vw,96px) 0}
 h2{font-size:clamp(28px,3.6vw,44px)}
 .sub{font-size:clamp(17px,1.4vw,19px);color:var(--ink2);max-width:60ch;margin:16px 0 0}
 
+/* opening on a mac */
+.macopen{border-top:1px solid var(--line)}
+.macopen .steps{list-style:none;margin:26px 0 0;padding:0;max-width:62ch;
+  display:flex;flex-direction:column;gap:16px;counter-reset:s}
+.macopen .steps li{display:flex;gap:14px;font-size:16px;line-height:1.55;color:var(--ink2)}
+.macopen .steps li::before{counter-increment:s;content:counter(s);flex:none;
+  width:26px;height:26px;border-radius:50%;background:var(--clay-fill);color:#fff;
+  font-weight:700;font-size:14px;display:grid;place-items:center;margin-top:1px}
+.macopen .steps b{color:var(--ink);font-weight:600}
+.cmd{display:block;margin:11px 0 0;font-family:ui-monospace,Menlo,Consolas,monospace;
+  font-size:13.5px;line-height:1.5;background:var(--ink);color:#f3e9dd;padding:12px 14px;
+  border-radius:10px;overflow-x:auto;white-space:nowrap;-webkit-user-select:all;user-select:all}
+.macopen .micro{margin-top:22px}
+
 /* the asterisk section */
 .catch{border-top:1px solid var(--line)}
 .catchgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
@@ -585,6 +599,24 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
         </div>
       </div>
     </div>
+  </section>
+
+  <section id=mac class=macopen>
+    <h2>Opening it on a Mac the first time</h2>
+    <p class=sub>It is a free app I sign myself, not through Apple's paid developer
+      program, so the first time you open it macOS adds one extra step. You only
+      do this once.</p>
+    <ol class=steps>
+      <li><div>Open the <b>.dmg</b> and drag <b>__APPNAME__</b> into your
+        <b>Applications</b> folder.</div></li>
+      <li><div>If macOS says the app is damaged or cannot be opened, open the
+        <b>Terminal</b> app and paste this line, then press Return:
+        <code class=cmd>xattr -dr com.apple.quarantine "/Applications/__APPNAME__.app"</code></div></li>
+      <li><div>Open <b>__APPNAME__</b> normally. It opens straight away every time
+        after that.</div></li>
+    </ol>
+    <p class=micro>No Terminal? Control-click the app in Applications, choose
+      <b>Open</b>, then <b>Open</b> again in the dialog.</p>
   </section>
 
   <section class=catch>
@@ -1211,6 +1243,8 @@ def home() -> str:
     version = info.get("version")
     mac, win = info.get("mac"), info.get("windows")
     chan = "" if CHANNEL == "stable" else f'<span class="chan">{CHANNEL}</span>'
+    # The Mac app (and so the quarantine command path) is named per channel.
+    app_name = "PDF Text Editor (Dev)" if CHANNEL != "stable" else "PDF Text Editor"
 
     def btn(label: str, fname, icon=""):
         if not fname:
@@ -1234,6 +1268,7 @@ def home() -> str:
             .replace("__WIN_BTN__", win_btn)
             .replace("__VER__", ver_line)
             .replace("__CHAN__", chan)
+            .replace("__APPNAME__", app_name)
             .replace("__GH__", GITHUB_URL)
             .replace("__DONATE__", DONATE_URL)
             .replace("__LOGO__", _LOGO_SVG)
