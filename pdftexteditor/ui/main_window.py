@@ -89,6 +89,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QStatusBar,
     QTabBar,
     QToolBar,
@@ -1934,7 +1935,13 @@ class MainWindow(QMainWindow):
         self.canvas = CanvasContainer(self)
         self.view = self.canvas.view
         col.addWidget(self.canvas, 1)
-        self.setCentralWidget(central)
+        # Host the document view in a stack so Settings can appear as an in-app
+        # PAGE (a second stack page) rather than a separate window. The document
+        # view stays at index 0; the settings page is added lazily.
+        self._content_stack = QStackedWidget()
+        self._content_stack.addWidget(central)
+        self._doc_view = central
+        self.setCentralWidget(self._content_stack)
 
         # Empty-state overlay, parented on the canvas so it tracks its geometry.
         self.empty_state = EmptyState(self.open_pdf, self.open_path,
@@ -3232,8 +3239,8 @@ class MainWindow(QMainWindow):
         self._about_dialog.activateWindow()
 
     def _show_settings(self) -> None:
-        """Settings (Preferences on macOS): non-modal, cached. Houses the OCR
-        engine toggle today; accounts and the update channel land here later."""
+        """Show Settings as an in-app PAGE (swap the stacked content), not a
+        separate window. Houses the OCR engine, software update, and account."""
         import sys
         from .settings_dialog import SettingsDialog
         if self._settings_dialog is None:
@@ -3241,12 +3248,18 @@ class MainWindow(QMainWindow):
                 is_mac=(sys.platform == "darwin"),
                 current_engine=self._ocr_engine_pref(),
                 on_engine_changed=self._set_ocr_engine_pref,
+                on_close=self._close_settings,
                 parent=self)
-        else:
-            self._settings_dialog.set_current_engine(self._ocr_engine_pref())
-        self._settings_dialog.show()
-        self._settings_dialog.raise_()
-        self._settings_dialog.activateWindow()
+            self._content_stack.addWidget(self._settings_dialog)
+        self._settings_dialog.set_current_engine(self._ocr_engine_pref())
+        self._settings_dialog._rebuild_account()  # reflect any sign-in change
+        self._content_stack.setCurrentWidget(self._settings_dialog)
+        self.toolbar.hide()
+
+    def _close_settings(self) -> None:
+        """Return from the Settings page back to the document view."""
+        self._content_stack.setCurrentWidget(self._doc_view)
+        self.toolbar.show()
 
     def _sync_toggle_labels(self, *_args) -> None:
         """Show <-> Hide flips for the View menu's checkable panel toggles
@@ -5462,7 +5475,12 @@ class MainWindow(QMainWindow):
             if not raw:
                 return
             state = json.loads(raw)
-            files = [str(p) for p in state.get("files", [])]
+            # Never reopen the repo's test fixtures: they get into a session while
+            # developing and are not real documents. A no-op for a shipped app
+            # (a user has no tests/fixtures path), so this just keeps dev sessions
+            # clean and stops the "app preloaded with random PDFs" effect.
+            files = [str(p) for p in state.get("files", [])
+                     if "/tests/fixtures/" not in str(p).replace(os.sep, "/")]
             for path in files:
                 if os.path.isfile(path):
                     self.open_path(path)
