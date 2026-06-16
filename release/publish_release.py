@@ -80,7 +80,19 @@ def main() -> None:
     if (cfg.REPO_DIR / "metadata" / "root.json").exists():
         repo = Repository.from_config()
     else:
-        repo.initialize()
+        # Fresh/empty volume bootstrap. initialize() reaches tufup's
+        # create_key_pair, which prompts "Overwrite key pair? [n]/y" because the
+        # signing keys are ALREADY restored from the secret above; that input()
+        # raises EOFError in CI (no stdin). Auto-answer the default (empty = keep
+        # the existing keys) so the bootstrap is non-interactive and signs with
+        # the restored keys.
+        import builtins
+        _real_input = builtins.input
+        builtins.input = lambda *a, **k: ""
+        try:
+            repo.initialize()
+        finally:
+            builtins.input = _real_input
     # Idempotent: if this version is already published for this platform, skip
     # add_bundle (it would error on the duplicate) and just refresh the installer.
     targets_dir = cfg.REPO_DIR / "targets"
