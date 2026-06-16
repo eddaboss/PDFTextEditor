@@ -59,6 +59,8 @@ QPushButton#SettingsDoneButton:hover {{ background: {theme.ACCENT_PRESSED}; }}
     border: 1px solid {theme.BORDER_STRONG}; border-radius: 8px; padding: 7px 14px;
     color: {theme.TEXT_PRIMARY}; }}
 #SettingsCard QPushButton:hover {{ background: {theme.CANVAS_BG}; }}
+#SettingsCard QPushButton:disabled {{ background: {theme.CONTROL_FILL_DISABLED};
+    color: {theme.TOOLBAR_ICON_DISABLED}; }}
 """
 
 
