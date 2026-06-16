@@ -15,5 +15,11 @@ assets/AppIcon.iconset/
 release/_repo/
 # Generated at build time by PDFTextEditor.spec from PDFTE_BUILD_CHANNEL.
 pdftexteditor/_build_channel.py
-
-tests/screenshots/
+# Local server dev database (never commit; may hold accounts/consent rows).
+local-dev.db
+server/local-dev.db
+# Release staging scratch (built artifacts).
+release/_staging/
+# Internal design specs + throwaway investigation scripts: kept local, not public.
+docs/
+_probe/

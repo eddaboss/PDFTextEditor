@@ -11,8 +11,8 @@ import sys
 from PIL import Image, ImageDraw
 
 S = 1024
-ACCENT = (10, 102, 255)
-ACCENT_DARK = (7, 78, 200)
+ACCENT = (194, 100, 63)       # clay-500 #C2643F (burnt orange, app accent)
+ACCENT_DARK = (139, 62, 35)   # clay-700 #8B3E23 (gradient foot)
 CARET = (224, 64, 64)
 INK = (60, 62, 66)
 

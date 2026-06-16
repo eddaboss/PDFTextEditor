@@ -6844,8 +6844,7 @@ class PageView(QGraphicsView):
         (``_add_style_defaults``). A document's header text is often WHITE
         because it sits on a dark/colored bar; inherit that white onto a box
         dropped on the white page body and the text is invisible -- typed,
-        present, but unreadable (the bug Edward hit re-typing a name into a
-        background-check report). We do NOT touch a deliberate white-on-a-dark-
+        present, but unreadable. We do NOT touch a deliberate white-on-a-dark-
         bar add: the contrast there is fine, so the color is kept. Only an
         effectively-invisible same-luminance pairing is corrected."""
         try:
