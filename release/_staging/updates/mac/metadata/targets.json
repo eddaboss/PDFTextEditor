@@ -1,0 +1,30 @@
+{
+ "signatures": [
+  {
+   "keyid": "c51b0830318159940c3ec0d44d196e63c20e265ae7c74a6144af0c86facd23e1",
+   "sig": "605b29f912be15f5a9b578a52855ffeae796673230a39b86fd387ea5630b7057fc70c0f55142d1b3a188709795170b9eaec4b11f826e379bbd36bd69da28e704"
+  }
+ ],
+ "signed": {
+  "_type": "targets",
+  "expires": "2026-07-15T23:07:15Z",
+  "spec_version": "1.0.31",
+  "targets": {
+   "PDFTextEditor-0.1.0.tar.gz": {
+    "custom": {
+     "tufup": {
+      "required": false
+     },
+     "user": {
+      "version": "0.1.0"
+     }
+    },
+    "hashes": {
+     "sha256": "90607271f23bab829fed2a7148ec89433e0ae33eccdbd470e1ee528b67b2eb09"
+    },
+    "length": 262
+   }
+  },
+  "version": 2
+ }
+}

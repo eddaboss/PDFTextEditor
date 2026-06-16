@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.DS_Store
+*-edited.pdf
+assets/AppIcon.iconset/
+!PDFTextEditor.spec
+# tufup local repo working state (config + signed metadata); never commit. The
+# private signing key lives only in CI secrets; root.json is committed under
+# pdftexteditor/assets/.
+.tufup-repo-config
+release/_repo/
+# Generated at build time by PDFTextEditor.spec from PDFTE_BUILD_CHANNEL.
+pdftexteditor/_build_channel.py
+
+tests/screenshots/

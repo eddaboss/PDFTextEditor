@@ -1,0 +1,93 @@
+name: Release
+
+# A push to dev publishes to the DEV channel; a push to master publishes to the
+# STABLE channel. Each platform builds, packages an installer, signs a new tufup
+# bundle for its platform, and merges it onto the channel volume.
+on:
+  push:
+    branches: [master, dev]
+    paths:
+      - 'pdftexteditor/**'
+      - 'PDFTextEditor.spec'
+      - 'requirements.txt'
+      - 'build_icon.py'
+      - 'launch.py'
+      - 'release/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: windows-latest
+            platform: win
+    runs-on: ${{ matrix.os }}
+    env:
+      CHANNEL: ${{ github.ref == 'refs/heads/master' && 'stable' || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow requests tufup
+
+      - name: Build app
+        env:
+          PDFTE_BUILD_CHANNEL: ${{ env.CHANNEL }}
+        run: |
+          python build_icon.py
+          pyinstaller --noconfirm "PDFTextEditor.spec"
+
+      - name: Package installer (macOS)
+        if: matrix.platform == 'mac'
+        run: |
+          APP=$(ls -d dist/*.app)
+          VER=$(python -c "import pdftexteditor; print(pdftexteditor.__version__)")
+          NAME=$(basename "$APP" .app)
+          DMG="dist/${NAME// /}-${VER}.dmg"
+          bash release/make_dmg.sh "$APP" "$DMG" "$NAME"
+          echo "APP_DIR=$APP" >> "$GITHUB_ENV"
+          echo "INSTALLER=$DMG" >> "$GITHUB_ENV"
+
+      - name: Install Inno Setup (Windows)
+        if: matrix.platform == 'win'
+        run: choco install innosetup -y --no-progress
+
+      - name: Package installer (Windows)
+        if: matrix.platform == 'win'
+        shell: bash
+        env:
+          PDFTE_BUNDLE_ID: ${{ env.CHANNEL == 'stable' && 'com.eddaboss.pdftexteditor' || 'com.eddaboss.pdftexteditor.dev' }}
+        run: |
+          APPDIR=$(ls -d dist/*/ | head -1)
+          NAME=$(basename "$APPDIR")
+          VER=$(python -c "import pdftexteditor; print(pdftexteditor.__version__)")
+          OUT="${NAME// /}-${VER}-setup"
+          PDFTE_APP_NAME="$NAME" PDFTE_APP_VERSION="$VER" \
+            PDFTE_SRC_DIR="$(cygpath -w "$PWD/${APPDIR%/}")" \
+            PDFTE_OUT_NAME="$OUT" \
+            "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" release/windows_installer.iss
+          echo "APP_DIR=$APPDIR" >> "$GITHUB_ENV"
+          echo "INSTALLER=release/$OUT.exe" >> "$GITHUB_ENV"
+
+      - name: Publish to channel
+        shell: bash
+        env:
+          PDFTE_TUFUP_KEYS: ${{ secrets.PDFTE_TUFUP_KEYS }}
+        run: |
+          if [ "${CHANNEL}" = "stable" ]; then
+            API="${{ secrets.API_URL_PROD }}"; TOK="${{ secrets.PUBLISH_TOKEN_PROD }}"
+          else
+            API="${{ secrets.API_URL_DEV }}"; TOK="${{ secrets.PUBLISH_TOKEN_DEV }}"
+          fi
+          python release/publish_release.py "$API" "$TOK" "${{ matrix.platform }}" "$APP_DIR" "$INSTALLER"

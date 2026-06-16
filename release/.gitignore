@@ -1,0 +1,5 @@
+# NEVER commit the working repo state or the private signing keys to this
+# public repository. The private key lives only in CI secrets; the canonical
+# root.json trust anchor is committed separately under pdftexteditor/assets/.
+_repo/
+*.tar.gz
