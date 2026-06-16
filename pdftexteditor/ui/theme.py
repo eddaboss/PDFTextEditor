@@ -521,7 +521,12 @@ def global_stylesheet() -> str:
     QFrame#ZoomBar QToolButton#ZoomStepBtn:disabled {{ color: {TEXT_TERTIARY}; }}
     QFrame#ZoomBar QToolButton#ZoomButton {{
         border: none; background: transparent;
-        min-width: 44px; padding: 0px 4px; color: {TEXT_PRIMARY};
+        min-width: 58px; padding: 0px 2px 0px 6px; color: {TEXT_PRIMARY};
+    }}
+    /* Show a small dropdown caret so the % reads as the zoom selector. */
+    QFrame#ZoomBar QToolButton#ZoomButton::menu-indicator {{
+        subcontrol-origin: padding; subcontrol-position: right center;
+        right: 3px; width: 8px; height: 8px;
     }}
     QFrame#ZoomBar QToolButton#ZoomButton:hover {{
         background: {WASH_HOVER}; border-radius: {BUTTON_RADIUS}px;
@@ -542,7 +547,7 @@ def global_stylesheet() -> str:
     }}
     QToolBar#MainToolbar QPushButton#SaveButton[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
     QToolBar#MainToolbar QPushButton#SaveButton[dirty="true"]:pressed {{ background: {ACCENT_DEEP}; }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="true"] {{
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="true"] {{
         background: {ACCENT_FILL}; border: none;
         border-left: 1px solid rgba(255,255,255,0.28);
         border-top-right-radius: {CONTROL_RADIUS}px;
@@ -550,7 +555,7 @@ def global_stylesheet() -> str:
         border-top-left-radius: 0px; border-bottom-left-radius: 0px;
         min-width: 27px;
     }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
 
     /* CLEAN -- a quiet neutral pill: BORDER_STRONG outline, control fill, no
        shadow; the caret owns the inner hairline (border-left). */
@@ -566,7 +571,7 @@ def global_stylesheet() -> str:
         background: {WASH_HOVER}; color: {TEXT_PRIMARY};
     }}
     QToolBar#MainToolbar QPushButton#SaveButton:disabled {{ color: {TOOLBAR_ICON_DISABLED}; }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="false"] {{
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="false"] {{
         background: {CONTROL_FILL};
         border: 1px solid {BORDER_STRONG}; border-left: 1px solid {BORDER_STRONG};
         border-top-right-radius: {CONTROL_RADIUS}px;
@@ -574,9 +579,9 @@ def global_stylesheet() -> str:
         border-top-left-radius: 0px; border-bottom-left-radius: 0px;
         min-width: 27px;
     }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="false"]:hover {{ background: {WASH_HOVER}; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="false"]:hover {{ background: {WASH_HOVER}; }}
     /* We draw our own chevron icon -- hide Qt's menu-indicator arrow. */
-    QToolBar#MainToolbar QToolButton#SaveCaret::menu-indicator {{ image: none; width: 0; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret::menu-indicator {{ image: none; width: 0; }}
 
     /* Group dividers: a short, soft hairline that floats inside the bar
        rather than a full-height hard rule. */

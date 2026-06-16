@@ -2748,7 +2748,9 @@ class MainWindow(QMainWindow):
         zbl = QHBoxLayout(zoombar)
         zbl.setContentsMargins(2, 0, 2, 0)
         zbl.setSpacing(0)
-        # Fit: a flat text button -> fit_width.
+        # Fit: a flat text button -> fit the WHOLE page into the window. This is
+        # the adapt-to-window mode: it re-fits automatically as the window
+        # resizes. Fit Width and the presets live in the % selector menu.
         zoom_fit_btn = QToolButton()
         zoom_fit_btn.setObjectName("ZoomFitBtn")
         zoom_fit_btn.setText("Fit")
@@ -2756,8 +2758,8 @@ class MainWindow(QMainWindow):
         zoom_fit_btn.setCursor(Qt.PointingHandCursor)
         zoom_fit_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         zoom_fit_btn.setFont(theme.ui_font(13, medium=True))
-        zoom_fit_btn.setToolTip("Fit width")
-        zoom_fit_btn.clicked.connect(self.fit_width)
+        zoom_fit_btn.setToolTip("Fit whole page (adapts to the window)")
+        zoom_fit_btn.clicked.connect(self.fit_page)
         # 1px vertical hairline divider (colour from QSS, NOT an inline hex).
         zoom_div = QFrame()
         zoom_div.setObjectName("ZoomDivider")
@@ -2773,15 +2775,18 @@ class MainWindow(QMainWindow):
         self._zoom_out_btn.setToolTip("Zoom out")
         self._zoom_out_btn.setFixedSize(22, 22)
         self._zoom_out_btn.clicked.connect(self.zoom_out)
-        # Percent value: a plain clickable button (NO menu) -> actual size (100%).
+        # Percent value: the zoom SELECTOR. Clicking it opens the menu --
+        # Fit Page / Fit Width / Actual Size + presets. (It used to just jump to
+        # 100%, which hid the whole selector and Fit Page; the menu restores them.)
         self.zoom_button = QToolButton()
         self.zoom_button.setText("100%")
         self.zoom_button.setObjectName("ZoomButton")
-        self.zoom_button.setToolTip("Actual size (100%)")
+        self.zoom_button.setToolTip("Zoom level")
         self.zoom_button.setCursor(Qt.PointingHandCursor)
         self.zoom_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.zoom_button.setFont(theme.mono_font(12, semibold=True))
-        self.zoom_button.clicked.connect(lambda: self.set_zoom(1.0))
+        self.zoom_button.setPopupMode(QToolButton.InstantPopup)
+        self.zoom_button.setMenu(self._build_zoom_menu())
         # Plus step: the typographic plus.
         self._zoom_in_btn = QToolButton()
         self._zoom_in_btn.setObjectName("ZoomStepBtn")
@@ -2849,17 +2854,19 @@ class MainWindow(QMainWindow):
         self.save_button.setEnabled(self.act_save.isEnabled())
         self.act_save.changed.connect(
             lambda: self.save_button.setEnabled(self.act_save.isEnabled()))
-        self.save_caret = QToolButton()
+        # A QPushButton (NOT a QToolButton): a QToolButton with a menu ignored
+        # setFixedSize and rendered 42px tall -- 8px past the 34px Save half --
+        # which is what made the split look broken. A QPushButton honours
+        # setFixedSize (same as the Save half) AND shows its menu via setMenu, so
+        # the two halves are the exact same height and read as one pill.
+        self.save_caret = QPushButton()
         self.save_caret.setObjectName("SaveCaret")
-        self.save_caret.setFixedSize(27, 34)       # 27 wide, fill the 34px split
+        self.save_caret.setFixedSize(28, 34)       # matches the 34px Save half
         self.save_caret.setCursor(Qt.PointingHandCursor)
         self.save_caret.setToolTip("Save options")
-        self.save_caret.setAutoRaise(True)
-        self.save_caret.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        self.save_caret.setIconSize(QSize(15, 15))
         self.save_caret.setIcon(self._caret_icon_white)
+        self.save_caret.setIconSize(QSize(15, 15))
         self.save_caret.setProperty("dirty", False)
-        self.save_caret.setPopupMode(QToolButton.InstantPopup)
         self.save_caret.setMenu(self._build_save_menu())
         savl.addWidget(self.save_button)
         savl.addWidget(self.save_caret)
@@ -2934,7 +2941,10 @@ class MainWindow(QMainWindow):
         self.page_prefix.setAlignment(Qt.AlignVCenter)
         self.page_field = _PageField()
         self.page_field.setObjectName("PageField")
-        self.page_field.setFixedSize(34, 28)
+        # 22px (not 28): QStatusBar adds its own internal vertical margin, so a
+        # 28px field inside the 30px STATUS bar overflowed and clipped at the
+        # bottom edge. 22px clears the margin with room to spare.
+        self.page_field.setFixedSize(38, 22)
         self.page_field.setAlignment(Qt.AlignCenter)
         self.page_field.setFont(nav_mono)
         self.page_field.returnPressed.connect(self._page_field_entered)
@@ -2944,8 +2954,8 @@ class MainWindow(QMainWindow):
         self.page_total.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         nav = QWidget()
         nav.setObjectName("FooterNavPill")
-        # Let the 28px field drive the height (STATUS_HEIGHT is 30, so it fits);
-        # the words read as inline text around it, no surrounding pill.
+        # The 22px field sits comfortably inside the 30px status bar (clearing
+        # QStatusBar's internal margin); the words read as inline text around it.
         nav_l = QHBoxLayout(nav)
         nav_l.setContentsMargins(0, 0, 0, 0)
         nav_l.setSpacing(6)
@@ -6767,6 +6777,21 @@ class MainWindow(QMainWindow):
 
     def fit_width(self) -> None:
         self._set_zoom_mode("fit_width")
+
+    def _build_zoom_menu(self) -> QMenu:
+        """The zoom selector menu on the % value: the fit modes + actual size +
+        preset levels. Restored after the toolbar rework dropped the dropdown
+        (which had left Fit Page reachable only via Cmd+9)."""
+        m = QMenu(self)
+        m.addAction(self.act_fit_page)      # Fit Page  (Ctrl+9)
+        m.addAction(self.act_fit_width)     # Fit Width (Ctrl+8)
+        m.addAction(self.act_actual_size)   # 100%      (Ctrl+0)
+        m.addSeparator()
+        for preset in ZOOM_PRESETS:
+            act = m.addAction(f"{int(round(preset * 100))}%")
+            act.triggered.connect(
+                lambda _checked=False, z=preset: self.set_zoom(z))
+        return m
 
     def _set_zoom_mode(self, mode: str) -> None:
         # ASSUMPTION (BUILD_SPEC §5.2): PageView.set_zoom_mode("fit_page"|
