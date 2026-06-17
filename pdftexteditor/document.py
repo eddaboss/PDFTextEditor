@@ -436,6 +436,13 @@ class NewBox:
     # pixel-identical to the scan; editing a word flips it to 0 so the cover then
     # whites out the scanned word and the replacement shows. Ordinary boxes stay 0.
     render_mode: int = 0
+    # 0.3.0 scanned-edit blend: a degraded+recolored RGB raster (PNG bytes) of the
+    # edited word and its placement rect (text-space). Set ONLY for an edited
+    # scanned-OCR box (one with a cover); when present the bake draws this image
+    # over the cover instead of crisp vector text, so the edit matches the scan's
+    # ink colour and degradation. Empty for every ordinary box.
+    edit_image: bytes = b""
+    edit_image_rect: tuple = ()
 
     @property
     def edit_key(self) -> tuple:
@@ -1137,6 +1144,76 @@ class PDFDocument:
         if pm.n >= 3:
             return np.ascontiguousarray(arr[..., :3])
         return np.repeat(arr[..., :1], 3, axis=2)
+
+    def _scanned_edit_raster(self, box: "NewBox", new_text: str):
+        """For an edited scanned-OCR box (one carrying a 7-tuple cover), render
+        ``new_text`` in the matched bundled font, recover the scan's ink/paper and
+        local dropout severity from the word's region, hard-damage it (ocr.degrade),
+        and return ``(png_bytes, rect)`` to draw over the cover so the edit matches
+        the scan's colour + degradation. None if anything is unavailable (the caller
+        then falls back to plain vector text). Non-rotated pages (the common scan)."""
+        import io
+        import numpy as np
+        cover = box.cover
+        if not (cover and len(cover) == 7) or not new_text.strip():
+            return None
+        try:
+            import cv2
+            from .ocr import degrade, fontmatch
+            x0, y0, x1, y1 = (float(c) for c in cover[:4])
+            fpath = os.path.join(fontmatch._DIR,
+                                 fontmatch._CANDIDATES.get(box.font_family, ""))
+            if not fontmatch._CANDIDATES.get(box.font_family) or not os.path.exists(fpath):
+                return None
+            dpi = 300.0
+            ppi = dpi / 72.0
+            page_rgb = self.render_page_image(box.page_index, dpi)
+            H, W = page_rgb.shape[:2]
+            rx0, ry0 = max(0, int(x0 * ppi)), max(0, int(y0 * ppi))
+            rx1, ry1 = min(W, int(x1 * ppi)), min(H, int(y1 * ppi))
+            region = page_rgb[ry0:ry1, rx0:rx1]
+            if region.size == 0 or region.shape[0] < 4 or region.shape[1] < 6:
+                return None
+            g = region.mean(2)
+            paper_guess = float(np.percentile(g, 85))
+            dark = g < paper_guess * 0.7                     # scanned ink pixels
+            ink, paper = degrade.sample_ink_paper(region, dark)
+            m = dark.astype(np.uint8)
+            if int(m.sum()) >= 8:                            # dropout fraction -> severity
+                closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+                sev = float(np.clip((int(closed.sum()) - int(m.sum())) /
+                                    max(int(closed.sum()), 1), 0.05, 0.6))
+            else:
+                sev = 0.25
+            f = fitz.Font(fontfile=fpath)
+            em = max(8.0, float(box.size))
+            runw = f.text_length(new_text, em)
+            doc = fitz.open()
+            pg = doc.new_page(width=runw + 2 * em, height=em * 3)
+            tw = fitz.TextWriter(pg.rect)
+            tw.append((em, em * 2.0), new_text, font=f, fontsize=em)
+            tw.write_text(pg, color=(0.06, 0.06, 0.06))
+            pm = pg.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
+            wr = np.frombuffer(pm.samples, np.uint8).reshape(
+                pm.height, pm.width, pm.n)[..., :3].copy()
+            cov = (255 - wr.mean(2)) / 255.0
+            ys = np.where(cov.max(1) > 0.12)[0]
+            xs = np.where(cov.max(0) > 0.12)[0]
+            if not len(ys) or not len(xs):
+                return None
+            wr = wr[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            deg = degrade.degrade_patch(wr, ink, paper, sev,
+                                        seed=box.box_id * 131 + len(new_text))
+            ok, buf = cv2.imencode(".png", cv2.cvtColor(deg, cv2.COLOR_RGB2BGR))
+            if not ok:
+                return None
+            # Fill the ORIGINAL word's box so the edit can never overflow into the
+            # neighbouring scanned words (a same-length edit barely distorts; this
+            # avoids the "fortydays" abutment). insert_image scales to this rect.
+            rect = (x0, y0, x1, y1)
+            return bytes(buf), rect
+        except Exception:
+            return None
 
     def ocr_text_placement(self, page_index: int,
                            display_origin_pt: tuple) -> tuple:
@@ -1974,6 +2051,17 @@ class PDFDocument:
             # words stay invisible over the original scan pixels.
             if cur.render_mode != 0:
                 updated = replace(updated, render_mode=0)
+            # 0.3.0: a scanned-OCR word carries a cover; render its edit as a
+            # recolored + hard-damaged raster (sampled from the scan under the
+            # cover) so it blends, instead of drawing crisp vector text. Falls back
+            # to plain text if the raster cannot be built.
+            if cur.cover and len(cur.cover) == 7:
+                raster = self._scanned_edit_raster(updated, new_text)
+                if raster is not None:
+                    updated = replace(updated, edit_image=raster[0],
+                                      edit_image_rect=raster[1])
+                else:
+                    updated = replace(updated, edit_image=b"", edit_image_rect=())
             updated = replace(updated, bbox=self._newbox_bbox(updated))
             after = _BoxState(newbox=updated, exists=True)
             self._push_command(key, None, "text", before, after,
@@ -3746,6 +3834,13 @@ class PDFDocument:
                 x0, y0, x1, y1, r, g, b = box.cover
                 page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                color=(r, g, b), fill=(r, g, b), width=0)
+                # 0.3.0: an edited scanned word is drawn as a recolored+degraded
+                # raster over the cover, so it blends with the scan instead of
+                # crisp vector text. (Ordinary boxes never carry edit_image.)
+                if box.edit_image and box.edit_image_rect:
+                    page.insert_image(fitz.Rect(box.edit_image_rect),
+                                      stream=box.edit_image, keep_proportion=False)
+                    continue
             rf = engine.resolve_family(box.font_family, box.bold, box.italic,
                                        box.text)
             fontname = self._register_resolved(engine, page, rf, registered)
@@ -4904,6 +4999,12 @@ class PDFDocument:
                 x0, y0, x1, y1, r, g, b = box.cover
                 page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                color=(r, g, b), fill=(r, g, b), width=0)
+                # 0.3.0: blended raster for an edited scanned word (see
+                # _apply_page_edits; keep both seams in lockstep).
+                if box.edit_image and box.edit_image_rect:
+                    page.insert_image(fitz.Rect(box.edit_image_rect),
+                                      stream=box.edit_image, keep_proportion=False)
+                    continue
             rf = engine.resolve_family(box.font_family, box.bold, box.italic,
                                        box.text)
             fontname = PDFDocument._register_resolved(engine, page, rf, registered)
