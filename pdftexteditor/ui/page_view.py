@@ -6022,8 +6022,17 @@ class PageView(QGraphicsView):
             self._apply_runs_to_editor(editor, staged_runs)
 
         if self._editor_multiline:
-            x0, y0, x1, y1 = self.document.effective_bbox(page, box)
-            editor.setTextWidth(max(1.0, (x1 - x0) * z))
+            # An OCR paragraph carries box_w: its column width in DISPLAY points
+            # (rotation-correct). Wrap the editor to THAT, not the text-space bbox
+            # width -- on a /Rotate page the text-space width is the block's display
+            # HEIGHT, so wrapping to it stacked every paragraph ~one word per line.
+            bw = getattr(box, "box_w", None)
+            if bw:
+                wrap_w = bw * z
+            else:
+                x0, y0, x1, y1 = self.document.effective_bbox(page, box)
+                wrap_w = (x1 - x0) * z
+            editor.setTextWidth(max(1.0, wrap_w))
             align = eff.get("alignment", "left")
             leading_pt = getattr(box, "leading", 0.0) or (eff_size * 1.2)
             if self._editor_hard_wrapped:
