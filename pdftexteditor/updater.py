@@ -73,9 +73,17 @@ def _reset_metadata_cache() -> None:
 
 
 def _install_dir() -> Path:
-    if is_frozen():
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent  # source checkout (no real update)
+    if not is_frozen():
+        return Path(__file__).resolve().parent.parent  # source checkout (no real update)
+    exe_dir = Path(sys.executable).resolve().parent
+    # On macOS the frozen exe runs from <App>.app/Contents/MacOS. The update
+    # archive holds the bundle's Contents/, so the install target is the .app
+    # ITSELF (Contents/ merges into it). Returning the MacOS dir would make tufup
+    # copy Contents/ INTO it -- a broken, nested bundle.
+    if (sys.platform == "darwin" and exe_dir.name == "MacOS"
+            and exe_dir.parent.name == "Contents"):
+        return exe_dir.parent.parent
+    return exe_dir
 
 
 def _make_client(current_version: str):
@@ -120,14 +128,19 @@ def check_for_updates(current_version: str):
 
 def apply_update(current_version: str) -> bool:
     """Download + apply the latest update (patch-based when smaller). Returns
-    True if an update was applied (the app then needs a restart)."""
+    True if an update was applied (the app then needs a restart).
+
+    skip_confirmation=True is REQUIRED: without it tufup calls input() for a
+    terminal y/n prompt, which raises EOFError in a windowed (no-stdin) build and
+    aborts the install."""
     try:
         client = _make_client(current_version)
         if client.check_for_updates() is None:
             return False
-        client.download_and_apply_update()
+        client.download_and_apply_update(skip_confirmation=True)
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("update install failed: %s", e)
         return False
 
 
