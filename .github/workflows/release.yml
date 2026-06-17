@@ -18,26 +18,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  reset:
-    # One-shot volume clean. When a release commit message contains
-    # [reset-updates], wipe this channel's update tree + installers FIRST, so the
-    # build below republishes a single clean baseline (drops accumulated/broken
-    # archives). A normal release skips this step entirely.
-    runs-on: ubuntu-latest
-    steps:
-      - name: Wipe update volume
-        if: contains(github.event.head_commit.message, '[reset-updates]')
-        env:
-          API: ${{ github.ref == 'refs/heads/master' && secrets.API_URL_PROD || secrets.API_URL_DEV }}
-          TOKEN: ${{ github.ref == 'refs/heads/master' && secrets.PUBLISH_TOKEN_PROD || secrets.PUBLISH_TOKEN_DEV }}
-        run: |
-          echo "Wiping update volume for a clean baseline..."
-          curl -fsS -X POST "$API/api/admin/wipe-updates" \
-            -H "Authorization: Bearer $TOKEN"
-          echo
-
   release:
-    needs: [reset]
+    # NOTE: there is deliberately NO channel "reset"/wipe step. Wiping a channel
+    # volume restarts the tufup/TUF metadata version counter at 1, which is BELOW
+    # what installed clients have already cached -- they then reject every later
+    # release as a rollback attack and are bricked until their local cache is
+    # cleared. TUF metadata versions must only ever increase per channel, forever.
+    # To prune accumulated archives, do a normal signed republish that drops old
+    # targets (still bumps the version); never wipe.
     strategy:
       fail-fast: false
       matrix:
