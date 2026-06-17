@@ -34,9 +34,12 @@ _ENGINE_LABELS = {"applevision": "Apple Vision", "rapidocr": "RapidOCR"}
 _TOKEN_KEY = "account/token"
 _EMAIL_KEY = "account/email"
 
-# Page styling: warm canvas behind white rounded cards, a clay Done button, and
+# Page styling: warm canvas behind raised rounded cards, a clay Done button, and
 # tidy inputs. Built from the active theme palette (set at theme import, before
-# this module loads lazily), so it follows the OS light/dark mode.
+# this module loads lazily), so it follows the OS light/dark mode. The cards use
+# the mode-aware CARD_BG surface (light: warm off-white, dark: a raised brown),
+# NOT the fixed SHEET_WHITE that is reserved for the PDF page -- otherwise dark
+# mode renders light ink on a white card and the text is unreadable.
 _PAGE_QSS = f"""
 #SettingsDialog {{ background: {theme.CANVAS_BG}; }}
 #SettingsHeader {{ background: {theme.CHROME_BG};
@@ -46,10 +49,11 @@ QPushButton#SettingsDoneButton {{ background: {theme.ACCENT_FILL}; color: #fffff
     border: 0; border-radius: 9px; padding: 8px 22px; font-weight: 600; }}
 QPushButton#SettingsDoneButton:hover {{ background: {theme.ACCENT_PRESSED}; }}
 #SettingsEyebrow {{ color: {theme.PANEL_HEADER}; }}
-#SettingsCard {{ background: {theme.SHEET_WHITE};
+#SettingsCard {{ background: {theme.CARD_BG};
     border: 1px solid {theme.CHROME_BORDER}; border-radius: 14px; }}
 #AccountBody {{ background: transparent; border: none; }}
 #SettingsCard QLabel {{ color: {theme.TEXT_PRIMARY}; background: transparent; }}
+#SettingsCard QRadioButton {{ color: {theme.TEXT_PRIMARY}; background: transparent; }}
 #SettingsCard QLabel#SettingsHint {{ color: {theme.TEXT_SECONDARY}; }}
 #SettingsCard QLineEdit {{ background: {theme.CHROME_BG};
     border: 1px solid {theme.BORDER_STRONG}; border-radius: 8px; padding: 7px 11px;
@@ -59,6 +63,8 @@ QPushButton#SettingsDoneButton:hover {{ background: {theme.ACCENT_PRESSED}; }}
     border: 1px solid {theme.BORDER_STRONG}; border-radius: 8px; padding: 7px 14px;
     color: {theme.TEXT_PRIMARY}; }}
 #SettingsCard QPushButton:hover {{ background: {theme.CANVAS_BG}; }}
+#SettingsCard QPushButton:disabled {{ background: {theme.CONTROL_FILL_DISABLED};
+    color: {theme.TOOLBAR_ICON_DISABLED}; }}
 """
 
 
@@ -288,13 +294,29 @@ class SettingsDialog(QWidget):
     def _store(self) -> QSettings:
         return QSettings("eddaboss", "PDF Text Editor")
 
-    def _rebuild_account(self) -> None:
-        lay = self._account_box.layout()
+    @staticmethod
+    def _clear_layout(lay) -> None:
+        """Empty a layout, deleting widgets nested in sub-layouts too. A plain
+        ``takeAt`` loop that only deletes ``item.widget()`` misses the buttons
+        that live inside the signed-in row's QHBoxLayout, leaving an orphaned,
+        default-sized (640x480) QPushButton parented to the account box; styled
+        as a bordered control it then renders as a stray box behind the real
+        content on every rebuild. Recurse so nothing is left behind."""
         while lay.count():
             item = lay.takeAt(0)
             w = item.widget()
-            if w:
+            if w is not None:
+                w.setParent(None)
                 w.deleteLater()
+            else:
+                sub = item.layout()
+                if sub is not None:
+                    SettingsDialog._clear_layout(sub)
+                    sub.deleteLater()
+
+    def _rebuild_account(self) -> None:
+        lay = self._account_box.layout()
+        self._clear_layout(lay)
         token = self._store().value(_TOKEN_KEY, "")
         if token:
             email = self._store().value(_EMAIL_KEY, "") or "your account"

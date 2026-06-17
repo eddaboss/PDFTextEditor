@@ -828,6 +828,34 @@ def global_stylesheet() -> str:
     }}
     QStatusBar#MainStatus::item {{ border: none; }}
 
+    /* --- Menu bar ---------------------------------------------------- */
+    /* The File/Edit/View... bar. Clay-styled for the in-window menu on Windows
+       and Linux (where the bar lives in the window); on macOS the native top
+       menu bar is used and this block is a no-op there. Hover and press match
+       the QMenu dropdowns below: a solid accent fill with white text. */
+    QMenuBar {{
+        background: {CHROME_BG};
+        border: none;
+        border-bottom: 1px solid {CHROME_BORDER};
+        padding: 2px 8px;
+        color: {TEXT_PRIMARY};
+        font-size: {UI_FONT_SIZE}px;
+    }}
+    QMenuBar::item {{
+        background: transparent;
+        padding: 5px 10px;
+        border-radius: {BUTTON_RADIUS}px;
+        color: {TEXT_PRIMARY};
+    }}
+    QMenuBar::item:selected {{
+        background: {ACCENT_FILL};
+        color: #FFFFFF;
+    }}
+    QMenuBar::item:pressed {{
+        background: {ACCENT_PRESSED};
+        color: #FFFFFF;
+    }}
+
     /* --- Menus ------------------------------------------------------- */
     QMenu {{
         background: {CHROME_BG};
