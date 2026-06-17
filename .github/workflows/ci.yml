@@ -56,6 +56,7 @@ jobs:
           python tests/test_font_fidelity.py
           python tests/test_ocr_sizing.py
           python tests/test_ocr_overlay.py
+          python tests/test_degrade.py
 
       - name: Build app (PyInstaller)
         run: pyinstaller --noconfirm "PDFTextEditor.spec"
