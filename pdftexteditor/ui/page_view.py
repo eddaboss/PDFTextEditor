@@ -1925,11 +1925,16 @@ class PageView(QGraphicsView):
             layer.rotation = self.document.page_rotation(pi)
             layer.rotation_matrix = self.document.rotation_matrix(pi)
             rect = self.document.doc[pi].rect
-            # Display-space size is the rotated rect: a 90/270 page swaps w/h.
-            if layer.rotation % 180 == 90:
-                pw, ph = rect.height, rect.width
-            else:
-                pw, ph = rect.width, rect.height
+            # ``page.rect`` ALREADY reflects the page's /Rotate -- a portrait page
+            # rotated 90 reports a 792x612 (landscape) rect. The materialize pass
+            # sizes the slot from get_pixmap, which is ALSO rotated, so pass 1 must
+            # use ``rect`` AS-IS. The old "90/270 swaps w/h" branch DOUBLE-counted
+            # rotation: a rotated page got a wrongly-shaped slot, and where the
+            # real (rotated) height exceeded the allocated height the page overran
+            # into the next one -- the "pages clipping into each other" seen on
+            # scanned/rotated image-only pages (which carry /Rotate far more often
+            # than born-digital text PDFs, hence the "only image pages clip").
+            pw, ph = rect.width, rect.height
             layer.pt_size = (pw, ph)
             layer.y_top = y
             page_h = ph * z
@@ -6344,12 +6349,20 @@ class PageView(QGraphicsView):
         the old ``page_index != self._page_index -> False`` short-circuit made
         the amber edited tint vanish on every materialized page except the one
         under the viewport center, which is wrong in the continuous view where
-        several pages' hotspots are live at once. A NewBox always counts as
-        edited (it IS an edit)."""
+        several pages' hotspots are live at once.
+
+        A NewBox counts as edited ONLY once it actually draws ink. An OCR
+        overlay is born invisible (render_mode 3) over the kept scan; the user
+        editing it flips it to visible (render_mode 0) via stage_edit. So a
+        PRISTINE OCR word (render_mode 3) is NOT edited -- it must stay unmarked
+        like any untouched run, or every recovered word wears the persistent
+        ochre edited tint at rest, smearing tan "yellow bars" across a scanned
+        page. User-added boxes are render_mode 0, so they read as edits as
+        before."""
         if not self.document or box is None:
             return False
         if isinstance(box, NewBox):
-            return True
+            return getattr(box, "render_mode", 0) == 0
         page = getattr(box, "page_index", self._page_index)
         return self.document.staged_text(page, box) != box.text
 
