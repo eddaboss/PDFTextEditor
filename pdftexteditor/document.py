@@ -3492,6 +3492,25 @@ class PDFDocument:
         self._saved_undo_depth = len(self._undo)
         self._saved_had_staged = self.has_edits
 
+    def is_edit_unsaved(self, page_index: int, box) -> bool:
+        """True when ``box`` carries an edit made SINCE the last save -- the
+        in-place edit signature shows only for UNSAVED changes and clears once
+        saved (the edit itself persists, it just stops being flagged).
+
+        An edit is on disk iff its undo command sits at or below the saved
+        baseline (``_saved_undo_depth``); commands above it are pending. A
+        ``-1`` baseline means the saved state is no longer reachable (undo/redo
+        crossed it), so every currently-applied edit reads as unsaved."""
+        depth = self._saved_undo_depth
+        if depth < 0:
+            depth = 0
+        unsaved = self._undo[depth:]
+        if not unsaved:
+            return False
+        key = (box.edit_key if isinstance(box, NewBox)
+               else self._span_edit_key(page_index, box))
+        return any(cmd.edit_key == key for cmd in unsaved)
+
     # --- document info / metadata (doc-tools M1) ---------------------------
     def metadata_fields(self) -> dict:
         """The four user-editable Description fields (Properties dialog), read

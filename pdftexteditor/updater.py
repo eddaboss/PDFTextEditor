@@ -12,6 +12,7 @@ rolled-back local metadata cache by retrying once from the bundled root.
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -126,9 +127,37 @@ def check_for_updates(current_version: str):
             return ("__error__", str(second))
 
 
+def _install_and_relaunch(src_dir, dst_dir, **kwargs) -> None:
+    """tufup install callable: place the update, relaunch the app, then hard-exit
+    THIS process. Replaces tufup's default install, which is broken here twice
+    over: it relaunches with ``subprocess.Popen(sys.executable, shell=True)`` -- a
+    shell cannot parse the macOS app path (spaces + parens) -- and it calls
+    ``sys.exit(0)``, which from our Qt worker thread only kills the thread and
+    leaves the old app frozen on "Downloading and installing…". We run off the GUI
+    thread, so the process has to be torn down with ``os._exit``."""
+    if sys.platform == "darwin":
+        # The running .app can be overwritten in place; merge the new Contents/
+        # into the bundle, then relaunch via `open` (argv list, so the spaces and
+        # parens are safe; -n forces a fresh instance).
+        shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True, symlinks=True)
+        subprocess.Popen(["/usr/bin/open", "-n", str(dst_dir)])
+    else:
+        # Windows: the running exe is locked, so tufup defers the swap to a script
+        # that waits for THIS process to exit before replacing files and
+        # relaunching. Its own sys.exit only kills our worker thread, hence the
+        # os._exit below that actually lets that script proceed.
+        from tufup.utils.platform_specific import install_update
+        try:
+            install_update(src_dir=src_dir, dst_dir=dst_dir, **kwargs)
+        except SystemExit:
+            pass
+    os._exit(0)
+
+
 def apply_update(current_version: str) -> bool:
-    """Download + apply the latest update (patch-based when smaller). Returns
-    True if an update was applied (the app then needs a restart).
+    """Download + apply the latest update, then relaunch. On success this does NOT
+    return -- _install_and_relaunch tears down the process and starts the updated
+    build. Returns False only if there was nothing to install or it failed.
 
     skip_confirmation=True is REQUIRED: without it tufup calls input() for a
     terminal y/n prompt, which raises EOFError in a windowed (no-stdin) build and
@@ -137,7 +166,8 @@ def apply_update(current_version: str) -> bool:
         client = _make_client(current_version)
         if client.check_for_updates() is None:
             return False
-        client.download_and_apply_update(skip_confirmation=True)
+        client.download_and_apply_update(
+            skip_confirmation=True, install=_install_and_relaunch)
         return True
     except Exception as e:
         log.warning("update install failed: %s", e)

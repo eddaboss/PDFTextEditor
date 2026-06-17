@@ -5618,6 +5618,13 @@ class MainWindow(QMainWindow):
             return False
         self.document.mark_clean()
         self.undo_stack.setClean()
+        # mark_clean() reset the saved baseline, so every in-place edit signature
+        # is now stale (the runs are on disk). Saving changes no geometry, so Qt
+        # would not repaint the hotspots on its own -- force the scene to redraw
+        # so the ochre marks clear immediately.
+        scene = self.view.scene()
+        if scene is not None:
+            scene.update()
         # Saved: the on-disk file now matches, so drop any crash-recovery copy.
         self._clear_recovery_for(self.document)
         # The edited file was just written: register it with macOS so it lands in
@@ -6511,7 +6518,10 @@ class MainWindow(QMainWindow):
                 if lb.cover:
                     cx0, cy0, cx1, cy1 = self.document.ocr_cover_rect(
                         page_index, lb.cover)
-                    cover = (cx0, cy0, cx1, cy1) + tuple(res.bg_color)
+                    # Each word's OWN local background, so an edited word's cover
+                    # matches its cell, not the page-wide paper median (which
+                    # painted every edit a single off-white/cream).
+                    cover = (cx0, cy0, cx1, cy1) + tuple(lb.bg)
                 self.undo_stack.push(BoxCommand(
                     self.document, self.view, page_index, None, "add", {
                         "origin": origin, "direction": direction,

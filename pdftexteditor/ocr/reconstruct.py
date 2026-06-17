@@ -2,17 +2,17 @@
 page, rendered in a MATCHED REAL FONT (0.3.0: no vtracer scan-built font).
 
 Recognition -> group lines into AREAS (one box per paragraph; a form field stays
-its own box) -> classify the document font (serif / sans / mono) and pick a bundled
-family metric-matched to the common document fonts (Tinos = Times, Arimo = Arial,
-Cousine = Courier) -> place invisible editable text over the kept scan. Editing a
-box flips it visible; a single word recolors + hard-damages to match the scan
-(ocr/degrade.py), a paragraph reflows as a paper-coloured tile (document.py).
+its own box) -> identify the document font (the shipped bank, ~4k fonts; else a
+bundled serif/sans/mono family) -> place invisible editable text over the kept
+scan. Editing a box flips it visible; a single word recolors + hard-damages to
+match the scan (ocr/degrade.py), a paragraph reflows as a local-coloured tile
+(document.py).
 
 This replaces the old ClearScan-style scan-built font (vtracer): that produced
 distorted glyphs and was the bulk of the "looks wrong" problem. Sizing is anchored
 to the OCR box height (reliable), and a box covers a whole AREA (a paragraph edits
-as ONE unit instead of confetti per word) with its rect painted in the paper colour
-once the box is edited. Pure numpy / cv2; runs off the GUI thread.
+as ONE unit instead of confetti per word) with its rect painted in the area's OWN
+local background colour once the box is edited. Pure numpy / cv2; off the GUI thread.
 """
 
 from __future__ import annotations
@@ -43,11 +43,12 @@ class LineBox:
     """One reconstructed editable AREA -- a paragraph or a single line. ``origin``
     is the first line's left baseline (DISPLAY points), ``text`` the recognized
     text (lines joined with a single space), ``size`` the body point size, and
-    ``cover`` the area's rectangle in DISPLAY points (x0,y0,x1,y1) painted in the
-    paper colour under an edit. For a multi-line area ``is_paragraph`` is True and
-    ``box_w`` (column width, display pts) + ``leading`` (baseline-to-baseline)
-    drive the reflow so the whole paragraph edits + wraps as ONE box; a single
-    line leaves them unset and behaves exactly like before."""
+    ``cover`` the area's rectangle in DISPLAY points (x0,y0,x1,y1) painted in
+    ``bg`` (the area's OWN local background colour, not the page-wide paper tone)
+    under an edit. For a multi-line area ``is_paragraph`` is True and ``box_w``
+    (column width, display pts) + ``leading`` (baseline-to-baseline) drive the
+    reflow so the whole paragraph edits + wraps as ONE box; a single line leaves
+    them unset and behaves like before."""
 
     origin: tuple
     text: str
@@ -57,13 +58,14 @@ class LineBox:
     box_w: float | None = None
     leading: float = 0.0
     is_paragraph: bool = False
+    bg: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
 class ReconResult:
-    """Everything the GUI thread needs to inject the OCR result. ``family`` is a
-    bundled font family the boxes render in (no per-page custom font in 0.3.0, so
-    ``otf_bytes`` is empty and the caller skips custom-face registration)."""
+    """Everything the GUI thread needs to inject the OCR result. ``family`` is the
+    matched bank font (``otf_bytes`` holds its bytes, registered as a custom face)
+    or, on a weak/absent match, a bundled family (``otf_bytes`` empty)."""
 
     otf_bytes: bytes
     family_name: str
@@ -86,6 +88,28 @@ def _paper_color(image_rgb: np.ndarray) -> tuple:
     return (float(c[0] / 255), float(c[1] / 255), float(c[2] / 255))
 
 
+def _local_paper_color(image_rgb: np.ndarray, x0: float, y0: float,
+                       x1: float, y1: float, fallback: tuple) -> tuple:
+    """The background colour right around ONE area: the median of the brighter
+    pixels in its (padded) box, so an edited box's cover matches its OWN cell
+    (white, light blue, ...) instead of the page-wide paper median, which on a
+    mixed form paints every edit a single off-white. Dark glyphs are the minority
+    in the box, so the top luminance band is the local background. Falls back to
+    the page paper colour when the crop has too little to go on."""
+    h, w = image_rgb.shape[:2]
+    xi0, yi0 = max(0, int(x0)), max(0, int(y0))
+    xi1, yi1 = min(w, int(x1) + 1), min(h, int(y1) + 1)
+    if xi1 - xi0 < 2 or yi1 - yi0 < 2:
+        return fallback
+    crop = image_rgb[yi0:yi1, xi0:xi1].reshape(-1, 3).astype(np.float32)
+    lum = crop.mean(axis=1)
+    bright = crop[lum >= np.percentile(lum, 70)]
+    if bright.shape[0] < 8:
+        return fallback
+    c = np.median(bright, axis=0)
+    return (float(c[0] / 255), float(c[1] / 255), float(c[2] / 255))
+
+
 def _line_em_px(box_h: float, text: str, x_height_px: float, x_ratio: float) -> float:
     """Estimate the font em (pixels) for one OCR line, anchored to the OCR box
     height (reliable). The measured x-height refines it only on a mixed-case line
@@ -102,7 +126,7 @@ def _line_em_px(box_h: float, text: str, x_height_px: float, x_ratio: float) -> 
 def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
                      base_font_serif: str, base_font_sans: str,
                      family_label: str = "Scanned Text") -> "ReconResult | None":
-    """Build placed word boxes + the matched family for one page. ``image_rgb`` is
+    """Build placed area boxes + the matched family for one page. ``image_rgb`` is
     the page raster at ``dpi``; ``ocr_lines`` a list of ``engine.OcrLine``. The
     ``base_font_*`` args are kept for signature compatibility (no longer used to
     build a font). Returns None when no usable text was recovered."""
@@ -118,6 +142,7 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
     cells: dict = {}          # id -> (char, scan bbox) for bank font ID
     x_ratio = _X_RATIO_SERIF
 
+    page_paper = _paper_color(image_rgb)   # fallback when a line crop is sparse
     for ln in ocr_lines:
         x0, y0, x1, y1 = ln.bbox
         x0i, y0i = max(0, int(x0)), max(0, int(y0))
@@ -134,10 +159,11 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
         if seg.space_px:
             space_em_list.append(seg.space_px / em_px)
         if ln.text.strip():
+            lbg = _local_paper_color(image_rgb, x0i, y0i, x1i, y1i, page_paper)
             raw_lines.append({
                 "x0": x0i, "y0": y0i, "x1": x1i, "y1": y1i,
                 "baseline": y0i + seg.baseline_y, "text": ln.text.strip(),
-                "em": em_px, "conf": ln.confidence,
+                "em": em_px, "conf": ln.confidence, "bg": lbg,
             })
         glyphs = sorted(seg.glyphs, key=lambda g: g.x0)
         for i, g in enumerate(glyphs):
@@ -177,7 +203,7 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
 
     return ReconResult(otf_bytes=otf_bytes, family_name=family, lines=lines,
                        traced_chars="".join(sorted(rep_bitmap.keys())),
-                       n_lines=len(lines), bg_color=_paper_color(image_rgb))
+                       n_lines=len(lines), bg_color=page_paper)
 
 
 def _group_lines_into_areas(raw_lines: list) -> list:
@@ -210,10 +236,10 @@ def _group_lines_into_areas(raw_lines: list) -> list:
 
 def _area_to_box(area: list, ppi: float) -> "LineBox":
     """One AREA (line dicts, top->bottom) -> a LineBox in PDF points. Origin = the
-    first line's left baseline; cover = the area's union rect (+pad). For >= 2
-    lines it is a reflowable PARAGRAPH (``box_w`` = column width, ``leading`` =
-    median baseline-to-baseline gap) so the whole block edits + wraps as one box;
-    a single line leaves those unset and behaves exactly as before."""
+    first line's left baseline; cover = the area's union rect (+pad); ``bg`` = the
+    area's own local background. For >= 2 lines it is a reflowable PARAGRAPH
+    (``box_w`` = column width, ``leading`` = median baseline-to-baseline gap) so the
+    whole block edits + wraps as one box; a single line leaves those unset."""
     em = statistics.median([l["em"] for l in area])
     pad = max(2.0, 0.06 * em)
     x0 = min(l["x0"] for l in area)
@@ -225,7 +251,7 @@ def _area_to_box(area: list, ppi: float) -> "LineBox":
     origin_pt = (area[0]["x0"] / ppi, area[0]["baseline"] / ppi)
     box = LineBox(origin=origin_pt, text=" ".join(l["text"] for l in area),
                   size=em / ppi, confidence=min(l["conf"] for l in area),
-                  cover=cover_pt)
+                  cover=cover_pt, bg=area[0].get("bg", (1.0, 1.0, 1.0)))
     if len(area) >= 2:
         gaps = [area[i]["baseline"] - area[i - 1]["baseline"]
                 for i in range(1, len(area))]
