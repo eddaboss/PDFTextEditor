@@ -136,11 +136,32 @@ def _install_and_relaunch(src_dir, dst_dir, **kwargs) -> None:
     leaves the old app frozen on "Downloading and installing…". We run off the GUI
     thread, so the process has to be torn down with ``os._exit``."""
     if sys.platform == "darwin":
-        # The running .app can be overwritten in place; merge the new Contents/
-        # into the bundle, then relaunch via `open` (argv list, so the spaces and
-        # parens are safe; -n forces a fresh instance).
-        shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True, symlinks=True)
-        subprocess.Popen(["/usr/bin/open", "-n", str(dst_dir)])
+        # The new bundle CANNOT be merged into the live one in place: it ships
+        # ~350 framework symlinks (Qt Versions/Current, the cv2 .dylibs, ...) and
+        # shutil.copytree(symlinks=True) recreates each via os.symlink, which
+        # raises FileExistsError on any symlink the destination already has.
+        # dirs_exist_ok forgives existing DIRECTORIES, not symlinks, so the merge
+        # died on the first framework link and EVERY update failed with "could
+        # not be installed" (errno 17). Instead build the new bundle fresh beside
+        # the old one (no destination to collide with), then swap it in.
+        dst = Path(dst_dir)
+        staging = dst.with_name(dst.name + ".update-new")
+        backup = dst.with_name(dst.name + ".update-old")
+        shutil.rmtree(staging, ignore_errors=True)   # clear any prior attempt
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.copytree(src_dir, staging, symlinks=True)
+        # Swap by rename within the same directory (atomic). macOS keeps the
+        # running process alive through its open inodes even after its bundle is
+        # moved aside, so replacing the live app mid-update is safe. Either the
+        # old or the new bundle is always fully in place -- never a half-merged
+        # mix, which the old in-place copy could leave on failure.
+        os.rename(dst, backup)
+        os.rename(staging, dst)
+        # Relaunch the updated app (argv list -> spaces/parens safe; -n -> fresh
+        # instance), then drop the old bundle once THIS process has exited.
+        subprocess.Popen(["/usr/bin/open", "-n", str(dst)])
+        subprocess.Popen(["/bin/sh", "-c", 'sleep 5; /bin/rm -rf "$1"',
+                          "sh", str(backup)])
     else:
         # Windows: the running exe is locked, so tufup defers the swap to a script
         # that waits for THIS process to exit before replacing files and
