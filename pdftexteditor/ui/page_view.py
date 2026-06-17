@@ -310,29 +310,20 @@ class SpanHotspot(QGraphicsRectItem):
         # reads cleanly over it).
         if self._editing or self._view._is_selected(self.span):
             return
-        edited = self._view.is_edited(self.span)
-        # An ALREADY-EDITED run carries a PERSISTENT ochre mark on the white page
-        # -- a faint tint + a thin baseline underline -- so edits stay legible at
-        # rest, not only on hover (the in-place edit signature). An unedited run
-        # shows only a faint clay wash while hovered.
-        if not edited and not self._hovered:
+        # No persistent mark on an edited run: an edit must look exactly like the
+        # surrounding type, with the cell's own background showing through. The
+        # old ochre "edit signature" (a faint tint + underline kept at rest) read
+        # as a cream box over coloured form cells. Only a faint clay hover
+        # affordance remains, identical for edited and unedited runs.
+        if not self._hovered:
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
         r = self.rect()
-        if edited:
-            wash = theme.color_edited_hover() if self._hovered \
-                else theme.color_edited_tint()
-            line = theme.color_edited_underline()
-            line_w = 1.5
-        else:
-            wash = theme.color_accent_hover()
-            line = theme.color_accent()
-            line_w = 1.0
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QBrush(wash))
+        painter.setBrush(QBrush(theme.color_accent_hover()))
         painter.drawRoundedRect(r, 2.0, 2.0)
-        pen = QPen(line)
-        pen.setWidthF(line_w)
+        pen = QPen(theme.color_accent())
+        pen.setWidthF(1.0)
         pen.setCosmetic(True)
         painter.setPen(pen)
         y = self._baseline_y - r.top()    # rect-local y of the baseline
