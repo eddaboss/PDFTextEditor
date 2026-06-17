@@ -3287,10 +3287,6 @@ class MainWindow(QMainWindow):
         Dynamic content (Open Recent, the Window open-document list, the
         shortcut cheatsheet, About) lands with the navigation workstream."""
         bar = QMenuBar(self)
-        # Render the menu IN the window on every platform (Clay-styled), instead
-        # of macOS hoisting it into the global menu bar at the top of the screen.
-        # No-op on Windows/Linux, which are already in-window.
-        bar.setNativeMenuBar(False)
         self.setMenuBar(bar)
         self.menu_bar = bar
         # Named insertion anchors: real separator QActions other workstreams
