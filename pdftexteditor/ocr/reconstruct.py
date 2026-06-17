@@ -249,7 +249,11 @@ def _area_to_box(area: list, ppi: float) -> "LineBox":
     cover_pt = ((x0 - pad) / ppi, (y0 - pad) / ppi,
                 (x1 + pad) / ppi, (y1 + pad) / ppi)
     origin_pt = (area[0]["x0"] / ppi, area[0]["baseline"] / ppi)
-    box = LineBox(origin=origin_pt, text=" ".join(l["text"] for l in area),
+    # Keep the recognized LINE BREAKS (join with newlines, not spaces): a form
+    # block (name / address / phone / DOB) must keep its lines, not reflow into
+    # one prose run. The editor shows the lines and the bake draws each at its own
+    # baseline; a single-line area has no newline and behaves as before.
+    box = LineBox(origin=origin_pt, text="\n".join(l["text"] for l in area),
                   size=em / ppi, confidence=min(l["conf"] for l in area),
                   cover=cover_pt, bg=area[0].get("bg", (1.0, 1.0, 1.0)))
     if len(area) >= 2:
