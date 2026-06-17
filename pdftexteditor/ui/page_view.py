@@ -6748,6 +6748,14 @@ class PageView(QGraphicsView):
             origin = (eb[0], origin[1])
         baseline = self._scene_point(*origin, page_index=page)
         rot = float(self._rotation_for(page) % 360)
+        # OCR overlay boxes (cover-marked) are placed DEROTATED so they bake + display
+        # upright over the scan; the inline editor must therefore show them upright
+        # too. Rotating by the page's raw /Rotate spun the editing text 90deg while
+        # the scan and baked text read upright (the "text rotates when you click in"
+        # bug on scanned /Rotate pages). Gated to OCR boxes; ordinary boxes on a
+        # genuinely rotated page still follow the page.
+        if len(getattr(box, "cover", ()) or ()) == 7:
+            rot = 0.0
         item.setRotation(rot)
         if rot == 0.0:
             item.setPos(baseline.x(), baseline.y() - ascent)

@@ -1160,6 +1160,10 @@ class PDFDocument:
         try:
             import cv2
             from .ocr import degrade, fontmatch
+            # The raster is rotation-naive (placed axis-aligned over the cover), so
+            # on a /Rotate page it would land wrong. Fall back to vector text there.
+            if self.page_rotation(box.page_index) % 360 != 0:
+                return None
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
             fpath = os.path.join(fontmatch._DIR,
                                  fontmatch._CANDIDATES.get(box.font_family, ""))
