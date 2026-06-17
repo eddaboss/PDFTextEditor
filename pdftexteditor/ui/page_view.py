@@ -310,11 +310,13 @@ class SpanHotspot(QGraphicsRectItem):
         # reads cleanly over it).
         if self._editing or self._view._is_selected(self.span):
             return
-        edited = self._view.is_edited(self.span)
-        # An ALREADY-EDITED run carries a PERSISTENT ochre mark on the white page
-        # -- a faint tint + a thin baseline underline -- so edits stay legible at
-        # rest, not only on hover (the in-place edit signature). An unedited run
-        # shows only a faint clay wash while hovered.
+        edited = self._view.is_unsaved_edit(self.span)
+        # An UNSAVED edit carries a PERSISTENT ochre mark on the white page -- a
+        # faint tint + a thin baseline underline -- so pending changes stay
+        # visible at rest, not only on hover (the in-place edit signature). The
+        # mark CLEARS once the edit is saved (the run then reads like untouched
+        # text). A run with no pending edit shows only a faint clay wash while
+        # hovered.
         if not edited and not self._hovered:
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -6352,6 +6354,16 @@ class PageView(QGraphicsView):
             return True
         page = getattr(box, "page_index", self._page_index)
         return self.document.staged_text(page, box) != box.text
+
+    def is_unsaved_edit(self, box) -> bool:
+        """True when ``box`` carries an edit made since the last save. Drives
+        the persistent in-place edit signature, which flags PENDING changes and
+        clears once they are saved (a saved edit then reads as clean, like the
+        original text -- see ``Document.is_edit_unsaved``)."""
+        if not self.document or box is None:
+            return False
+        page = getattr(box, "page_index", self._page_index)
+        return self.document.is_edit_unsaved(page, box)
 
     # =====================================================================
     # Keyboard (view-level, depends on selection/editor state, §3.3/§5.5)

@@ -5616,6 +5616,13 @@ class MainWindow(QMainWindow):
             return False
         self.document.mark_clean()
         self.undo_stack.setClean()
+        # mark_clean() reset the saved baseline, so every in-place edit signature
+        # is now stale (the runs are on disk). Saving changes no geometry, so Qt
+        # would not repaint the hotspots on its own -- force the scene to redraw
+        # so the ochre marks clear immediately.
+        scene = self.view.scene()
+        if scene is not None:
+            scene.update()
         # Saved: the on-disk file now matches, so drop any crash-recovery copy.
         self._clear_recovery_for(self.document)
         # The edited file was just written: register it with macOS so it lands in
