@@ -310,11 +310,13 @@ class SpanHotspot(QGraphicsRectItem):
         # reads cleanly over it).
         if self._editing or self._view._is_selected(self.span):
             return
-        edited = self._view.is_edited(self.span)
-        # An ALREADY-EDITED run carries a PERSISTENT ochre mark on the white page
-        # -- a faint tint + a thin baseline underline -- so edits stay legible at
-        # rest, not only on hover (the in-place edit signature). An unedited run
-        # shows only a faint clay wash while hovered.
+        edited = self._view.is_unsaved_edit(self.span)
+        # An UNSAVED edit carries a PERSISTENT ochre mark on the white page -- a
+        # faint tint + a thin baseline underline -- so pending changes stay
+        # visible at rest, not only on hover (the in-place edit signature). The
+        # mark CLEARS once the edit is saved (the run then reads like untouched
+        # text). A run with no pending edit shows only a faint clay wash while
+        # hovered.
         if not edited and not self._hovered:
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1925,11 +1927,16 @@ class PageView(QGraphicsView):
             layer.rotation = self.document.page_rotation(pi)
             layer.rotation_matrix = self.document.rotation_matrix(pi)
             rect = self.document.doc[pi].rect
-            # Display-space size is the rotated rect: a 90/270 page swaps w/h.
-            if layer.rotation % 180 == 90:
-                pw, ph = rect.height, rect.width
-            else:
-                pw, ph = rect.width, rect.height
+            # ``page.rect`` ALREADY reflects the page's /Rotate -- a portrait page
+            # rotated 90 reports a 792x612 (landscape) rect. The materialize pass
+            # sizes the slot from get_pixmap, which is ALSO rotated, so pass 1 must
+            # use ``rect`` AS-IS. The old "90/270 swaps w/h" branch DOUBLE-counted
+            # rotation: a rotated page got a wrongly-shaped slot, and where the
+            # real (rotated) height exceeded the allocated height the page overran
+            # into the next one -- the "pages clipping into each other" seen on
+            # scanned/rotated image-only pages (which carry /Rotate far more often
+            # than born-digital text PDFs, hence the "only image pages clip").
+            pw, ph = rect.width, rect.height
             layer.pt_size = (pw, ph)
             layer.y_top = y
             page_h = ph * z
@@ -6344,14 +6351,32 @@ class PageView(QGraphicsView):
         the old ``page_index != self._page_index -> False`` short-circuit made
         the amber edited tint vanish on every materialized page except the one
         under the viewport center, which is wrong in the continuous view where
-        several pages' hotspots are live at once. A NewBox always counts as
-        edited (it IS an edit)."""
+        several pages' hotspots are live at once.
+
+        A NewBox counts as edited ONLY once it actually draws ink. An OCR
+        overlay is born invisible (render_mode 3) over the kept scan; the user
+        editing it flips it to visible (render_mode 0) via stage_edit. So a
+        PRISTINE OCR word (render_mode 3) is NOT edited -- it must stay unmarked
+        like any untouched run, or every recovered word wears the persistent
+        ochre edited tint at rest, smearing tan "yellow bars" across a scanned
+        page. User-added boxes are render_mode 0, so they read as edits as
+        before."""
         if not self.document or box is None:
             return False
         if isinstance(box, NewBox):
-            return True
+            return getattr(box, "render_mode", 0) == 0
         page = getattr(box, "page_index", self._page_index)
         return self.document.staged_text(page, box) != box.text
+
+    def is_unsaved_edit(self, box) -> bool:
+        """True when ``box`` carries an edit made since the last save. Drives
+        the persistent in-place edit signature, which flags PENDING changes and
+        clears once they are saved (a saved edit then reads as clean, like the
+        original text -- see ``Document.is_edit_unsaved``)."""
+        if not self.document or box is None:
+            return False
+        page = getattr(box, "page_index", self._page_index)
+        return self.document.is_edit_unsaved(page, box)
 
     # =====================================================================
     # Keyboard (view-level, depends on selection/editor state, §3.3/§5.5)
@@ -6748,6 +6773,14 @@ class PageView(QGraphicsView):
             origin = (eb[0], origin[1])
         baseline = self._scene_point(*origin, page_index=page)
         rot = float(self._rotation_for(page) % 360)
+        # OCR overlay boxes (cover-marked) are placed DEROTATED so they bake + display
+        # upright over the scan; the inline editor must therefore show them upright
+        # too. Rotating by the page's raw /Rotate spun the editing text 90deg while
+        # the scan and baked text read upright (the "text rotates when you click in"
+        # bug on scanned /Rotate pages). Gated to OCR boxes; ordinary boxes on a
+        # genuinely rotated page still follow the page.
+        if len(getattr(box, "cover", ()) or ()) == 7:
+            rot = 0.0
         item.setRotation(rot)
         if rot == 0.0:
             item.setPos(baseline.x(), baseline.y() - ascent)

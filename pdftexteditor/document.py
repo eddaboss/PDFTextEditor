@@ -443,6 +443,19 @@ class NewBox:
     # ink colour and degradation. Empty for every ordinary box.
     edit_image: bytes = b""
     edit_image_rect: tuple = ()
+    # Paragraph (multi-line AREA) support, for OCR areas that fuse several scanned
+    # lines into ONE editable block (the user edits a paragraph as one). When
+    # ``box_w`` is set the box is a reflowable paragraph: the inline editor goes
+    # multi-line (keys off ``is_paragraph``) and wraps to ``box_w``, ``leading`` is
+    # the baseline-to-baseline gap, ``alignment`` the block alignment. Unset for an
+    # ordinary single-line box / form field, which behaves exactly as before.
+    box_w: float | None = None
+    leading: float = 0.0
+    alignment: str = "left"
+
+    @property
+    def is_paragraph(self) -> bool:
+        return self.box_w is not None
 
     @property
     def edit_key(self) -> tuple:
@@ -1159,11 +1172,19 @@ class PDFDocument:
             return None
         try:
             import cv2
-            from .ocr import degrade, fontmatch
+            from .ocr import degrade, fontbank, fontmatch
+            # The raster is rotation-naive (placed axis-aligned over the cover), so
+            # on a /Rotate page it would land wrong. Fall back to vector text there.
+            if self.page_rotation(box.page_index) % 360 != 0:
+                return None
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
-            fpath = os.path.join(fontmatch._DIR,
-                                 fontmatch._CANDIDATES.get(box.font_family, ""))
-            if not fontmatch._CANDIDATES.get(box.font_family) or not os.path.exists(fpath):
+            # A matched BANK font (the document's real face) if this box uses one,
+            # else the bundled family.
+            fpath = fontbank.font_file_for(box.font_family)
+            if fpath is None:
+                fpath = os.path.join(fontmatch._DIR,
+                                     fontmatch._CANDIDATES.get(box.font_family, ""))
+            if not fpath or not os.path.exists(fpath):
                 return None
             dpi = 300.0
             ppi = dpi / 72.0
@@ -1212,6 +1233,64 @@ class PDFDocument:
             # avoids the "fortydays" abutment). insert_image scales to this rect.
             rect = (x0, y0, x1, y1)
             return bytes(buf), rect
+        except Exception:
+            return None
+
+    def _scanned_paragraph_raster(self, box: "NewBox", new_text: str):
+        """For an edited PARAGRAPH (a multi-line OCR area), render the reflowed
+        text onto a paper-coloured tile the size of the area and return
+        ``(png_bytes, rect)``. The bake places it with ``insert_image(rotate=
+        page.rotation)``, so -- unlike the single-word degrade raster, which is
+        axis-aligned and bails on /Rotate -- a paragraph edit lands correctly on
+        rotated scans too. The paper colour comes from the cover (sampled at OCR
+        time), so the tile replaces the scanned block and blends with the page."""
+        import numpy as np
+        cover = box.cover
+        if not (cover and len(cover) == 7) or not new_text.strip():
+            return None
+        try:
+            import cv2
+            from .ocr import fontbank, fontmatch
+            from .reflow import wrap_paragraph
+            x0, y0, x1, y1 = (float(c) for c in cover[:4])
+            pr, pg, pb = (float(c) for c in cover[4:7])
+            area_w, area_h = x1 - x0, y1 - y0
+            if area_w < 4 or area_h < 4:
+                return None
+            # The font file to render the tile in: a matched BANK font (the OCR'd
+            # document's real face) if this box uses one, else the bundled family.
+            fpath = fontbank.font_file_for(box.font_family)
+            if fpath is None:
+                fpath = os.path.join(fontmatch._DIR,
+                                     fontmatch._CANDIDATES.get(box.font_family, ""))
+            if not fpath or not os.path.exists(fpath):
+                return None
+            em = max(8.0, float(box.size))
+            lead = box.leading or em * 1.3
+            col_w = max(8.0, (box.box_w or area_w) - 4.0)
+            f = fitz.Font(fontfile=fpath)
+            # Draw on a tile sized to the AREA (PDF pts); wrap to the column.
+            doc = fitz.open()
+            pg_ = doc.new_page(width=area_w, height=area_h)
+            pg_.draw_rect(pg_.rect, color=(pr, pg, pb), fill=(pr, pg, pb), width=0)
+            tw = fitz.TextWriter(pg_.rect)
+            result = wrap_paragraph(new_text, f, em, 2.0, em, col_w, leading=lead)
+            drew = False
+            for ln in result.lines:
+                if ln.text and 0 <= ln.origin[1] <= area_h + em:
+                    tw.append((ln.origin[0], ln.origin[1]), ln.text,
+                              font=f, fontsize=em)
+                    drew = True
+            if drew:
+                tw.write_text(pg_, color=(0.1, 0.1, 0.1))
+            ppi = 300.0 / 72.0
+            pm = pg_.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
+            rgb = np.frombuffer(pm.samples, np.uint8).reshape(
+                pm.height, pm.width, pm.n)[..., :3].copy()
+            ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            if not ok:
+                return None
+            return bytes(buf), (x0, y0, x1, y1)
         except Exception:
             return None
 
@@ -2056,7 +2135,12 @@ class PDFDocument:
             # cover) so it blends, instead of drawing crisp vector text. Falls back
             # to plain text if the raster cannot be built.
             if cur.cover and len(cur.cover) == 7:
-                raster = self._scanned_edit_raster(updated, new_text)
+                # A paragraph area reflows as a whole-tile raster (rotation-safe);
+                # a single word uses the per-word degrade raster (precise blend,
+                # non-rotated only). Either falls back to plain text on failure.
+                raster = (self._scanned_paragraph_raster(updated, new_text)
+                          if cur.is_paragraph
+                          else self._scanned_edit_raster(updated, new_text))
                 if raster is not None:
                     updated = replace(updated, edit_image=raster[0],
                                       edit_image_rect=raster[1])
@@ -2364,7 +2448,8 @@ class PDFDocument:
     def add_box(self, page: int, origin: tuple, text: str, family: str,
                 size: float, color: tuple, bold: bool, italic: bool,
                 direction: tuple = (1.0, 0.0), cover: tuple = (),
-                render_mode: int = 0) -> NewBox:
+                render_mode: int = 0, box_w: float | None = None,
+                leading: float = 0.0, alignment: str = "left") -> NewBox:
         """Create a NewBox at baseline ``origin`` (PDF points) with the given
         style, compute its bbox from ``resolve_family`` metrics (BUILD_SPEC
         §1.6), register it, push an 'add' command, and return it. The caller
@@ -2378,7 +2463,8 @@ class PDFDocument:
                      bbox=(0.0, 0.0, 0.0, 0.0), text=text, font_family=family,
                      size=size, color=tuple(color), bold=bold, italic=italic,
                      dir=tuple(direction), cover=tuple(cover),
-                     render_mode=int(render_mode))
+                     render_mode=int(render_mode),
+                     box_w=box_w, leading=float(leading), alignment=alignment)
         box = replace(box, bbox=self._newbox_bbox(box))
         key = box.edit_key
         before = _BoxState(newbox=None, exists=False)
@@ -2392,6 +2478,12 @@ class PDFDocument:
         width = the resolved face's advance for the text at the size. For a
         rotated box (``dir`` != horizontal) the text rectangle is rotated about
         the baseline origin and the AABB of its corners is returned."""
+        # A multi-line PARAGRAPH (OCR area) is bounded by its known area rect, the
+        # cover -- already in this page's text space and rotation-correct. Use it
+        # directly so the selection frame / editor column span the whole block
+        # (single-line metric math can't, and doesn't know the line count).
+        if box.is_paragraph and box.cover and len(box.cover) == 7:
+            return tuple(box.cover[:4])
         rf = self.font_engine.resolve_family(
             box.font_family, box.bold, box.italic, box.text)
         fobj = self.font_engine.fitz_font_for(rf)
@@ -3117,6 +3209,13 @@ class PDFDocument:
         never wrap and need no break/width matching)."""
         if not getattr(box, "is_paragraph", False):
             return None
+        if isinstance(box, NewBox):
+            # A paragraph NewBox (OCR area) is not a rawdict span: it has no
+            # ``.key`` / ``_edits`` entry and no member layout to mirror. Returning
+            # None routes the editor to its SOFT-WRAP path (wrap to effective_bbox),
+            # which edits the block fine; the authoritative reflow happens in the
+            # bake's paragraph raster on commit.
+            return None
         edit = self._edits.get((page_index, box.key))
         e = edit if edit is not None else Edit(span=box)
         result = self._wrap_for_edit_cached(page_index, box, e)
@@ -3392,6 +3491,25 @@ class PDFDocument:
         self._saved_struct_depth = self.structural_depth
         self._saved_undo_depth = len(self._undo)
         self._saved_had_staged = self.has_edits
+
+    def is_edit_unsaved(self, page_index: int, box) -> bool:
+        """True when ``box`` carries an edit made SINCE the last save -- the
+        in-place edit signature shows only for UNSAVED changes and clears once
+        saved (the edit itself persists, it just stops being flagged).
+
+        An edit is on disk iff its undo command sits at or below the saved
+        baseline (``_saved_undo_depth``); commands above it are pending. A
+        ``-1`` baseline means the saved state is no longer reachable (undo/redo
+        crossed it), so every currently-applied edit reads as unsaved."""
+        depth = self._saved_undo_depth
+        if depth < 0:
+            depth = 0
+        unsaved = self._undo[depth:]
+        if not unsaved:
+            return False
+        key = (box.edit_key if isinstance(box, NewBox)
+               else self._span_edit_key(page_index, box))
+        return any(cmd.edit_key == key for cmd in unsaved)
 
     # --- document info / metadata (doc-tools M1) ---------------------------
     def metadata_fields(self) -> dict:
@@ -3838,9 +3956,20 @@ class PDFDocument:
                 # raster over the cover, so it blends with the scan instead of
                 # crisp vector text. (Ordinary boxes never carry edit_image.)
                 if box.edit_image and box.edit_image_rect:
+                    # ``rotate=page.rotation`` makes the tile display upright on a
+                    # /Rotate scan (no-op at 0). A paragraph tile carries its own
+                    # paper + wrapped text, so it covers the block correctly even
+                    # on rotated pages where axis-aligned vector text could not.
                     page.insert_image(fitz.Rect(box.edit_image_rect),
-                                      stream=box.edit_image, keep_proportion=False)
+                                      stream=box.edit_image, keep_proportion=False,
+                                      rotate=page.rotation)
                     continue
+            # An UNTOUCHED paragraph overlay (invisible, render_mode 3) draws
+            # nothing: the scan shows through and the box is purely the editing
+            # affordance. A single invisible run of a whole joined paragraph would
+            # otherwise spill off-column. Edited paragraphs took the tile path above.
+            if box.is_paragraph and box.render_mode == 3:
+                continue
             rf = engine.resolve_family(box.font_family, box.bold, box.italic,
                                        box.text)
             fontname = self._register_resolved(engine, page, rf, registered)
@@ -4999,12 +5128,15 @@ class PDFDocument:
                 x0, y0, x1, y1, r, g, b = box.cover
                 page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                color=(r, g, b), fill=(r, g, b), width=0)
-                # 0.3.0: blended raster for an edited scanned word (see
-                # _apply_page_edits; keep both seams in lockstep).
+                # 0.3.0: blended raster for an edited scanned word / paragraph
+                # tile (see _apply_page_edits; keep both seams in lockstep).
                 if box.edit_image and box.edit_image_rect:
                     page.insert_image(fitz.Rect(box.edit_image_rect),
-                                      stream=box.edit_image, keep_proportion=False)
+                                      stream=box.edit_image, keep_proportion=False,
+                                      rotate=page.rotation)
                     continue
+            if box.is_paragraph and box.render_mode == 3:
+                continue                # invisible paragraph overlay: scan shows
             rf = engine.resolve_family(box.font_family, box.bold, box.italic,
                                        box.text)
             fontname = PDFDocument._register_resolved(engine, page, rf, registered)
