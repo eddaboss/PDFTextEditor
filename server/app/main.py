@@ -16,7 +16,6 @@ import html
 import io
 import json
 import os
-import shutil
 import tarfile
 import tempfile
 from pathlib import Path
@@ -1608,16 +1607,17 @@ def publish(authorization: str = Header(default=""),
 
 @app.post("/api/admin/wipe-updates")
 def wipe_updates(authorization: str = Header(default="")) -> dict:
-    """DESTRUCTIVE, token-protected: clear the update tree and installers so the
-    next release republishes a single clean baseline. Used to prune accumulated
-    or broken archives off the volume (they otherwise only ever grow). Run this
-    once, then trigger a release; existing installs then pull one full update and
-    patch normally from the fresh baseline."""
+    """DISABLED on purpose. Deleting the update tree removes the tufup/TUF
+    metadata, which restarts the channel's metadata version counter at 1 -- BELOW
+    the version installed clients have already cached. Every such client then
+    rejects all later releases as a rollback attack and is bricked until its
+    local cache is cleared. TUF metadata versions must only ever increase per
+    channel, forever; this wipe broke updates exactly once already. To prune
+    accumulated archives, do a normal signed republish that drops old targets,
+    which still increments the version."""
     _check_publish_token(authorization)
-    wiped = []
-    for d in (UPDATES_DIR, INSTALLERS_DIR):
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            wiped.append(d.name)
-    ensure_dirs()
-    return {"ok": True, "wiped": wiped, "channel": CHANNEL}
+    raise HTTPException(
+        status_code=410,
+        detail="wipe-updates is disabled: wiping the tufup metadata rolls the "
+               "TUF version back to 1 and bricks installed clients. Prune via a "
+               "signed republish instead.")
