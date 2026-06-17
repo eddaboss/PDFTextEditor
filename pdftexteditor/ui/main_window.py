@@ -6491,7 +6491,11 @@ class MainWindow(QMainWindow):
         pixel-identical to the scan; each box carries its own scanned-word rect as
         a cover that paints only if the word is edited (which makes it visible).
         Acrobat's "Searchable Image (Exact)" + font-matched editing."""
-        FontEngine.register_custom_face(res.family_name, res.otf_bytes)
+        # 0.3.0: the matched family is a real BUNDLED font (Tinos/Arimo/Cousine),
+        # resolved + embedded like any bundled family, so there is no per-page
+        # custom face to register. Older results carried a scan-built OTF.
+        if res.otf_bytes:
+            FontEngine.register_custom_face(res.family_name, res.otf_bytes)
         self.undo_stack.beginMacro(f"OCR page {page_index + 1}")
         try:
             for lb in res.lines:
