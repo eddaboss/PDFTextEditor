@@ -1207,9 +1207,10 @@ class PDFDocument:
             ok, buf = cv2.imencode(".png", cv2.cvtColor(deg, cv2.COLOR_RGB2BGR))
             if not ok:
                 return None
-            rh = y1 - y0
-            aspect = deg.shape[1] / max(1, deg.shape[0])
-            rect = (x0, y0, x0 + rh * aspect, y1)            # left-aligned, cover height
+            # Fill the ORIGINAL word's box so the edit can never overflow into the
+            # neighbouring scanned words (a same-length edit barely distorts; this
+            # avoids the "fortydays" abutment). insert_image scales to this rect.
+            rect = (x0, y0, x1, y1)
             return bytes(buf), rect
         except Exception:
             return None
