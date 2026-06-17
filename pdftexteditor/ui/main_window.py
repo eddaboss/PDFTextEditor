@@ -677,7 +677,9 @@ class BoxCommand(_ModelCommand):
                 page, p["origin"], p.get("text", ""), p["family"], p["size"],
                 p["color"], p.get("bold", False), p.get("italic", False),
                 direction=p.get("direction", (1.0, 0.0)),
-                cover=p.get("cover", ()), render_mode=p.get("render_mode", 0))
+                cover=p.get("cover", ()), render_mode=p.get("render_mode", 0),
+                box_w=p.get("box_w"), leading=p.get("leading", 0.0),
+                alignment=p.get("alignment", "left"))
         # Placed images (images & signatures §4): the §2.3 model mutators.
         if kind == "img_add":
             return self._doc.add_image(
@@ -6486,11 +6488,12 @@ class MainWindow(QMainWindow):
 
     def _ocr_apply_page(self, page_index: int, res) -> None:
         """Overlay the recognized text on the KEPT scan image as one editable but
-        INVISIBLE (render_mode 3) NewBox per word, in the page's scan-built font,
-        as ONE undo step. The scan image is left untouched, so the page stays
-        pixel-identical to the scan; each box carries its own scanned-word rect as
-        a cover that paints only if the word is edited (which makes it visible).
-        Acrobat's "Searchable Image (Exact)" + font-matched editing."""
+        INVISIBLE (render_mode 3) NewBox per AREA (a paragraph fuses its lines into
+        one reflowable box; a form field stays a single box), in the matched
+        bundled font, as ONE undo step. The scan image is left untouched, so the
+        page stays pixel-identical to the scan; each box carries its area rect as a
+        cover that paints only if the box is edited (which makes it visible).
+        Acrobat's "Searchable Image (Exact)" + font-matched, paragraph editing."""
         # 0.3.0: the matched family is a real BUNDLED font (Tinos/Arimo/Cousine),
         # resolved + embedded like any bundled family, so there is no per-page
         # custom face to register. Older results carried a scan-built OTF.
@@ -6515,7 +6518,9 @@ class MainWindow(QMainWindow):
                         "cover": cover, "render_mode": 3,
                         "text": lb.text, "family": res.family_name,
                         "size": lb.size, "color": (0.0, 0.0, 0.0),
-                        "bold": False, "italic": False}))
+                        "bold": False, "italic": False,
+                        "box_w": lb.box_w, "leading": lb.leading,
+                        "alignment": "left"}))
         finally:
             self.undo_stack.endMacro()
 

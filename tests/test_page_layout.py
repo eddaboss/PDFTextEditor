@@ -25,10 +25,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import fitz  # noqa: E402
+import numpy as np  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 _APP = QApplication.instance() or QApplication([])
 
+from pdftexteditor.document import PDFDocument  # noqa: E402
+from pdftexteditor.ocr.reconstruct import _group_lines_into_areas  # noqa: E402
 from pdftexteditor.ui.main_window import MainWindow  # noqa: E402
 
 
@@ -122,10 +125,135 @@ def test_pristine_ocr_box_not_edited() -> None:
             w.close()
 
 
+def test_lines_group_into_paragraphs() -> None:
+    """OCR lines fuse into ONE area per paragraph; a separated field stays its own
+    box. Drives the reconstruct grouping directly (no OCR engine), so it is
+    deterministic. Coords are display pixels (x0,y0,x1,y1,baseline,em,...)."""
+    def ln(x0, y0, x1, y1, txt):
+        return {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "baseline": y1 - 3,
+                "text": txt, "em": 16.0, "conf": 0.9}
+    lines = [
+        ln(40, 60, 300, 78, "Paragraph line one of a tight block"),    # para A
+        ln(40, 80, 300, 98, "paragraph line two continues here"),      # +18 gap
+        ln(40, 100, 300, 118, "and paragraph line three ends it"),
+        ln(40, 200, 260, 218, "Provider: Acme Home Health"),           # far below
+        ln(40, 260, 200, 278, "Phone: 555 0100"),                      # field
+    ]
+    areas = _group_lines_into_areas(lines)
+    multi = [a for a in areas if len(a) >= 2]
+    singles = [a for a in areas if len(a) == 1]
+    assert len(areas) == 3, f"want 3 areas (1 para + 2 fields), got {len(areas)}"
+    assert len(multi) == 1 and len(multi[0]) == 3, (
+        f"the tight 3-line block must fuse into ONE area, got {[len(a) for a in areas]}")
+    assert len(singles) == 2, "the two separated fields must stay single boxes"
+    print("  ok  3 tight lines fuse into one paragraph; 2 fields stay separate")
+
+
+def _flat_scan(path: str) -> None:
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.draw_rect(page.rect, color=(0.96, 0.96, 0.94),
+                   fill=(0.96, 0.96, 0.94), width=0)
+    doc.save(path)
+    doc.close()
+
+
+def _px(pm):
+    a = np.frombuffer(pm.samples, np.uint8).reshape(pm.height, pm.width, pm.n)
+    return a[..., :3].astype(np.int16)
+
+
+def test_paragraph_box_invisible_then_edits_in_area() -> None:
+    """A paragraph OCR box renders pixel-identical to the scan until edited; the
+    edit flips it visible and bakes its reflowed text INSIDE the area -- on a
+    rotated scan too (the tile is placed via insert_image(rotate=page.rotation))."""
+    for rot in (0, 90):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.pdf")
+            doc0 = fitz.open()
+            page = doc0.new_page(width=400, height=300)
+            page.draw_rect(page.rect, color=(0.96, 0.96, 0.94),
+                           fill=(0.96, 0.96, 0.94), width=0)
+            if rot:
+                page.set_rotation(rot)
+            doc0.save(p)
+            doc0.close()
+            doc = PDFDocument(p)
+            try:
+                scan = _px(doc.render(0, 2.0))
+                disp_cover = (36.0, 56.0, 250.0, 118.0)
+                cover = tuple(doc.ocr_cover_rect(0, disp_cover)) + (0.96, 0.96, 0.94)
+                origin, direction = doc.ocr_text_placement(0, (40.0, 70.0))
+                box = doc.add_box(
+                    0, origin, "Scanned block line one and line two and three",
+                    "Tinos", 11.0, (0, 0, 0), False, False, direction=direction,
+                    cover=cover, render_mode=3, box_w=214.0, leading=16.0)
+                inv = _px(doc.render_with_edits(0, 2.0))
+                assert int(np.abs(inv - scan).max()) == 0, (
+                    f"rot={rot}: invisible paragraph overlay must match the scan")
+                doc.stage_edit(0, box, "EDITED paragraph text replacing the whole "
+                                       "scanned block as one editable unit now")
+                eb = doc._new_boxes[box.edit_key]
+                assert eb.render_mode == 0 and eb.edit_image, (
+                    f"rot={rot}: edited paragraph must flip visible + build a tile")
+                edited = _px(doc.render_with_edits(0, 2.0))
+                ch = np.abs(edited - scan).sum(2) > 24
+                ys, xs = np.where(ch)
+                ax0, ay0, ax1, ay1 = (v * 2 for v in disp_cover)
+                assert ch.any() and xs.min() >= ax0 - 14 and xs.max() <= ax1 + 14 \
+                    and ys.min() >= ay0 - 14 and ys.max() <= ay1 + 14, (
+                    f"rot={rot}: the edited text must land INSIDE the area, not "
+                    f"misplaced (changed x[{xs.min()}-{xs.max()}] "
+                    f"y[{ys.min()}-{ys.max()}] vs area x[{int(ax0)}-{int(ax1)}])")
+            finally:
+                doc.close()
+    print("  ok  paragraph box invisible until edited, edit lands in area (rot 0 + 90)")
+
+
+def test_paragraph_box_mounts_multiline_editor() -> None:
+    """A paragraph NewBox opens the MULTI-LINE inline editor (edit the block as
+    one) without crashing on the span-only editor paths, and committing rebuilds
+    the paragraph tile. Checked BEFORE pumping (offscreen loses editor focus)."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "s.pdf")
+        _flat_scan(p)
+        w = _open(p)
+        try:
+            doc, view = w.document, w.view
+            cover = (36.0, 56.0, 250.0, 118.0, 0.96, 0.96, 0.94)
+            box = doc.add_box(0, (40.0, 70.0),
+                              "Para one and para two and para three here",
+                              "Tinos", 11.0, (0, 0, 0), False, False,
+                              cover=cover, render_mode=3, box_w=210.0, leading=16.0)
+            view.reload()
+            _pump()
+            for layer in view._layers:
+                view._materialize_page(layer)
+            hs = view._hotspot_for(box)
+            assert hs is not None, "paragraph box must have an editable hotspot"
+            view.begin_edit(hs)                  # no pump: offscreen focus-out commits
+            assert view._editor is not None, "paragraph box must mount an editor"
+            assert view._editor_multiline is True, (
+                "a paragraph box must open the MULTI-LINE editor (edit as one)")
+            view._editor.setPlainText("Edited paragraph as one block now")
+            view.commit_edit()
+            _pump()
+            eb = doc._new_boxes[box.edit_key]
+            assert eb.render_mode == 0 and eb.edit_image and eb.is_paragraph, (
+                "committing a paragraph edit must keep it a paragraph + build a tile")
+            print("  ok  paragraph box opens the multi-line editor + commits as one")
+        finally:
+            w._suppress_close_guard = True
+            w.close()
+
+
 def main() -> None:
     test_rotated_pages_do_not_overlap()
     test_pristine_ocr_box_not_edited()
-    print("\n2 page-layout tests passed.")
+    test_lines_group_into_paragraphs()
+    test_paragraph_box_invisible_then_edits_in_area()
+    test_paragraph_box_mounts_multiline_editor()
+    print("\n5 page-layout tests passed.")
 
 
 if __name__ == "__main__":
