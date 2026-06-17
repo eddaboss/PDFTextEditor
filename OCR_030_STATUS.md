@@ -1,7 +1,41 @@
 # OCR 0.3.0 — overnight status (scanned-edit color + damage)
 
 Branch: `feat/ocr-degrade-030` (off `dev` @ 0.2.4). Isolated worktree at
-`~/Documents/GitHub/PDFTextEditor-v030`. No app code changed; only additive files.
+`~/Documents/GitHub/PDFTextEditor-v030`.
+
+## UPDATE 2026-06-17: decision = full reconstruction rebuild, approach PROVEN
+You said the existing OCR reconstruction is garbage and to start over (shape +
+color + damage + sizing). I validated the new approach end to end OFFSCREEN and
+built the foundation. See `~/Desktop/ocr_demos/newrecon.png`: a fax-degraded scan,
+real OCR, then edits ("sixty"->"forty", "thirty"->"ninety") rendered in a REAL
+bundled serif, SIZED FROM THE OCR BOX (the sizing that was off is now correct),
+color-matched and hard-damaged so they blend. That is the new output, and it works.
+
+Clean architecture (simpler than the original plan; ships with no custom-font build):
+- DROP vtracer / `fontbuild.py` / the per-page scan-built OTF entirely.
+- Bundle the Croscore metric fonts (DONE: Tinos=Times, Arimo=Arial, Cousine=Courier,
+  OFL, in assets/fonts) + existing Newsreader/DejaVu; register them as families.
+- New reconstruction: recognize -> per-word boxes (keep) -> size from box height
+  (keep) -> classify serif/sans/mono, set box.font_family to the matched bundled
+  family (NO custom OTF) -> paper cover (keep) -> store per-word recovered ink +
+  local severity on the box.
+- Edit seam (document.py `_apply_page_edits` + `_apply_page_edits_for`): for an
+  edited scanned-OCR box, render the run in the bundled font, recolor + hard-damage
+  (degrade.py), insert_image over the cover. Gated on the cover marker so normal
+  editing is byte-identical.
+
+Remaining to ship (focused, headless-verifiable, then your GUI test on dev):
+1. Register bundled Croscore families in font_engine.
+2. Rewrite reconstruct.py per above; delete the vtracer path.
+3. Box fields (ink, severity, edit raster) + the gated insert_image branch at BOTH
+   bake seams; compute the raster at stage_edit.
+4. Update main_window OCR-apply glue (drop register_custom_face; use bundled family).
+5. Headless tests (unedited pixel-identical; edited word recolored+degraded; save ->
+   reopen -> render stable). Bump 0.3.0, green CI, ship to dev.
+
+This is a real feature, not a one-nighter; the approach + foundation are proven and
+committed. The pre-"start over" status below is kept for reference (its "not
+validated / did not ship" note is superseded by the validation above).
 
 ## TL;DR (read first)
 I did **not** ship 0.3.0 live, on purpose. The piece that would make it worth
