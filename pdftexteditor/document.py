@@ -1274,13 +1274,22 @@ class PDFDocument:
             pg_ = doc.new_page(width=area_w, height=area_h)
             pg_.draw_rect(pg_.rect, color=(pr, pg, pb), fill=(pr, pg, pb), width=0)
             tw = fitz.TextWriter(pg_.rect)
-            result = wrap_paragraph(new_text, f, em, 2.0, em, col_w, leading=lead)
+            # Draw each recognized LINE at its own baseline (preserve the block's
+            # line breaks); only an over-long single line wraps to the column.
             drew = False
-            for ln in result.lines:
-                if ln.text and 0 <= ln.origin[1] <= area_h + em:
-                    tw.append((ln.origin[0], ln.origin[1]), ln.text,
-                              font=f, fontsize=em)
-                    drew = True
+            y = em
+            for line_text in new_text.split("\n"):
+                lt = line_text.strip()
+                if not lt:
+                    y += lead
+                    continue
+                sub = wrap_paragraph(lt, f, em, 2.0, y, col_w, leading=lead)
+                for ln in sub.lines:
+                    if ln.text and 0 <= ln.origin[1] <= area_h + em:
+                        tw.append((ln.origin[0], ln.origin[1]), ln.text,
+                                  font=f, fontsize=em)
+                        drew = True
+                y += lead * max(1, len(sub.lines))
             if drew:
                 tw.write_text(pg_, color=(0.1, 0.1, 0.1))
             ppi = 300.0 / 72.0
