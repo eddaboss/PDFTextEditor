@@ -373,8 +373,15 @@ header{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--paper
 .ver{margin:18px 0 0;font-size:14px;color:var(--ink3)}
 .ver b{color:var(--clay-press);font-weight:600}
 .micro{margin:6px 0 0;font-size:13.5px;color:var(--ink3)}
-@media(max-width:860px){.hero{grid-template-columns:1fr;padding-top:48px}
+/* the editor mockup needs real room; below this the hero stacks to one column */
+@media(max-width:959px){.hero{grid-template-columns:1fr;padding-top:48px}
   .lede{max-width:46ch} .heroart{order:-1}}
+/* in the deck at mid widths keep the mockup, but give the text column the larger
+   share so the headline doesn't wrap to a sliver, and it still fits one screen */
+@media (pointer:fine) and (min-width:700px) and (max-width:959px) and (min-height:680px) and (prefers-reduced-motion:no-preference){
+  html.motion-ready .hero{grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);
+    gap:clamp(16px,3vw,34px)}
+  html.motion-ready .hero .heroart{display:block;order:0;align-self:center}}
 
 /* editor mock */
 .heroart{justify-self:center;width:100%}
@@ -395,11 +402,11 @@ header{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--paper
 .ln{height:11px;border-radius:3px;background:#ece7df}
 .ln.h{height:15px;width:62%;background:#d9cdbb}
 .ln.s{width:48%}
-.editln{position:relative;height:26px;display:flex;align-items:center;margin:3px 0}
+.editln{position:relative;min-height:26px;display:flex;align-items:center;margin:3px 0}
 .editbox{position:absolute;inset:-5px -8px;border:2px solid var(--clay);border-radius:5px;
   background:rgba(194,100,63,.05)}
 .editln .txt{font-family:var(--body);font-weight:600;font-size:15px;color:var(--ink);
-  position:relative;z-index:1}
+  line-height:1.35;position:relative;z-index:1}
 .caret{display:inline-block;width:2px;height:18px;background:var(--clay-press);
   margin-left:1px;position:relative;z-index:1;animation:blink 1.1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
@@ -420,15 +427,18 @@ h2{font-size:clamp(28px,3.6vw,44px)}
 .macopen .steps{list-style:none;margin:26px 0 0;padding:0;max-width:62ch;
   display:flex;flex-direction:column;gap:16px;counter-reset:s}
 .macopen .steps li{display:flex;gap:14px;font-size:16px;line-height:1.55;color:var(--ink2)}
+.macopen .steps li>div{min-width:0;flex:1}
 .macopen .steps li::before{counter-increment:s;content:counter(s);flex:none;
   width:26px;height:26px;border-radius:50%;background:var(--clay-fill);color:#fff;
   font-weight:700;font-size:14px;display:grid;place-items:center;margin-top:1px}
 .macopen .steps b{color:var(--ink);font-weight:600}
 .cmd{display:block;margin:11px 0 0;font-family:ui-monospace,Menlo,Consolas,monospace;
   font-size:13.5px;line-height:1.5;background:var(--ink);color:#f3e9dd;padding:12px 14px;
-  border-radius:10px;overflow-x:auto;white-space:nowrap;-webkit-user-select:all;user-select:all}
+  border-radius:10px;overflow-x:auto;white-space:nowrap;-webkit-user-select:all;user-select:all;
+  max-width:100%}
 .macopen .micro{margin-top:22px}
 .opengrid{display:grid;grid-template-columns:1fr 1fr;gap:clamp(28px,4.5vw,56px);margin-top:28px}
+.opencol{min-width:0}
 .osh{font-family:var(--display);font-size:18px;color:var(--clay-press);margin:0;
   padding-bottom:10px;border-bottom:1px solid var(--line)}
 .opencol .steps{margin-top:16px;max-width:none}
@@ -551,6 +561,60 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
 .dlgo:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
 .dlerr{margin:12px 0 0;font-size:13.5px;color:#b3402a;font-weight:500}
 
+/* ===================== FULL-BLEED COLOUR FIELDS =====================
+   Each section is its own full-width colour "page": a ::before paints the colour
+   edge to edge while the content column stays centred on top. Light pages carry
+   the intro, instructions and fine print; saturated pages carry the beats (the
+   dark "catches", the burnt-orange "free means free", the deep-rust features, the
+   terracotta call to action). Applied site-wide, so on phones the sections simply
+   stack as colour bands. */
+body{overflow-x:clip}
+main>.wrap>section{position:relative}
+main>.wrap>section::before{content:"";position:absolute;z-index:-1;
+  top:0;bottom:0;left:50%;width:100vw;transform:translateX(-50%)}
+.hero::before{background:#FBF9F5}
+.macopen::before{background:#ECE6DC}
+.catch::before{background:#241F1A}
+.bandwrap::before{background:#AA4E2C}
+.paid::before{background:#F5F1EA}
+.does::before{background:#8B3E23}
+.final::before{background:#6B311F}
+.donate::before{background:#FBF9F5}
+/* the colour change is the seam now -- drop the old hairline separators */
+.macopen,.catch,.paid,.does,.donate,.final{border-top:0}
+
+/* dark / saturated pages: cream type */
+.catch,.bandwrap,.does,.final{color:#F7E7DC}
+.catch h2,.bandwrap h2,.does h2,.final h2{color:#fff}
+.catch .sub,.bandwrap .sub,.does .sub,.final .sub{color:#EBD0C0}
+.does .frow h3{color:#fff}
+.does .frow p{color:#E7D4C6}
+.does .frow{border-top-color:rgba(255,255,255,.16)}
+.does .frow .ic{background:rgba(255,255,255,.14)}
+.does .frow .ic svg{color:#FCE9DD}
+.final .micro{color:#EBD0C0}
+
+/* the "free means free" band: flatten the old panel, sit straight on the orange */
+.band{background:transparent;border-radius:0;box-shadow:none;margin:0;padding:0}
+.band h2{color:#fff}.band .sub{color:#F4DCCB}
+.checks .ck{background:rgba(255,255,255,.18)}
+.checks .ck svg{color:#fff}
+.checks b{color:#fff}.checks span{color:#F4DCCB}
+
+/* cards on the near-black "catches" page float as light cards */
+.catch .catchitem{background:#FBF7F1;border-color:rgba(255,255,255,.10)}
+.catch .catchitem h3{color:var(--ink)}
+.catch .catchitem .x{background:rgba(160,70,44,.12);color:var(--clay-press)}
+/* lift the cards off the matching panel on the light "paid" page */
+.paid .paiditem{background:#fff}
+.paid .paidnote{color:var(--ink2)}
+
+/* buttons on the terracotta CTA page invert to read clearly */
+.final .btn{background:#fff;color:var(--clay-press);box-shadow:0 8px 22px rgba(74,30,16,.3)}
+.final .btn:hover{background:#FBEFE6;color:var(--clay-deep);transform:translateY(-1px)}
+.final .btn-ghost{background:transparent;color:#fff;border-color:rgba(255,255,255,.55)}
+.final .btn-ghost:hover{background:rgba(255,255,255,.12);border-color:#fff;color:#fff}
+
 /* ============================ MOTION ============================
    Calm + editorial: ease-out only, never bounce. Everything is progressive
    enhancement -- the page is fully visible without JS (reveal initial states
@@ -568,18 +632,81 @@ footer{border-top:1px solid var(--line);background:var(--panel)}
 /* scroll reveals -- only armed after JS adds .motion-ready, so no-JS ships visible */
 html.motion-ready [data-rv]{opacity:0;
   transition:opacity .7s var(--ease-out),transform .7s var(--ease-out)}
-html.motion-ready [data-rv=up]{transform:translateY(22px)}
+html.motion-ready [data-rv=up]{transform:translateY(48px)}   /* text flies up from below */
 html.motion-ready [data-rv=scale]{transform:scale(.975)}
 html.motion-ready [data-rv].rv-in{opacity:1;transform:none}
 /* staggered children for card grids / lists (legit sibling stagger, capped) */
-html.motion-ready [data-rvs]>*{opacity:0;transform:translateY(16px);
-  transition:opacity .6s var(--ease-out),transform .6s var(--ease-out)}
+html.motion-ready [data-rvs]>*{opacity:0;transform:translateY(34px);
+  transition:opacity .7s var(--ease-out),transform .7s var(--ease-out)}
 html.motion-ready [data-rvs].rv-in>*{opacity:1;transform:none}
 html.motion-ready [data-rvs].rv-in>*:nth-child(2){transition-delay:.06s}
 html.motion-ready [data-rvs].rv-in>*:nth-child(3){transition-delay:.12s}
 html.motion-ready [data-rvs].rv-in>*:nth-child(4){transition-delay:.18s}
 html.motion-ready [data-rvs].rv-in>*:nth-child(5){transition-delay:.24s}
 html.motion-ready [data-rvs].rv-in>*:nth-child(6){transition-delay:.30s}
+
+/* ===== full-page deck: one section per screen, hard snap =====
+   MANDATORY snap + scroll-snap-stop:always, so the page moves strictly section by
+   section -- every scroll lands cleanly on the next "page" and you cannot rest
+   half-way between two. Each section fills the screen and centers its content.
+   Enabled only on tall, mouse-driven, motion-OK viewports; phones, tablets and
+   short windows scroll normally (the fly-in reveals still run). A section whose
+   content genuinely exceeds the screen stays scrollable, so nothing is trapped. */
+@media (pointer:fine) and (min-width:700px) and (min-height:680px) and (prefers-reduced-motion:no-preference){
+  html.motion-ready{scroll-snap-type:y mandatory;scroll-padding-top:60px}
+  html.motion-ready main>.wrap>section{
+    scroll-snap-align:start;scroll-snap-stop:always;
+    min-height:100vh;min-height:100svh;
+    padding-top:clamp(48px,5.5vh,76px);padding-bottom:clamp(36px,4.5vh,60px)}
+  /* center each page's content, without overriding the hero's own grid layout */
+  html.motion-ready main>.wrap>section:not(.hero){
+    display:flex;flex-direction:column;justify-content:safe center}
+  html.motion-ready main>.wrap>section.hero{align-content:safe center;
+    padding-top:clamp(60px,7vh,84px);padding-bottom:clamp(28px,3.5vh,52px)}
+
+  /* ---- fill the page: each section's content + spacing scale up (vh-based, so
+     they track window height) so every page is well-filled like the hero, not a
+     small centred cluster. Single-child panels (band, donate) get a min-height. ---- */
+  html.motion-ready main>.wrap>section h2{font-size:clamp(30px,4.8vh,50px)}
+  html.motion-ready main .sub{font-size:clamp(17px,2.3vh,21px);margin-top:clamp(14px,2.1vh,22px)}
+  html.motion-ready .hero h1{font-size:clamp(38px,6.2vh,62px)}
+  html.motion-ready .hero .qa{margin-top:clamp(14px,2.4vh,24px);gap:clamp(9px,1.6vh,15px)}
+  html.motion-ready .hero .qa dt{font-size:clamp(14px,1.8vh,17px)}
+  html.motion-ready .hero .qa dd{font-size:clamp(15px,2vh,18px)}
+  html.motion-ready .hero .cta{margin-top:clamp(16px,2.8vh,32px)}
+  html.motion-ready .hero .ver{margin-top:clamp(10px,1.6vh,16px)}
+  html.motion-ready .opengrid,html.motion-ready .catchgrid,
+    html.motion-ready .paidgrid,html.motion-ready .feat{margin-top:clamp(18px,3.2vh,38px)}
+  html.motion-ready .catchgrid{gap:clamp(13px,2.2vh,22px)}
+  html.motion-ready .catchitem,html.motion-ready .paiditem{padding:clamp(17px,2.7vh,28px)}
+  html.motion-ready .catchitem h3,html.motion-ready .paiditem h3{font-size:clamp(17px,2.1vh,20px)}
+  html.motion-ready .catchitem p,html.motion-ready .paiditem p{font-size:clamp(14px,1.7vh,16px);
+    margin-top:clamp(6px,1.1vh,11px)}
+  html.motion-ready .catchitem .x{width:clamp(27px,3.2vh,34px);height:clamp(27px,3.2vh,34px);
+    margin-bottom:clamp(9px,1.5vh,14px)}
+  html.motion-ready .frow{padding:clamp(12px,2.1vh,22px) 0}
+  html.motion-ready .frow h3{font-size:clamp(18px,2.3vh,22px)}
+  html.motion-ready .frow p{font-size:clamp(14px,1.7vh,16px);margin-top:clamp(7px,1.2vh,12px)}
+  html.motion-ready .macopen .steps{gap:clamp(10px,1.8vh,18px)}
+  html.motion-ready .macopen .steps li{font-size:clamp(14px,1.8vh,16px)}
+  html.motion-ready .osh{font-size:clamp(16px,2vh,19px);padding-bottom:clamp(8px,1.4vh,13px)}
+  html.motion-ready .bandwrap>.band{width:100%;min-height:58vh;
+    display:flex;flex-direction:column;justify-content:center;
+    padding:clamp(30px,4.6vh,64px) clamp(36px,5vw,76px)}
+  html.motion-ready .band .checks{margin-top:clamp(18px,3.2vh,38px);
+    gap:clamp(13px,2.2vh,20px) 36px;font-size:clamp(15px,2vh,18px)}
+  html.motion-ready .paidnote{margin-top:clamp(16px,2.6vh,28px)}
+  html.motion-ready main>.wrap>section.final h2{font-size:clamp(40px,7vh,72px)}
+  html.motion-ready main>.wrap>section.final{justify-content:space-between;
+    padding-top:clamp(60px,8.5vh,104px);padding-bottom:clamp(48px,7vh,88px)}
+  html.motion-ready .final .sub{font-size:clamp(18px,2.6vh,23px);margin-top:0}
+  html.motion-ready .final .cta{margin-top:0}
+  html.motion-ready .donate .donatebox{width:100%;min-height:54vh;
+    display:flex;flex-direction:column;justify-content:center;align-items:center;
+    padding:clamp(34px,5vh,68px) clamp(32px,5vw,64px)}
+  html.motion-ready main>.wrap>section.donate .donatebox h2{font-size:clamp(32px,5vh,50px)}
+  html.motion-ready .donatebox p{font-size:clamp(17px,2.3vh,21px);margin-top:clamp(14px,2vh,20px)}
+}
 
 /* hover micro-interactions */
 .catchitem,.paiditem{transition:transform .2s var(--ease-out),
@@ -922,11 +1049,14 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
   if(reduce||!('IntersectionObserver'in window)){      // no-motion / no-IO: reveal everything now
     items.forEach(function(el){el.classList.add('rv-in');});return;
   }
+  // Re-trigger: a section's text flies in every time you arrive at its page, and
+  // re-arms once it has fully scrolled away (at ratio 0, so off-screen and unseen).
   var io=new IntersectionObserver(function(entries){
     entries.forEach(function(e){
-      if(e.isIntersecting){e.target.classList.add('rv-in');io.unobserve(e.target);}
+      if(e.intersectionRatio>=.12){e.target.classList.add('rv-in');}
+      else if(e.intersectionRatio<=.001){e.target.classList.remove('rv-in');}
     });
-  },{rootMargin:'0px 0px -12% 0px',threshold:.12});
+  },{threshold:[0,.12]});
   items.forEach(function(el){io.observe(el);});
 })();
 </script>
