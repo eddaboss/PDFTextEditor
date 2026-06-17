@@ -44,13 +44,15 @@ class LineBox:
     """One reconstructed editable word: baseline ``origin`` (PDF points), the
     recognized ``text``, the estimated point ``size``, OCR ``confidence``, and
     ``cover`` -- the scanned word's rectangle in DISPLAY points (x0,y0,x1,y1),
-    painted in the paper colour before the edited text is drawn."""
+    painted in ``bg`` (this word's OWN local background colour, not the page-wide
+    paper tone) before the edited text is drawn."""
 
     origin: tuple
     text: str
     size: float
     confidence: float
     cover: tuple = ()
+    bg: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -76,6 +78,28 @@ def _paper_color(image_rgb: np.ndarray) -> tuple:
     bright = flat[lum > thresh]
     if bright.shape[0] == 0:
         bright = flat
+    c = np.median(bright, axis=0)
+    return (float(c[0] / 255), float(c[1] / 255), float(c[2] / 255))
+
+
+def _local_paper_color(image_rgb: np.ndarray, x0: float, y0: float,
+                       x1: float, y1: float, fallback: tuple) -> tuple:
+    """The background colour right around ONE word: the median of the brighter
+    pixels in its (padded) box, so an edited word's cover matches its OWN cell
+    (white, light blue, ...) instead of the page-wide paper median, which on a
+    mixed form paints every edit a single off-white. Dark glyphs are the minority
+    in the box, so the top luminance band is the local background. Falls back to
+    the page paper colour when the crop has too little to go on."""
+    h, w = image_rgb.shape[:2]
+    xi0, yi0 = max(0, int(x0)), max(0, int(y0))
+    xi1, yi1 = min(w, int(x1) + 1), min(h, int(y1) + 1)
+    if xi1 - xi0 < 2 or yi1 - yi0 < 2:
+        return fallback
+    crop = image_rgb[yi0:yi1, xi0:xi1].reshape(-1, 3).astype(np.float32)
+    lum = crop.mean(axis=1)
+    bright = crop[lum >= np.percentile(lum, 70)]
+    if bright.shape[0] < 8:
+        return fallback
     c = np.median(bright, axis=0)
     return (float(c[0] / 255), float(c[1] / 255), float(c[2] / 255))
 
@@ -112,6 +136,7 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
     raw_lines: list = []      # (origin_px, text, em_px, conf, cover_pt)
     x_ratio = _X_RATIO_SERIF
 
+    page_paper = _paper_color(image_rgb)   # fallback when a word crop is sparse
     for ln in ocr_lines:
         x0, y0, x1, y1 = ln.bbox
         x0i, y0i = max(0, int(x0)), max(0, int(y0))
@@ -136,7 +161,11 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
             w_origin_px = (x0i + w.x0, baseline_px)
             w_cover_pt = ((x0i + w.x0 - pad) / ppi, (y0i + w.top - pad) / ppi,
                           (x0i + w.x1 + pad) / ppi, (y0i + w.bottom + pad) / ppi)
-            raw_lines.append((w_origin_px, w.text, em_px, ln.confidence, w_cover_pt))
+            w_bg = _local_paper_color(
+                image_rgb, x0i + w.x0 - pad, y0i + w.top - pad,
+                x0i + w.x1 + pad, y0i + w.bottom + pad, page_paper)
+            raw_lines.append(
+                (w_origin_px, w.text, em_px, ln.confidence, w_cover_pt, w_bg))
         glyphs = sorted(seg.glyphs, key=lambda g: g.x0)
         for i, g in enumerate(glyphs):
             if g.char not in rep_bitmap and g.bitmap.size:
@@ -150,12 +179,12 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
     family = fontmatch.classify_family(rep_bitmap)
 
     lines = []
-    for origin_px, text, em_px, conf, cover_pt in raw_lines:
+    for origin_px, text, em_px, conf, cover_pt, w_bg in raw_lines:
         size_pt = em_px / ppi
         origin_pt = (origin_px[0] / ppi, origin_px[1] / ppi)
         lines.append(LineBox(origin=origin_pt, text=text, size=size_pt,
-                             confidence=conf, cover=cover_pt))
+                             confidence=conf, cover=cover_pt, bg=w_bg))
 
     return ReconResult(otf_bytes=b"", family_name=family, lines=lines,
                        traced_chars="".join(sorted(rep_bitmap.keys())),
-                       n_lines=len(lines), bg_color=_paper_color(image_rgb))
+                       n_lines=len(lines), bg_color=page_paper)
