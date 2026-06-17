@@ -130,13 +130,16 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
             space_em_list.append(seg.space_px / em_px)
         pad = max(2.0, 0.06 * em_px)
         baseline_px = y0i + seg.baseline_y
-        for w in seg.words:
-            if not w.text.strip():
-                continue
-            w_origin_px = (x0i + w.x0, baseline_px)
-            w_cover_pt = ((x0i + w.x0 - pad) / ppi, (y0i + w.top - pad) / ppi,
-                          (x0i + w.x1 + pad) / ppi, (y0i + w.bottom + pad) / ppi)
-            raw_lines.append((w_origin_px, w.text, em_px, ln.confidence, w_cover_pt))
+        # ONE editable box per LINE, not per word. A box per word turned a page
+        # into a confetti of tiny boxes (the "boxes suck" problem); a line box edits
+        # as a coherent unit and matches how the text reads. Cover = the whole OCR
+        # line rect (painted in paper before the edited line draws); origin = the
+        # line's left baseline.
+        if ln.text.strip():
+            line_cover_pt = ((x0i - pad) / ppi, (y0i - pad) / ppi,
+                             (x1i + pad) / ppi, (y1i + pad) / ppi)
+            raw_lines.append(((x0i, baseline_px), ln.text, em_px, ln.confidence,
+                              line_cover_pt))
         glyphs = sorted(seg.glyphs, key=lambda g: g.x0)
         for i, g in enumerate(glyphs):
             if g.char not in rep_bitmap and g.bitmap.size:
