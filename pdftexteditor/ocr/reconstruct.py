@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from . import fontmatch
+from . import fontbank, fontmatch
 from .segment import segment_line
 
 # Bundled families (in assets/fonts), metric-compatible with the three fonts most
@@ -115,6 +115,7 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
     advances: list = []       # per-glyph advance (px) for the mono test
     space_em_list: list = []
     raw_lines: list = []      # per-line geometry dicts (display PIXELS)
+    cells: dict = {}          # id -> (char, scan bbox) for bank font ID
     x_ratio = _X_RATIO_SERIF
 
     for ln in ocr_lines:
@@ -142,13 +143,29 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
         for i, g in enumerate(glyphs):
             if g.char not in rep_bitmap and g.bitmap.size:
                 rep_bitmap[g.char] = g.bitmap
+            if g.bitmap.size and g.char.strip():
+                gx = x0i + int(g.x0)
+                cells[len(cells)] = (g.char,
+                                     (gx, y0i, gx + int(g.bitmap.shape[1]), y1i))
             if i + 1 < len(glyphs):
                 advances.append(glyphs[i + 1].x0 - g.x0)
 
     if not raw_lines or not rep_bitmap:
         return None
 
+    # Identify the document's ACTUAL font from the shipped bank (~4k fonts) by
+    # shape-matching the scanned glyphs, and embed it, so an edit matches the
+    # document instead of one of three fallback families. Falls back to the
+    # 3-family classifier when the bank is absent or the match is too weak
+    # (match_font returns None); then there is no per-page custom face.
     family = fontmatch.classify_family(rep_bitmap)
+    otf_bytes = b""
+    try:
+        matched = fontbank.match_font(image_rgb, cells)
+    except Exception:
+        matched = None
+    if matched is not None:
+        otf_bytes, family = matched
 
     # ONE editable box per AREA, not per word/line. A box per word turned a page
     # into confetti; what the user wants is to edit a whole paragraph as one. Lines
@@ -158,7 +175,7 @@ def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
     lines = [_area_to_box(area, ppi)
              for area in _group_lines_into_areas(raw_lines)]
 
-    return ReconResult(otf_bytes=b"", family_name=family, lines=lines,
+    return ReconResult(otf_bytes=otf_bytes, family_name=family, lines=lines,
                        traced_chars="".join(sorted(rep_bitmap.keys())),
                        n_lines=len(lines), bg_color=_paper_color(image_rgb))
 

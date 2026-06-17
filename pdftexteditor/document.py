@@ -1172,15 +1172,19 @@ class PDFDocument:
             return None
         try:
             import cv2
-            from .ocr import degrade, fontmatch
+            from .ocr import degrade, fontbank, fontmatch
             # The raster is rotation-naive (placed axis-aligned over the cover), so
             # on a /Rotate page it would land wrong. Fall back to vector text there.
             if self.page_rotation(box.page_index) % 360 != 0:
                 return None
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
-            fpath = os.path.join(fontmatch._DIR,
-                                 fontmatch._CANDIDATES.get(box.font_family, ""))
-            if not fontmatch._CANDIDATES.get(box.font_family) or not os.path.exists(fpath):
+            # A matched BANK font (the document's real face) if this box uses one,
+            # else the bundled family.
+            fpath = fontbank.font_file_for(box.font_family)
+            if fpath is None:
+                fpath = os.path.join(fontmatch._DIR,
+                                     fontmatch._CANDIDATES.get(box.font_family, ""))
+            if not fpath or not os.path.exists(fpath):
                 return None
             dpi = 300.0
             ppi = dpi / 72.0
@@ -1246,17 +1250,20 @@ class PDFDocument:
             return None
         try:
             import cv2
-            from .ocr import fontmatch
+            from .ocr import fontbank, fontmatch
             from .reflow import wrap_paragraph
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
             pr, pg, pb = (float(c) for c in cover[4:7])
             area_w, area_h = x1 - x0, y1 - y0
             if area_w < 4 or area_h < 4:
                 return None
-            fpath = os.path.join(fontmatch._DIR,
-                                 fontmatch._CANDIDATES.get(box.font_family, ""))
-            if not fontmatch._CANDIDATES.get(box.font_family) \
-                    or not os.path.exists(fpath):
+            # The font file to render the tile in: a matched BANK font (the OCR'd
+            # document's real face) if this box uses one, else the bundled family.
+            fpath = fontbank.font_file_for(box.font_family)
+            if fpath is None:
+                fpath = os.path.join(fontmatch._DIR,
+                                     fontmatch._CANDIDATES.get(box.font_family, ""))
+            if not fpath or not os.path.exists(fpath):
                 return None
             em = max(8.0, float(box.size))
             lead = box.leading or em * 1.3

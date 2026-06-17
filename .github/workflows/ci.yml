@@ -59,6 +59,7 @@ jobs:
           python tests/test_degrade.py
           python tests/test_ocr_blend.py
           python tests/test_page_layout.py
+          python tests/test_fontbank.py
 
       - name: Build app (PyInstaller)
         run: pyinstaller --noconfirm "PDFTextEditor.spec"
