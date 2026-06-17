@@ -6515,7 +6515,10 @@ class MainWindow(QMainWindow):
                 if lb.cover:
                     cx0, cy0, cx1, cy1 = self.document.ocr_cover_rect(
                         page_index, lb.cover)
-                    cover = (cx0, cy0, cx1, cy1) + tuple(res.bg_color)
+                    # Each word's OWN local background, so an edited word's cover
+                    # matches its cell, not the page-wide paper median (which
+                    # painted every edit a single off-white/cream).
+                    cover = (cx0, cy0, cx1, cy1) + tuple(lb.bg)
                 self.undo_stack.push(BoxCommand(
                     self.document, self.view, page_index, None, "add", {
                         "origin": origin, "direction": direction,
