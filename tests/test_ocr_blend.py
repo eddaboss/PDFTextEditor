@@ -24,7 +24,7 @@ _APP = QApplication.instance() or QApplication([])
 from pdftexteditor.document import PDFDocument  # noqa: E402
 from pdftexteditor.ocr import degrade as D  # noqa: E402
 
-SERIF = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
+SERIF = os.path.join(ROOT, "pdftexteditor", "assets", "fonts", "Tinos-Regular.ttf")
 EM = 16.0
 MARGIN = 20.0
 BASELINE = 50.0
