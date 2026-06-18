@@ -1308,6 +1308,157 @@ class PDFDocument:
         except Exception:
             return None
 
+    def _scanned_composite_raster(self, box: "NewBox", new_text: str,
+                                  orig_text: str = ""):
+        """Render an edited single scanned LINE by KEEPING the original scanned
+        pixels of every word the user did NOT change and synthesizing ONLY the
+        words that changed, then reflowing them on the original baseline with the
+        measured inter-word spacing (so deleting a word closes the gap cleanly).
+
+        The kept words ARE the real scan, so they blend perfectly; a synthesized
+        word is recoloured to the scan's ink and degraded only to the line's OWN
+        local severity, so a clean line yields a clean edit. Word-level keeps the
+        kept/synth seams in the whitespace between words, where they are invisible.
+
+        The original word boxes are recovered on the fly by re-segmenting the
+        cover region with the original text (``ocr/segment.py``) -- the same code
+        the OCR used -- so nothing extra has to be threaded through the box.
+        Non-rotated pages only; returns (png, rect), or None to make the caller
+        fall back to the whole-line re-render (which handles rotation)."""
+        import numpy as np
+        cover = box.cover
+        ot = (orig_text or "").strip()
+        if not (cover and len(cover) == 7) or not new_text.strip() or not ot:
+            return None
+        if self.page_rotation(box.page_index) % 360 != 0:
+            return None                          # rotated -> caller falls back
+        try:
+            import cv2
+            import difflib
+            from .ocr import degrade
+            from .ocr.segment import segment_line
+            x0, y0, x1, y1 = (float(c) for c in cover[:4])
+            fpath = self._edit_font_file(box.font_family)
+            if fpath is None:
+                return None
+            ppi = 300.0 / 72.0
+            page_rgb = self.render_page_image(box.page_index, 300.0)  # text==display
+            H, W = page_rgb.shape[:2]
+            rx0, ry0 = max(0, int(round(x0 * ppi))), max(0, int(round(y0 * ppi)))
+            rx1, ry1 = min(W, int(round(x1 * ppi))), min(H, int(round(y1 * ppi)))
+            if rx1 - rx0 < 6 or ry1 - ry0 < 4:
+                return None
+            region = np.ascontiguousarray(page_rgb[ry0:ry1, rx0:rx1])
+            Hr, Wr = region.shape[:2]
+            # Locate each ORIGINAL word's ink box by re-segmenting with the old text.
+            seg = segment_line(region, ot)
+            if seg is None or not seg.words:
+                return None
+            base_y = float(seg.baseline_y)
+            # Recover ink / paper colour + local damage severity from THIS line.
+            gmean = region.mean(2)
+            dark = gmean < float(np.percentile(gmean, 85)) * 0.7
+            ink, paper = degrade.sample_ink_paper(region, dark)
+            if float(ink.mean()) > float(paper.mean()) * 0.72:
+                ink = (paper * 0.18).astype(np.float32)
+            # Local damage of THIS line (its own neighbours). local_severity needs
+            # the INTENDED ink footprint (where ink should be), so close the dark
+            # mask to fill toner dropout, then it measures how much of that footprint
+            # has FADED: ~0.05 for crisp text, high for a faxy line. This is what
+            # keeps a synth word CLEAN when the words around it are clean (the ask).
+            try:
+                footprint = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_CLOSE,
+                                             np.ones((5, 5), np.uint8)) > 0
+                sev = float(degrade.local_severity(region, footprint, (0, 0, Wr, Hr)))
+            except Exception:
+                sev = 0.06
+            # em that reproduces the original line's ink height, measured with the
+            # line's OWN letters so its ascender/descender profile is matched.
+            f = fitz.Font(fontfile=fpath)
+            rows = np.where(dark.any(1))[0]
+            orig_ink_h = (float(rows.max() - rows.min() + 1) / ppi
+                          if len(rows) >= 2 else (y1 - y0) * 0.7)
+            _, oys, _, _ = self._render_text_px(f, ot, 100.0, ppi)
+            ratio = ((oys.max() - oys.min() + 1) / ppi / 100.0) if len(oys) else 0.0
+            em = float(np.clip(orig_ink_h / ratio if ratio > 1e-3 else float(box.size),
+                               5.0, 200.0))
+            # Paper-coloured tile the size of the region; kept words paste their real
+            # scan pixels, synth words paste their own recoloured+degraded patch.
+            paper_u8 = np.clip(paper, 0, 255).astype(np.uint8)
+            tile = np.empty((Hr, Wr, 3), np.uint8)
+            tile[:] = paper_u8
+
+            def blit(src, x, y):
+                sh, sw = src.shape[:2]
+                sx0, sy0 = max(0, -x), max(0, -y)
+                dx0, dy0 = max(0, x), max(0, y)
+                w = min(sw - sx0, Wr - dx0)
+                h = min(sh - sy0, Hr - dy0)
+                if w > 0 and h > 0:
+                    tile[dy0:dy0 + h, dx0:dx0 + w] = src[sy0:sy0 + h, sx0:sx0 + w]
+
+            # Word-level diff: KEEP unchanged words (their real pixels), SYNTH the
+            # changed/new ones. A 'delete' just drops the word; reflow closes the gap.
+            orig_tokens, new_tokens = ot.split(), new_text.split()
+            sm = difflib.SequenceMatcher(a=orig_tokens, b=new_tokens, autojunk=False)
+            placements = []                      # ('keep', WordBox) | ('synth', str)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag == "equal":
+                    for off in range(i2 - i1):
+                        a, b = i1 + off, j1 + off
+                        if a < len(seg.words) and seg.words[a].text == orig_tokens[a]:
+                            placements.append(("keep", seg.words[a]))
+                        else:
+                            placements.append(("synth", new_tokens[b]))
+                elif tag in ("replace", "insert"):
+                    for b in range(j1, j2):
+                        placements.append(("synth", new_tokens[b]))
+                # 'delete' -> contributes nothing
+            if not placements:
+                return None
+            # Lay the words out left to right, starting at the original line's left
+            # edge, advancing by word width + the measured inter-word space.
+            space_px = (seg.space_px if seg.space_px and seg.space_px > 1
+                        else 0.25 * em * ppi)
+            x_cursor = float(min(w.x0 for w in seg.words))
+            for idx, (kind, item) in enumerate(placements):
+                if kind == "keep":
+                    w = item
+                    wx0, wx1 = max(0, int(w.x0)), min(Wr, int(max(w.x1, w.x0 + 1)))
+                    wt, wb = max(0, int(w.top)), min(Hr, int(max(w.bottom, w.top + 1)))
+                    if wx1 <= wx0 or wb <= wt:
+                        continue
+                    patch = region[wt:wb, wx0:wx1]
+                    blit(patch, int(round(x_cursor)), wt)   # keep its baseline row
+                    x_cursor = round(x_cursor) + patch.shape[1] + space_px
+                else:
+                    wr0, ys, xs, by_px = self._render_text_px(f, item, em, ppi)
+                    if not len(ys) or not len(xs):
+                        x_cursor += space_px
+                        continue
+                    crop = wr0[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+                    if sev <= 0.12:
+                        # Clean neighbours -> just recolour to the scan ink, KEEPING
+                        # the antialiasing. No hard-degrade: that aliases + thickens
+                        # the glyph, making an edit look damaged next to crisp text.
+                        cov = ((255.0 - crop.mean(2)) / 255.0)[..., None]
+                        deg = np.clip(
+                            paper.reshape(1, 1, 3) * (1.0 - cov) +
+                            ink.reshape(1, 1, 3) * cov, 0, 255).astype(np.uint8)
+                    else:
+                        deg = degrade.degrade_patch(
+                            crop, ink, paper, sev,
+                            seed=box.box_id * 131 + idx * 17 + len(item) * 7)
+                    dy0 = int(round(base_y - (by_px - ys.min())))
+                    blit(deg, int(round(x_cursor)), dy0)
+                    x_cursor = round(x_cursor) + deg.shape[1] + space_px
+            ok, buf = cv2.imencode(".png", cv2.cvtColor(tile, cv2.COLOR_RGB2BGR))
+            if not ok:
+                return None
+            return bytes(buf), (rx0 / ppi, ry0 / ppi, rx1 / ppi, ry1 / ppi)
+        except Exception:
+            return None
+
     def paragraph_fit_factor(self, box: "NewBox", text: "str | None" = None) -> float:
         """How much to scale a paragraph OCR box's size + leading DOWN so its lines
         fit the cover (1.0 = fits as-is; never > 1). SHARED by the inline editor and
@@ -2246,12 +2397,15 @@ class PDFDocument:
             # cover) so it blends, instead of drawing crisp vector text. Falls back
             # to plain text if the raster cannot be built.
             if cur.cover and len(cur.cover) == 7:
-                # A paragraph area reflows as a whole-tile raster (rotation-safe);
-                # a single word uses the per-word degrade raster (precise blend,
-                # non-rotated only). Either falls back to plain text on failure.
+                # A paragraph area reflows as a whole-tile raster (rotation-safe).
+                # A single line KEEPS the original scan pixels of the words the user
+                # did not change and synthesizes only the changed ones (composite,
+                # non-rotated); on a rotated page or any failure it falls back to the
+                # whole-line degrade raster, then to plain text.
                 raster = (self._scanned_paragraph_raster(updated, new_text)
                           if cur.is_paragraph
-                          else self._scanned_edit_raster(updated, new_text, cur.text))
+                          else (self._scanned_composite_raster(updated, new_text, cur.text)
+                                or self._scanned_edit_raster(updated, new_text, cur.text)))
                 if raster is not None:
                     updated = replace(updated, edit_image=raster[0],
                                       edit_image_rect=raster[1])
