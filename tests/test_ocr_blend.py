@@ -67,6 +67,100 @@ def _px(pm):
     return a[:, :, :3].astype(np.int16)
 
 
+LINE = "Total sixty owed today"
+
+
+def _scanned_line_pdf(path, degraded):
+    """A one-page PDF whose page IS a (clean OR degraded) scan of the whole LINE.
+    Returns the cover rect (points) spanning the WHOLE line + the baseline origin,
+    so the composite sees every word."""
+    f = fitz.Font(fontfile=SERIF)
+    Wpt = MARGIN + f.text_length(LINE, EM) + MARGIN
+    Hpt = 80.0
+    doc = fitz.open(); pg = doc.new_page(width=Wpt, height=Hpt)
+    tw = fitz.TextWriter(pg.rect)
+    tw.append((MARGIN, BASELINE), LINE, font=f, fontsize=EM)
+    tw.write_text(pg, color=(0.07, 0.07, 0.09))
+    pm = pg.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+    rgb = np.frombuffer(pm.samples, np.uint8).reshape(
+        pm.height, pm.width, pm.n)[..., :3].copy()
+    if degraded:
+        rgb = D.hard_degrade(rgb.astype(np.float32), np.array([26, 26, 40], np.float32),
+                             np.array([248, 247, 244], np.float32), 0.40,
+                             np.random.RandomState(2))
+    import PIL.Image
+    buf = io.BytesIO(); PIL.Image.fromarray(rgb).save(buf, "PNG")
+    out = fitz.open(); page = out.new_page(width=Wpt, height=Hpt)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    out.save(path); out.close(); doc.close()
+    pad = 0.10 * EM
+    cover = (MARGIN - pad, BASELINE - 0.80 * EM,
+             MARGIN + f.text_length(LINE, EM) + pad, BASELINE + 0.26 * EM,
+             248 / 255, 247 / 255, 244 / 255)
+    return cover, (MARGIN, BASELINE)
+
+
+def _speckle_frac(region_i16):
+    """Fraction of dark pixels that are ISOLATED (no dark 4-neighbour). Hard toner
+    damage scatters stray ink + breaks strokes -> speckle; clean antialiased text
+    keeps dark pixels inside solid strokes -> ~0. So this rises with degradation."""
+    g = region_i16.mean(2)
+    dm = g < 110
+    nb = np.zeros_like(dm)
+    nb[1:, :] |= dm[:-1, :]; nb[:-1, :] |= dm[1:, :]
+    nb[:, 1:] |= dm[:, :-1]; nb[:, :-1] |= dm[:, 1:]
+    iso = dm & ~nb
+    return float(iso.sum()) / max(int(dm.sum()), 1)
+
+
+def _inked_cols(region_i16):
+    """(min, max) inked column in the region, or None."""
+    dark = region_i16.mean(2) < 130
+    cols = np.where(dark.any(0))[0]
+    return (int(cols.min()), int(cols.max())) if len(cols) else None
+
+
+def test_clean_stays_clean_and_reflows():
+    """The composite keeps a CLEAN line's edit clean (no hard-degrade speckle the
+    neighbours lack) and reflows cleanly on a delete -- the two things the user
+    called out. A DEGRADED line's edit, by contrast, must pick up the damage."""
+    import tempfile
+
+    def run(degraded, new_text):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "scan.pdf")
+            cover, origin = _scanned_line_pdf(path, degraded)
+            doc = PDFDocument(path)
+            box = doc.add_box(0, origin, LINE, "Tinos", EM, (0.0, 0.0, 0.0),
+                              False, False, cover=cover, render_mode=3)
+            base = _px(doc.render_with_edits(0, 2.0))
+            doc.stage_edit(0, box, new_text)
+            eb = doc._new_boxes[box.edit_key]
+            assert eb.edit_image and eb.edit_image_rect, \
+                "single-line scanned edit must build a composite raster"
+            edited = _px(doc.render_with_edits(0, 2.0))
+            cx0, cy0 = int(cover[0] * 2), int(cover[1] * 2)
+            cx1, cy1 = int(cover[2] * 2), int(cover[3] * 2)
+            doc.close()
+            return base[cy0:cy1, cx0:cx1], edited[cy0:cy1, cx0:cx1]
+
+    # REPLACE one word: clean edit must be far less speckled than the degraded one.
+    _, clean_reg = run(False, "Total forty owed today")
+    _, deg_reg = run(True, "Total forty owed today")
+    sc, sd = _speckle_frac(clean_reg), _speckle_frac(deg_reg)
+    assert sc < 0.5 * sd, \
+        f"clean edit must NOT be hard-degraded like a faxy one (speckle clean {sc:.3f} vs degraded {sd:.3f})"
+    assert sc < 0.04, f"clean edit should be near speckle-free (got {sc:.3f})"
+    print(f"  ok  clean edit stays clean (speckle {sc:.3f} << degraded {sd:.3f})")
+
+    # DELETE a middle word: the line must reflow left, not leave a hole.
+    base_reg, del_reg = run(False, "Total owed today")
+    b, e = _inked_cols(base_reg), _inked_cols(del_reg)
+    assert b and e and e[1] < b[1] - 4, \
+        f"deleting a word must reflow the line shorter (was right={b[1]} now {e[1]})"
+    print(f"  ok  delete reflows the line ({b[1]} -> {e[1]} px right edge)")
+
+
 def main():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "scan.pdf")
@@ -111,7 +205,8 @@ def main():
         assert diff < 6.0, f"save and screen disagree (mean diff {diff:.2f})"
         print(f"  ok  save -> reopen stable (mean diff {diff:.2f})")
         doc2.close(); doc.close()
-    print("\n4 ocr-blend tests passed.")
+    test_clean_stays_clean_and_reflows()
+    print("\n6 ocr-blend tests passed.")
 
 
 if __name__ == "__main__":
