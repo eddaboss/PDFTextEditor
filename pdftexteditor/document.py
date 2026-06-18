@@ -1203,7 +1203,17 @@ class PDFDocument:
                                     max(int(closed.sum()), 1), 0.05, 0.6))
             else:
                 sev = 0.25
-            return ink, paper, sev
+            # The ORIGINAL ink's vertical band as a fraction of the cover height: the
+            # edit is sized + positioned to match THIS, not the padded box, so it has
+            # the same x-height/cap-height as the word it replaces (the em estimate is
+            # unreliable -- often 50% too big). Rows that actually carry ink.
+            rows = np.where(dark.any(1))[0]
+            Hr = dark.shape[0]
+            if len(rows) >= 2 and Hr > 0:
+                ink_vfrac = (float(rows.min()) / Hr, float(rows.max() + 1) / Hr)
+            else:
+                ink_vfrac = (0.0, 1.0)
+            return ink, paper, sev, ink_vfrac
         except Exception:
             return None
 
@@ -1237,7 +1247,7 @@ class PDFDocument:
             samp = self._sample_scan_region(box)
             if samp is None:
                 return None
-            ink, paper, sev = samp
+            ink, paper, sev, ink_vfrac = samp
             ppi = 300.0 / 72.0
             f = fitz.Font(fontfile=fpath)
             em = max(8.0, float(box.size))
@@ -1261,7 +1271,17 @@ class PDFDocument:
             ok, buf = cv2.imencode(".png", cv2.cvtColor(deg, cv2.COLOR_RGB2BGR))
             if not ok:
                 return None
-            return bytes(buf), (x0, y0, x1, y1)
+            # Place to match the ORIGINAL ink's vertical band (so the edit has the
+            # SAME x/cap height as the word it replaces -- the em estimate is often
+            # ~50% too big), at its natural width preserving the rendered aspect,
+            # capped at the cover so it never runs into the neighbouring words.
+            fy0, fy1 = ink_vfrac
+            cov_h = y1 - y0
+            ty0 = y0 + fy0 * cov_h
+            th = max(1.0, (fy1 - fy0) * cov_h)
+            aspect = wr.shape[1] / max(wr.shape[0], 1)
+            tw_ = min(x1 - x0, aspect * th)
+            return bytes(buf), (x0, ty0, x0 + tw_, ty0 + th)
         except Exception:
             return None
 
@@ -1347,7 +1367,7 @@ class PDFDocument:
             #    (this is the colour/damage that the old flat-grey tile skipped).
             samp = self._sample_scan_region(box)
             if samp is not None:
-                ink, paper, sev = samp
+                ink, paper, sev, _ = samp
             else:
                 pr, pg_c, pb = (float(c) for c in cover[4:7])
                 ink = np.array([24.0, 24.0, 24.0], np.float32)

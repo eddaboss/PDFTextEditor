@@ -326,6 +326,47 @@ def test_oversized_paragraph_scales_to_fit() -> None:
             doc.close()
 
 
+def test_word_edit_sized_to_original_ink() -> None:
+    """A single-word edit is sized to the ORIGINAL word's measured ink height, not
+    the (often ~1.4x over-estimated) em -- so the replacement matches its neighbours
+    instead of rendering oversized like the 'WOMAN' case the user saw."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "s.pdf")
+        doc0 = fitz.open()
+        pg = doc0.new_page(width=420, height=120)
+        pg.draw_rect(pg.rect, color=(0.95, 0.93, 0.88),
+                     fill=(0.95, 0.93, 0.88), width=0)
+        f = fitz.Font(fontfile=os.path.join(_FONTS, "Cousine-Regular.ttf"))
+        tw = fitz.TextWriter(pg.rect)
+        tw.append((30, 60), "old female and lives", font=f, fontsize=13)
+        tw.write_text(pg, color=(0.18, 0.20, 0.22))
+        doc0.save(p)
+        doc0.close()
+        doc = PDFDocument(p)
+        try:
+            w = [x for x in doc.working[0].get_text("words") if x[4] == "female"][0]
+            wx0, wy0, wx1, wy1 = w[:4]
+            word_h = wy1 - wy0
+            cover = (wx0 - 1, wy0 - 1, wx1 + 1, wy1 + 1, 0.95, 0.93, 0.88)
+            o, dr = doc.ocr_text_placement(0, (wx0, wy1 - 2))
+            # em deliberately over-estimated (height/0.72) as the real pipeline does
+            box = doc.add_box(0, o, "female", "Cousine", round(word_h / 0.72, 1),
+                              (0, 0, 0), False, False, direction=dr,
+                              cover=cover, render_mode=3)
+            doc.stage_edit(0, box, "spouse")
+            eb = doc._new_boxes[box.edit_key]
+            assert eb.edit_image and eb.edit_image_rect, "no edit tile built"
+            edit_h = eb.edit_image_rect[3] - eb.edit_image_rect[1]
+            assert edit_h < word_h * 1.25, (
+                f"edit height {edit_h:.1f} is oversized vs the word {word_h:.1f} "
+                f"(should track the original ink, not the 1.4x em)")
+            assert edit_h > word_h * 0.45, \
+                f"edit height {edit_h:.1f} collapsed vs the word {word_h:.1f}"
+            print("  ok  word edit sized to the original ink, not the over-est em")
+        finally:
+            doc.close()
+
+
 def main() -> None:
     test_rotated_pages_do_not_overlap()
     test_pristine_ocr_box_not_edited()
@@ -334,7 +375,8 @@ def main() -> None:
     test_paragraph_box_mounts_multiline_editor()
     test_paragraph_edit_recolors_and_degrades()
     test_oversized_paragraph_scales_to_fit()
-    print("\n7 page-layout tests passed.")
+    test_word_edit_sized_to_original_ink()
+    print("\n8 page-layout tests passed.")
 
 
 if __name__ == "__main__":
