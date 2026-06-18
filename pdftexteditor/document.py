@@ -1266,7 +1266,9 @@ class PDFDocument:
             if not fpath or not os.path.exists(fpath):
                 return None
             em = max(8.0, float(box.size))
-            lead = box.leading or em * 1.3
+            # Clamp leading to the font's height so lines never overlap in the
+            # baked tile (a scan's measured leading can be tighter than the em).
+            lead = max(box.leading or 0.0, em * 1.15)
             col_w = max(8.0, (box.box_w or area_w) - 4.0)
             f = fitz.Font(fontfile=fpath)
             # Draw on a tile sized to the AREA (PDF pts); wrap to the column.
