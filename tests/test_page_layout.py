@@ -34,6 +34,8 @@ from pdftexteditor.document import PDFDocument  # noqa: E402
 from pdftexteditor.ocr.reconstruct import _group_lines_into_areas  # noqa: E402
 from pdftexteditor.ui.main_window import MainWindow  # noqa: E402
 
+_FONTS = os.path.join(ROOT, "pdftexteditor", "assets", "fonts")
+
 
 def _pump(n: int = 6) -> None:
     for _ in range(n):
@@ -247,13 +249,66 @@ def test_paragraph_box_mounts_multiline_editor() -> None:
             w.close()
 
 
+def test_paragraph_edit_recolors_and_degrades() -> None:
+    """An edited paragraph must RECOLOR to the scan's ink (not flat gray/black) and
+    carry damage -- the color/degrade models must run on the paragraph path, on a
+    rotated page too. Render a scan with distinctly BLUE ink and check the edit's
+    ink pixels are blue with texture."""
+    for rot in (0, 90):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s.pdf")
+            doc0 = fitz.open()
+            page = doc0.new_page(width=400, height=300)
+            page.draw_rect(page.rect, color=(0.93, 0.91, 0.85),
+                           fill=(0.93, 0.91, 0.85), width=0)
+            f = fitz.Font(fontfile=os.path.join(_FONTS, "Tinos-Regular.ttf"))
+            tw = fitz.TextWriter(page.rect)
+            for i, t in enumerate(["Scanned blue ink line one",
+                                   "second line of the block"]):
+                tw.append((40, 70 + i * 22), t, font=f, fontsize=15)
+            tw.write_text(page, color=(0.10, 0.14, 0.42))      # dark blue ink
+            if rot:
+                page.set_rotation(rot)
+            doc0.save(p)
+            doc0.close()
+            doc = PDFDocument(p)
+            try:
+                cover = tuple(doc.ocr_cover_rect(0, (34., 52., 262., 120.))) \
+                    + (0.93, 0.91, 0.85)
+                o, dr = doc.ocr_text_placement(0, (40., 70.))
+                box = doc.add_box(0, o, "x", "Tinos", 15.0, (0, 0, 0), False, False,
+                                  direction=dr, cover=cover, render_mode=3,
+                                  box_w=224., leading=22.)
+                doc.stage_edit(0, box, "EDITED blue ink line one\n"
+                                       "second line of the block")
+                eb = doc._new_boxes[box.edit_key]
+                assert eb.edit_image, f"rot={rot}: paragraph edit built no tile"
+                import cv2
+                arr = cv2.cvtColor(
+                    cv2.imdecode(np.frombuffer(eb.edit_image, np.uint8),
+                                 cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB).astype(np.float32)
+                lum = arr.mean(2)
+                ink = arr[lum < 150]                            # the genuinely dark pixels
+                assert ink.shape[0] > 200, f"rot={rot}: edit has no ink (invisible)"
+                med = np.median(ink, axis=0)
+                assert med[2] > med[0] + 25, (
+                    f"rot={rot}: edit ink {med.round(0)} is not the scan's BLUE -- "
+                    f"the color match did not run")
+                assert ink.mean(1).std() > 4.0, (
+                    f"rot={rot}: edit ink is uniform -- no degradation applied")
+            finally:
+                doc.close()
+    print("  ok  paragraph edit recolors to scan ink + degrades (rot 0 + 90)")
+
+
 def main() -> None:
     test_rotated_pages_do_not_overlap()
     test_pristine_ocr_box_not_edited()
     test_lines_group_into_paragraphs()
     test_paragraph_box_invisible_then_edits_in_area()
     test_paragraph_box_mounts_multiline_editor()
-    print("\n5 page-layout tests passed.")
+    test_paragraph_edit_recolors_and_degrades()
+    print("\n6 page-layout tests passed.")
 
 
 if __name__ == "__main__":
