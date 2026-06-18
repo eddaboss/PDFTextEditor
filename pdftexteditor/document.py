@@ -1227,12 +1227,30 @@ class PDFDocument:
                                  fontmatch._CANDIDATES.get(family, ""))
         return fpath if (fpath and os.path.exists(fpath)) else None
 
-    def _scanned_edit_raster(self, box: "NewBox", new_text: str):
-        """Render an edited single scanned word to LOOK LIKE THE SCAN: the new text
-        in the matched/bundled face, recoloured to the scan's recovered ink/paper
-        and per-pixel degraded to the local severity (ocr.degrade). Returns
-        ``(png_bytes, rect)`` to draw over the cover, or None to fall back to text.
-        Works on rotated pages now (sampling + insert_image both rotation-aware)."""
+    def _render_text_px(self, f, text, em, ppi):
+        """Render ``text`` at ``em`` and return (pixmap_rgb, ink_rows, ink_cols,
+        baseline_px). Baseline is at em*2 in the tile."""
+        import numpy as np
+        runw = f.text_length(text, em)
+        doc = fitz.open()
+        pg = doc.new_page(width=runw + 2 * em, height=em * 3)
+        tw = fitz.TextWriter(pg.rect)
+        tw.append((em, em * 2.0), text, font=f, fontsize=em)
+        tw.write_text(pg, color=(0.06, 0.06, 0.06))
+        pm = pg.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
+        a = np.frombuffer(pm.samples, np.uint8).reshape(
+            pm.height, pm.width, pm.n)[..., :3].copy()
+        cov = (255 - a.mean(2)) / 255.0
+        ys = np.where(cov.max(1) > 0.12)[0]
+        xs = np.where(cov.max(0) > 0.12)[0]
+        return a, ys, xs, em * 2.0 * ppi
+
+    def _scanned_edit_raster(self, box: "NewBox", new_text: str, orig_text: str = ""):
+        """Render an edited single scanned word to LOOK LIKE THE SCAN: recoloured to
+        the scan's ink/paper, per-pixel degraded, SIZED so its em reproduces the
+        ORIGINAL word's measured ink extent (using the original word's OWN letters,
+        so ascenders/descenders cancel and the edit isn't over/under-sized), and
+        PLACED on the original baseline. Returns (png, rect) or None."""
         import numpy as np
         cover = box.cover
         if not (cover and len(cover) == 7) or not new_text.strip():
@@ -1250,38 +1268,43 @@ class PDFDocument:
             ink, paper, sev, ink_vfrac = samp
             ppi = 300.0 / 72.0
             f = fitz.Font(fontfile=fpath)
-            em = max(8.0, float(box.size))
-            runw = f.text_length(new_text, em)
-            doc = fitz.open()
-            pg = doc.new_page(width=runw + 2 * em, height=em * 3)
-            tw = fitz.TextWriter(pg.rect)
-            tw.append((em, em * 2.0), new_text, font=f, fontsize=em)
-            tw.write_text(pg, color=(0.06, 0.06, 0.06))
-            pm = pg.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
-            wr = np.frombuffer(pm.samples, np.uint8).reshape(
-                pm.height, pm.width, pm.n)[..., :3].copy()
-            cov = (255 - wr.mean(2)) / 255.0
-            ys = np.where(cov.max(1) > 0.12)[0]
-            xs = np.where(cov.max(0) > 0.12)[0]
+            fy0, fy1 = ink_vfrac
+            cov_h = y1 - y0
+            rotated = self.page_rotation(box.page_index) % 360 != 0
+            orig_ink_h = max(1.0, (fy1 - fy0) * cov_h)   # original ink extent (pt)
+            # The em that reproduces the original word's ink extent, measured with the
+            # ORIGINAL word's letters so its ascender/descender profile is matched.
+            ot = (orig_text or "").strip()
+            if ot:
+                _, oys, _, _ = self._render_text_px(f, ot, 100.0, ppi)
+                ratio = ((oys.max() - oys.min() + 1) / ppi / 100.0) if len(oys) else 0.0
+                em = orig_ink_h / ratio if ratio > 1e-3 else float(box.size)
+            else:
+                em = float(box.size)
+            em = float(np.clip(em, 5.0, 200.0))
+            wr0, ys, xs, by_px = self._render_text_px(f, new_text, em, ppi)
             if not len(ys) or not len(xs):
                 return None
-            wr = wr[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+            asc_pt = (by_px - ys.min()) / ppi            # edit ascender above baseline
+            desc_pt = ((ys.max() + 1) - by_px) / ppi     # edit descender below
+            w_pt = (xs.max() - xs.min() + 1) / ppi
+            wr = wr0[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
             deg = degrade.degrade_patch(wr, ink, paper, sev,
                                         seed=box.box_id * 131 + len(new_text))
             ok, buf = cv2.imencode(".png", cv2.cvtColor(deg, cv2.COLOR_RGB2BGR))
             if not ok:
                 return None
-            # Place to match the ORIGINAL ink's vertical band (so the edit has the
-            # SAME x/cap height as the word it replaces -- the em estimate is often
-            # ~50% too big), at its natural width preserving the rendered aspect,
-            # capped at the cover so it never runs into the neighbouring words.
-            fy0, fy1 = ink_vfrac
-            cov_h = y1 - y0
+            if not rotated:
+                # Place on the recovered baseline; descenders hang below it.
+                baseline_y = float(box.origin[1])
+                return bytes(buf), (x0, baseline_y - asc_pt, x0 + w_pt,
+                                    baseline_y + desc_pt)
+            # Rotated: fall back to the cover ink band (baseline geometry would need
+            # the writing direction; not yet handled there).
             ty0 = y0 + fy0 * cov_h
             th = max(1.0, (fy1 - fy0) * cov_h)
             aspect = wr.shape[1] / max(wr.shape[0], 1)
-            tw_ = min(x1 - x0, aspect * th)
-            return bytes(buf), (x0, ty0, x0 + tw_, ty0 + th)
+            return bytes(buf), (x0, ty0, x0 + min(x1 - x0, aspect * th), ty0 + th)
         except Exception:
             return None
 
@@ -2228,7 +2251,7 @@ class PDFDocument:
                 # non-rotated only). Either falls back to plain text on failure.
                 raster = (self._scanned_paragraph_raster(updated, new_text)
                           if cur.is_paragraph
-                          else self._scanned_edit_raster(updated, new_text))
+                          else self._scanned_edit_raster(updated, new_text, cur.text))
                 if raster is not None:
                     updated = replace(updated, edit_image=raster[0],
                                       edit_image_rect=raster[1])
