@@ -6105,8 +6105,14 @@ class PageView(QGraphicsView):
         block_fmt = editor.textCursor().blockFormat()
         block_fmt.setAlignment(amap.get(alignment, Qt.AlignLeft))
         if line_height_px > 0:
+            # NEVER pin the line height below the font's natural height, or the
+            # glyphs overlap: an OCR block's measured leading can be tighter than
+            # the rendered face needs (scan lines packed tighter than the em
+            # estimate), and a FixedHeight smaller than the glyph box stacks the
+            # lines on top of each other. Clamp so lines can never collide.
+            natural = QFontMetricsF(editor.document().defaultFont()).height()
             block_fmt.setLineHeight(
-                line_height_px,
+                max(line_height_px, natural),
                 QTextBlockFormat.LineHeightTypes.FixedHeight.value)
         cur = editor.textCursor()
         cur.select(QTextCursor.Document)
