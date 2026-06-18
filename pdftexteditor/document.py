@@ -1158,54 +1158,87 @@ class PDFDocument:
             return np.ascontiguousarray(arr[..., :3])
         return np.repeat(arr[..., :1], 3, axis=2)
 
+    def _sample_scan_region(self, box: "NewBox", dpi: float = 300.0):
+        """Recover ``(ink, paper, severity)`` from the SCAN under ``box.cover`` --
+        the colour + damage signal an edit must match. The cover is text space; map
+        it through the page rotation matrix to the DISPLAY-space render so it works
+        on a /Rotate page too (the old raster bailed on rotation, which is why
+        rotated edits never blended). None when the region is too small."""
+        import numpy as np
+        cover = box.cover
+        if not (cover and len(cover) == 7):
+            return None
+        try:
+            import cv2
+            from .ocr import degrade
+            x0, y0, x1, y1 = (float(c) for c in cover[:4])
+            ppi = dpi / 72.0
+            page = self.working[box.page_index]
+            page_rgb = self.render_page_image(box.page_index, dpi)   # display space
+            H, W = page_rgb.shape[:2]
+            rot = page.rotation_matrix                               # text -> display
+            pts = [fitz.Point(px, py) * rot
+                   for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+            rx0 = max(0, int(min(p.x for p in pts) * ppi))
+            ry0 = max(0, int(min(p.y for p in pts) * ppi))
+            rx1 = min(W, int(max(p.x for p in pts) * ppi))
+            ry1 = min(H, int(max(p.y for p in pts) * ppi))
+            region = page_rgb[ry0:ry1, rx0:rx1]
+            if region.size == 0 or region.shape[0] < 4 or region.shape[1] < 6:
+                return None
+            g = region.mean(2)
+            dark = g < float(np.percentile(g, 85)) * 0.7            # scanned ink pixels
+            ink, paper = degrade.sample_ink_paper(region, dark)
+            # If the cover has no real ink (blank/sparse region), sampling returns
+            # ~paper, which would render the edit INVISIBLE (paper on paper). Floor
+            # the ink to a dark tone so an edit over a sparse cover stays legible;
+            # when real ink is present this is well below the sampled value and never
+            # fires, so a true colour match is preserved.
+            if float(ink.mean()) > float(paper.mean()) * 0.72:
+                ink = (paper * 0.18).astype(np.float32)
+            m = dark.astype(np.uint8)
+            if int(m.sum()) >= 8:                                   # dropout -> severity
+                closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+                sev = float(np.clip((int(closed.sum()) - int(m.sum())) /
+                                    max(int(closed.sum()), 1), 0.05, 0.6))
+            else:
+                sev = 0.25
+            return ink, paper, sev
+        except Exception:
+            return None
+
+    def _edit_font_file(self, family: str) -> "str | None":
+        """The TTF to render an edit in: the matched BANK face if the box uses one,
+        else the bundled family. None when neither is on disk."""
+        from .ocr import fontbank, fontmatch
+        fpath = fontbank.font_file_for(family)
+        if fpath is None:
+            fpath = os.path.join(fontmatch._DIR,
+                                 fontmatch._CANDIDATES.get(family, ""))
+        return fpath if (fpath and os.path.exists(fpath)) else None
+
     def _scanned_edit_raster(self, box: "NewBox", new_text: str):
-        """For an edited scanned-OCR box (one carrying a 7-tuple cover), render
-        ``new_text`` in the matched bundled font, recover the scan's ink/paper and
-        local dropout severity from the word's region, hard-damage it (ocr.degrade),
-        and return ``(png_bytes, rect)`` to draw over the cover so the edit matches
-        the scan's colour + degradation. None if anything is unavailable (the caller
-        then falls back to plain vector text). Non-rotated pages (the common scan)."""
-        import io
+        """Render an edited single scanned word to LOOK LIKE THE SCAN: the new text
+        in the matched/bundled face, recoloured to the scan's recovered ink/paper
+        and per-pixel degraded to the local severity (ocr.degrade). Returns
+        ``(png_bytes, rect)`` to draw over the cover, or None to fall back to text.
+        Works on rotated pages now (sampling + insert_image both rotation-aware)."""
         import numpy as np
         cover = box.cover
         if not (cover and len(cover) == 7) or not new_text.strip():
             return None
         try:
             import cv2
-            from .ocr import degrade, fontbank, fontmatch
-            # The raster is rotation-naive (placed axis-aligned over the cover), so
-            # on a /Rotate page it would land wrong. Fall back to vector text there.
-            if self.page_rotation(box.page_index) % 360 != 0:
-                return None
+            from .ocr import degrade
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
-            # A matched BANK font (the document's real face) if this box uses one,
-            # else the bundled family.
-            fpath = fontbank.font_file_for(box.font_family)
+            fpath = self._edit_font_file(box.font_family)
             if fpath is None:
-                fpath = os.path.join(fontmatch._DIR,
-                                     fontmatch._CANDIDATES.get(box.font_family, ""))
-            if not fpath or not os.path.exists(fpath):
                 return None
-            dpi = 300.0
-            ppi = dpi / 72.0
-            page_rgb = self.render_page_image(box.page_index, dpi)
-            H, W = page_rgb.shape[:2]
-            rx0, ry0 = max(0, int(x0 * ppi)), max(0, int(y0 * ppi))
-            rx1, ry1 = min(W, int(x1 * ppi)), min(H, int(y1 * ppi))
-            region = page_rgb[ry0:ry1, rx0:rx1]
-            if region.size == 0 or region.shape[0] < 4 or region.shape[1] < 6:
+            samp = self._sample_scan_region(box)
+            if samp is None:
                 return None
-            g = region.mean(2)
-            paper_guess = float(np.percentile(g, 85))
-            dark = g < paper_guess * 0.7                     # scanned ink pixels
-            ink, paper = degrade.sample_ink_paper(region, dark)
-            m = dark.astype(np.uint8)
-            if int(m.sum()) >= 8:                            # dropout fraction -> severity
-                closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-                sev = float(np.clip((int(closed.sum()) - int(m.sum())) /
-                                    max(int(closed.sum()), 1), 0.05, 0.6))
-            else:
-                sev = 0.25
+            ink, paper, sev = samp
+            ppi = 300.0 / 72.0
             f = fitz.Font(fontfile=fpath)
             em = max(8.0, float(box.size))
             runw = f.text_length(new_text, em)
@@ -1228,11 +1261,7 @@ class PDFDocument:
             ok, buf = cv2.imencode(".png", cv2.cvtColor(deg, cv2.COLOR_RGB2BGR))
             if not ok:
                 return None
-            # Fill the ORIGINAL word's box so the edit can never overflow into the
-            # neighbouring scanned words (a same-length edit barely distorts; this
-            # avoids the "fortydays" abutment). insert_image scales to this rect.
-            rect = (x0, y0, x1, y1)
-            return bytes(buf), rect
+            return bytes(buf), (x0, y0, x1, y1)
         except Exception:
             return None
 
@@ -1250,34 +1279,27 @@ class PDFDocument:
             return None
         try:
             import cv2
-            from .ocr import fontbank, fontmatch
+            from .ocr import degrade
             from .reflow import wrap_paragraph
             x0, y0, x1, y1 = (float(c) for c in cover[:4])
-            pr, pg, pb = (float(c) for c in cover[4:7])
             area_w, area_h = x1 - x0, y1 - y0
             if area_w < 4 or area_h < 4:
                 return None
-            # The font file to render the tile in: a matched BANK font (the OCR'd
-            # document's real face) if this box uses one, else the bundled family.
-            fpath = fontbank.font_file_for(box.font_family)
+            fpath = self._edit_font_file(box.font_family)
             if fpath is None:
-                fpath = os.path.join(fontmatch._DIR,
-                                     fontmatch._CANDIDATES.get(box.font_family, ""))
-            if not fpath or not os.path.exists(fpath):
                 return None
             em = max(8.0, float(box.size))
-            # Clamp leading to the font's height so lines never overlap in the
-            # baked tile (a scan's measured leading can be tighter than the em).
+            # Clamp leading to the font's height so lines never overlap in the tile.
             lead = max(box.leading or 0.0, em * 1.15)
             col_w = max(8.0, (box.box_w or area_w) - 4.0)
             f = fitz.Font(fontfile=fpath)
-            # Draw on a tile sized to the AREA (PDF pts); wrap to the column.
+            # 1) Render the recognized lines CLEAN -- dark text on a WHITE tile sized
+            #    to the area -- preserving the block's line breaks (only an over-long
+            #    line wraps to the column).
             doc = fitz.open()
             pg_ = doc.new_page(width=area_w, height=area_h)
-            pg_.draw_rect(pg_.rect, color=(pr, pg, pb), fill=(pr, pg, pb), width=0)
+            pg_.draw_rect(pg_.rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
             tw = fitz.TextWriter(pg_.rect)
-            # Draw each recognized LINE at its own baseline (preserve the block's
-            # line breaks); only an over-long single line wraps to the column.
             drew = False
             y = em
             for line_text in new_text.split("\n"):
@@ -1293,12 +1315,25 @@ class PDFDocument:
                         drew = True
                 y += lead * max(1, len(sub.lines))
             if drew:
-                tw.write_text(pg_, color=(0.1, 0.1, 0.1))
+                tw.write_text(pg_, color=(0.06, 0.06, 0.06))
             ppi = 300.0 / 72.0
             pm = pg_.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
-            rgb = np.frombuffer(pm.samples, np.uint8).reshape(
+            clean = np.frombuffer(pm.samples, np.uint8).reshape(
                 pm.height, pm.width, pm.n)[..., :3].copy()
-            ok, buf = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            # 2) Recover the scan's ink/paper + local damage and RECOLOR + DEGRADE the
+            #    whole tile, so a paragraph edit blends exactly like a single word
+            #    (this is the colour/damage that the old flat-grey tile skipped).
+            samp = self._sample_scan_region(box)
+            if samp is not None:
+                ink, paper, sev = samp
+            else:
+                pr, pg_c, pb = (float(c) for c in cover[4:7])
+                ink = np.array([24.0, 24.0, 24.0], np.float32)
+                paper = np.array([pr * 255, pg_c * 255, pb * 255], np.float32)
+                sev = 0.2
+            out = degrade.degrade_patch(clean, ink, paper, sev,
+                                        seed=box.box_id * 131 + len(new_text))
+            ok, buf = cv2.imencode(".png", cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
             if not ok:
                 return None
             return bytes(buf), (x0, y0, x1, y1)
