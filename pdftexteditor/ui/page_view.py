@@ -5957,6 +5957,14 @@ class PageView(QGraphicsView):
 
         z = self._zoom
         eff_size = float(eff.get("size", box.size) or box.size)
+        # A paragraph OCR box scales to FIT its cover, with the SAME factor the bake
+        # uses, so the inline editor and the saved page lay out the same lines at the
+        # same size (without this the editor renders the raw over-estimated size and
+        # overflows while the bake fits -- they disagreed).
+        _fit = (self.document.paragraph_fit_factor(box)
+                if getattr(box, "is_paragraph", False)
+                and len(getattr(box, "cover", ()) or ()) == 7 else 1.0)
+        eff_size *= _fit
         pixel_size = max(_MIN_PIXEL_SIZE, eff_size * z)
         font = resolved.qfont(pixel_size)
 
@@ -6034,7 +6042,7 @@ class PageView(QGraphicsView):
                 wrap_w = (x1 - x0) * z
             editor.setTextWidth(max(1.0, wrap_w))
             align = eff.get("alignment", "left")
-            leading_pt = getattr(box, "leading", 0.0) or (eff_size * 1.2)
+            leading_pt = (getattr(box, "leading", 0.0) * _fit) or (eff_size * 1.2)
             if self._editor_hard_wrapped:
                 # Use the bake's hard breaks exactly (no Qt re-wrap), and lay out
                 # each line to the page: per-block alignment, a leading-matched
@@ -6057,7 +6065,7 @@ class PageView(QGraphicsView):
         # hard-wrap path uses per-block top margins (first block margin 0), so it
         # needs no lift.
         if self._editor_multiline and not self._editor_hard_wrapped:
-            leading_pt = getattr(box, "leading", 0.0) or (eff_size * 1.2)
+            leading_pt = (getattr(box, "leading", 0.0) * _fit) or (eff_size * 1.2)
             surplus = leading_pt * z - QFontMetricsF(font).height()
             if surplus > 0:
                 editor.setY(editor.y() - surplus)
