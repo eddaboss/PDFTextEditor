@@ -301,6 +301,31 @@ def test_paragraph_edit_recolors_and_degrades() -> None:
     print("  ok  paragraph edit recolors to scan ink + degrades (rot 0 + 90)")
 
 
+def test_oversized_paragraph_scales_to_fit() -> None:
+    """A paragraph box whose size is too big for its cover scales DOWN to fit (the
+    factor the editor AND bake both use, so they lay out identically and the text
+    never overflows the cover); a well-sized box is left alone."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "s.pdf")
+        _flat_scan(p)
+        doc = PDFDocument(p)
+        try:
+            cover = (40., 60., 260., 124.) + (0.96, 0.96, 0.94)
+            o, dr = doc.ocr_text_placement(0, (44., 72.))
+            text = "line one of the block\nline two of the block\nline three here"
+            big = doc.add_box(0, o, text, "Tinos", 26.0, (0, 0, 0), False, False,
+                              direction=dr, cover=cover, render_mode=3,
+                              box_w=216., leading=26.)
+            small = doc.add_box(0, o, text, "Tinos", 9.0, (0, 0, 0), False, False,
+                                direction=dr, cover=cover, render_mode=3,
+                                box_w=216., leading=12.)
+            assert doc.paragraph_fit_factor(big) < 0.85, "over-sized box must scale down"
+            assert doc.paragraph_fit_factor(small) > 0.95, "well-sized box must not shrink"
+            print("  ok  over-sized paragraph scales to fit; well-sized one doesn't")
+        finally:
+            doc.close()
+
+
 def main() -> None:
     test_rotated_pages_do_not_overlap()
     test_pristine_ocr_box_not_edited()
@@ -308,7 +333,8 @@ def main() -> None:
     test_paragraph_box_invisible_then_edits_in_area()
     test_paragraph_box_mounts_multiline_editor()
     test_paragraph_edit_recolors_and_degrades()
-    print("\n6 page-layout tests passed.")
+    test_oversized_paragraph_scales_to_fit()
+    print("\n7 page-layout tests passed.")
 
 
 if __name__ == "__main__":

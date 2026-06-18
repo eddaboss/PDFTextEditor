@@ -1265,6 +1265,33 @@ class PDFDocument:
         except Exception:
             return None
 
+    def paragraph_fit_factor(self, box: "NewBox", text: "str | None" = None) -> float:
+        """How much to scale a paragraph OCR box's size + leading DOWN so its lines
+        fit the cover (1.0 = fits as-is; never > 1). SHARED by the inline editor and
+        the bake so the two lay the block out identically -- without this the editor
+        renders at the raw (often over-estimated) size while the bake fits, and they
+        disagree. Uses the recognized line breaks; no re-wrapping."""
+        cover = box.cover
+        if not (cover and len(cover) == 7):
+            return 1.0
+        fpath = self._edit_font_file(box.font_family)
+        if not fpath:
+            return 1.0
+        try:
+            f = fitz.Font(fontfile=fpath)
+            em = max(8.0, float(box.size))
+            lead = max(float(box.leading or 0.0), em * 1.2)
+            x0, y0, x1, y1 = (float(c) for c in cover[:4])
+            area_w, area_h = x1 - x0, y1 - y0
+            src = text if text is not None else (box.text or "")
+            lines = [t.strip() for t in src.split("\n") if t.strip()]
+            n = max(1, len(lines))
+            widest = max((f.text_length(t, em) for t in lines), default=1.0)
+            return float(min(1.0, (area_w - 4.0) / max(widest, 1.0),
+                             (area_h - 2.0) / max(n * lead, 1.0)))
+        except Exception:
+            return 1.0
+
     def _scanned_paragraph_raster(self, box: "NewBox", new_text: str):
         """For an edited PARAGRAPH (a multi-line OCR area), render the reflowed
         text onto a paper-coloured tile the size of the area and return
@@ -1288,32 +1315,27 @@ class PDFDocument:
             fpath = self._edit_font_file(box.font_family)
             if fpath is None:
                 return None
-            em = max(8.0, float(box.size))
-            # Clamp leading to the font's height so lines never overlap in the tile.
-            lead = max(box.leading or 0.0, em * 1.15)
-            col_w = max(8.0, (box.box_w or area_w) - 4.0)
             f = fitz.Font(fontfile=fpath)
-            # 1) Render the recognized lines CLEAN -- dark text on a WHITE tile sized
-            #    to the area -- preserving the block's line breaks (only an over-long
-            #    line wraps to the column).
+            lines_txt = [t.strip() for t in new_text.split("\n")]
+            # Render EXACTLY the recognized lines -- one per baseline, NO re-wrapping
+            # -- so the bake matches the inline editor line-for-line (the bake's wrap
+            # engine disagreed with Qt's and re-wrapped, overflowing the cover). Size
+            # + leading scaled by the SHARED fit factor so a too-big estimate fits
+            # the cover instead of overflowing, identically to the editor.
+            fit = self.paragraph_fit_factor(box, new_text)
+            em = max(8.0, float(box.size)) * fit
+            lead = max(box.leading or 0.0, max(8.0, float(box.size)) * 1.2) * fit
             doc = fitz.open()
             pg_ = doc.new_page(width=area_w, height=area_h)
             pg_.draw_rect(pg_.rect, color=(1, 1, 1), fill=(1, 1, 1), width=0)
             tw = fitz.TextWriter(pg_.rect)
             drew = False
             y = em
-            for line_text in new_text.split("\n"):
-                lt = line_text.strip()
-                if not lt:
-                    y += lead
-                    continue
-                sub = wrap_paragraph(lt, f, em, 2.0, y, col_w, leading=lead)
-                for ln in sub.lines:
-                    if ln.text and 0 <= ln.origin[1] <= area_h + em:
-                        tw.append((ln.origin[0], ln.origin[1]), ln.text,
-                                  font=f, fontsize=em)
-                        drew = True
-                y += lead * max(1, len(sub.lines))
+            for lt in lines_txt:
+                if lt and y <= area_h + em:
+                    tw.append((2.0, y), lt, font=f, fontsize=em)
+                    drew = True
+                y += lead
             if drew:
                 tw.write_text(pg_, color=(0.06, 0.06, 0.06))
             ppi = 300.0 / 72.0
