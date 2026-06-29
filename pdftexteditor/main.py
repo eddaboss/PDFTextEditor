@@ -139,6 +139,10 @@ def _update_check_due() -> bool:
 
 
 def main() -> int:
+    # Fresh action debug log for this session (see debuglog.py): every significant
+    # action appends to /tmp/pdfte_debug.log so a bug can be read straight off the trace.
+    from . import debuglog
+    debuglog.new_session()
     # Must run before any window renders text so Core Graphics picks it up.
     _disable_macos_font_smoothing()
     app = QApplication(sys.argv)

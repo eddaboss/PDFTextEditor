@@ -59,6 +59,8 @@ class LineSeg:
     words: list           # list[WordBox]
     glyphs: list          # list[GlyphInstance] (clean harvest only)
     space_px: float       # measured inter-word gap (or 0 if single word)
+    groups: tuple = ()    # (x0, x1) of every merged ink cluster, x-sorted -- the raw
+    #                       ink positions, available even when no clean glyph harvested
 
 
 def binarize(strip: np.ndarray) -> np.ndarray:
@@ -131,26 +133,47 @@ def _baseline(groups: list) -> tuple:
 
 
 def _split_words(groups: list, text: str, min_gap: float) -> list:
-    """Split x-sorted groups into words at the inter-word gaps, aligned to the
-    number of space-delimited tokens in ``text``. A gap qualifies as a word
-    break only if it exceeds ``min_gap`` (a fraction of the em), which keeps
-    intra-word letter gaps from being mistaken for spaces; among qualifying
-    gaps the (len(tokens)-1) widest are chosen. Returns list of
-    (token, [group,...])."""
+    """Split x-sorted groups into exactly ``len(tokens)`` words, ESTIMATE-then-SNAP:
+    estimate each boundary's x from the running CHARACTER COUNT (the segmenter has no
+    font yet, so character width is the best proxy), then snap it to the widest real
+    inter-group gap within a window of that estimate, re-anchoring at each cut so the
+    estimate never drifts. Plain "the (n-1) widest gaps" failed badly when glyphs
+    over-segment -- a gap INSIDE a number rivals a word space, so the widest gaps were
+    not the word breaks (a clean address line split into 6 words of 9 and harvested
+    zero glyphs). This always makes n-1 strictly-increasing cuts, so chunks pair 1:1
+    with tokens. Returns list of (token, [group,...])."""
     tokens = text.split()
     if not groups or not tokens:
         return []
     if len(tokens) == 1 or len(groups) <= 1:
         return [(text.strip(), groups)]
-    gaps = []                               # (gap_width, index_after)
-    for i in range(len(groups) - 1):
-        gap = groups[i + 1]["x0"] - groups[i]["x1"]
-        if gap > min_gap:
-            gaps.append((gap, i + 1))
-    # The (len(tokens)-1) widest QUALIFYING gaps are the word breaks.
-    n_breaks = min(len(tokens) - 1, len(gaps))
-    cut_idx = sorted(idx for _, idx in
-                     sorted(gaps, reverse=True)[:n_breaks])
+    n = len(groups)
+    x0 = groups[0]["x0"]
+    x1 = groups[-1]["x1"]
+    span = max(x1 - x0, 1.0)
+    nchars = sum(len(t) for t in tokens) + (len(tokens) - 1)   # +1 per inter-word space
+    cut_idx = []
+    anchor_x, anchor_ch, cumch, lo = float(x0), 0.0, 0, 1
+    for k in range(len(tokens) - 1):
+        cumch += len(tokens[k])
+        est = anchor_x + span * (cumch + 0.5 - anchor_ch) / nchars
+        win = span / nchars * 2.0
+        best = None                                  # (score, idx, gap_center)
+        for i in range(lo, n):
+            gc = 0.5 * (groups[i - 1]["x1"] + groups[i]["x0"])
+            if abs(gc - est) <= win:
+                gw = groups[i]["x0"] - groups[i - 1]["x1"]
+                score = gw - 0.02 * abs(gc - est)    # widest gap nearest the estimate
+                if best is None or score > best[0]:
+                    best = (score, i, gc)
+        if best is None:                             # no gap in window: nearest boundary
+            if lo >= n:                              # cuts already consumed every group:
+                break                                # no group left to split on -> stop
+            i = min(range(lo, n), key=lambda j: abs(groups[j]["x0"] - est))
+            best = (0.0, i, float(groups[i]["x0"]))
+        cut_idx.append(best[1])
+        anchor_x, anchor_ch, lo = best[2], cumch + 0.5, best[1] + 1
+        cumch += 1                                   # the inter-word space
     chunks = []
     start = 0
     for c in cut_idx:
@@ -215,8 +238,9 @@ def segment_line(strip: np.ndarray, text: str) -> "LineSeg | None":
                     char=ch, bitmap=bm, x0=float(g["x0"]),
                     baseline_y=baseline, top_y=float(g["y0"])))
     space_px = float(np.median(space_samples)) if space_samples else 0.0
+    group_bounds = tuple((float(g["x0"]), float(g["x1"])) for g in groups)
     return LineSeg(baseline_y=baseline, x_height_px=xh, words=words,
-                   glyphs=glyphs, space_px=space_px)
+                   glyphs=glyphs, space_px=space_px, groups=group_bounds)
 
 
 def _group_bitmap(binary: np.ndarray, g: dict) -> "np.ndarray | None":

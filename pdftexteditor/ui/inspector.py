@@ -707,8 +707,10 @@ class Inspector(QWidget):
             return
 
         with self._loaded():
+            # Show the REAL typeface name, not the opaque scan-bank alias the box
+            # stores internally (e.g. 'ScanFont-01669' -> 'Solway Medium').
             family = style.get("font_family", "")
-            self._select_family(family)
+            self._select_family(FontEngine.display_name_for(family))
             self.size_spin.setValue(float(style.get("size", 12.0) or 12.0))
             self._color = self._norm_color(style.get("color", (0.0, 0.0, 0.0)))
             self._paint_swatch()
@@ -1070,17 +1072,38 @@ class Inspector(QWidget):
             current = self.family_combo.currentText()
             self.family_combo.clear()
             self.family_combo.addItems(self._families)
+            self._apply_item_fonts()
             if current:
                 self._select_family(current)
+
+    def _apply_item_fonts(self) -> None:
+        """Render each family name in its OWN font in the dropdown -- a live type
+        specimen, so the picker reads as a preview (the user can SEE each face).
+        Per-item Qt.FontRole; falls back silently to the combo font for any family
+        that will not load."""
+        for i in range(self.family_combo.count()):
+            self._set_item_font(i, self.family_combo.itemText(i))
+
+    def _set_item_font(self, idx: int, family: str) -> None:
+        if idx < 0:
+            return
+        try:
+            f = QFont(family)
+            f.setPointSize(13)
+            self.family_combo.setItemData(idx, f, Qt.FontRole)
+        except Exception:
+            pass
 
     def _select_family(self, family: str) -> None:
         """Select ``family`` in the combo if present; otherwise add it once so
         the inspector always shows the box's real family even when it is not in
-        the scanned system index (e.g. an embedded-only original)."""
+        the scanned system index (e.g. an embedded-only original or a scan
+        typeface shown by its real name)."""
         idx = self.family_combo.findText(family, Qt.MatchFixedString)
         if idx < 0 and family:
             self.family_combo.addItem(family)
             idx = self.family_combo.findText(family, Qt.MatchFixedString)
+            self._set_item_font(idx, family)
         if idx >= 0:
             self.family_combo.setCurrentIndex(idx)
 

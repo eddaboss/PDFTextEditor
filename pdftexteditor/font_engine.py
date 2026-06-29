@@ -36,6 +36,7 @@ import os
 import re
 import threading
 from dataclasses import dataclass
+from functools import lru_cache
 
 import fitz
 from PySide6.QtCore import QByteArray
@@ -50,6 +51,7 @@ from .fonts import (
     base14_code_for_family,
     is_bold,
     is_italic,
+    _SANS_HINTS as _SANS_TOKENS,
 )
 
 # --- Resolution tiers (also the fidelity-dot colors in the UI) ------------
@@ -125,7 +127,6 @@ class ResolvedFont:
     exact: bool                     # True only when the literal target typeface was reproduced
     # --- PyMuPDF insertion side (what save_as passes to insert_text) ---
     pdf_fontname: str               # registration name to pass as insert_text(fontname=...)
-    pdf_fontfile: str | None        # path to a font FILE on disk, or None
     pdf_fontbuffer: bytes | None    # font bytes, or None
     base14_code: str | None         # set only when tier == TIER_BASE14 (e.g. "hebo")
     # --- Qt rendering side (what the editor/preview draw with) ---
@@ -178,16 +179,88 @@ class _FaceRecord:
     is_italic: bool
 
 
+def _style_from_ttfont(tt, path: str) -> "tuple[str, str, str, str, bool, bool]":
+    """Read (postscript, family, subfamily, full_name, bold, italic) off an OPEN
+    fontTools TTFont. The ONE place that classifies a face's style, shared by the
+    system-index scan (``read_face``) and the standalone ``detect_ttf_style``
+    probe so the two can never drift. name IDs 6 / 16-or-1 / 17-or-2 / 4; bold &
+    italic primarily from OS/2.fsSelection (italic 0x01, bold 0x20), then
+    head.macStyle (bold 0x01, italic 0x02), then a name heuristic last. Returns
+    all-empty when there is no usable name table."""
+    try:
+        name = tt["name"]
+    except Exception:
+        return ("", "", "", "", False, False)
+
+    def gn(*ids: int) -> str:
+        for nid in ids:
+            rec = (name.getName(nid, 3, 1, 0x409)
+                   or name.getName(nid, 1, 0, 0)
+                   or name.getName(nid, 3, 0, 0x409))
+            if rec is not None:
+                try:
+                    return str(rec)
+                except Exception:
+                    continue
+        return ""
+
+    postscript = gn(6)
+    family = gn(16, 1)
+    subfamily = gn(17, 2)
+    full_name = gn(4)
+    style_blob = f"{subfamily} {postscript} {full_name}".lower()
+    # OS/2 fsSelection / head macStyle are more reliable for bold/italic.
+    bold = italic = False
+    try:
+        fs = tt["OS/2"].fsSelection
+        italic = bool(fs & 0x01)
+        bold = bool(fs & 0x20)
+    except Exception:
+        pass
+    if not (bold or italic):
+        try:
+            mac = tt["head"].macStyle
+            bold = bool(mac & 0x01)
+            italic = bool(mac & 0x02)
+        except Exception:
+            pass
+    if not bold:
+        bold = "bold" in style_blob and "semibold" not in subfamily.lower()
+    if not italic:
+        italic = "italic" in style_blob or "oblique" in style_blob
+    if not family:
+        family = postscript or os.path.basename(path)
+    return (postscript, family, subfamily, full_name, bold, italic)
+
+
+def detect_ttf_style(path: str, face_index: int = 0) -> "tuple[str, bool, bool]":
+    """``(family, bold, italic)`` for ONE font file/face, read straight off its
+    OpenType tables. The standalone probe used to learn the style of a
+    scan-matched bank face (the bank's files keep their real name tables even
+    after subsetting) or a user-picked file. Returns ``("", False, False)`` on an
+    unreadable font."""
+    try:
+        from fontTools.ttLib import TTFont
+        tt = TTFont(path, lazy=True, fontNumber=max(0, face_index))
+        try:
+            _, family, _, _, bold, italic = _style_from_ttfont(tt, path)
+        finally:
+            try:
+                tt.close()
+            except Exception:
+                pass
+        return (family, bold, italic)
+    except Exception:
+        return ("", False, False)
+
+
 # --------------------------------------------------------------------------
 # Tier-2 alias table (BUILD_SPEC §2.4). Keyed by the bare normalized family
 # of the span/PostScript base name; value is the ordered candidate family
 # list handed to Qt (every candidate gated on QFontInfo.exactMatch()).
 # --------------------------------------------------------------------------
-# Sans-serif name tokens: a font whose name contains one of these is treated as
-# sans even when the PDF's serif flag bit is (wrongly) set.
-_SANS_TOKENS = ("sans", "arial", "helvetica", "verdana", "tahoma", "calibri",
-                "segoe", "roboto", "dejavu", "lato", "avenir", "futura",
-                "myriad", "frutiger", "ubuntu", "noto")
+# _SANS_TOKENS (sans name hints, used even when the serif flag is wrongly set) is
+# imported from .fonts as _SANS_HINTS -- it was a byte-identical copy.
 
 
 def _alias_candidates(base_norm: str, raw_norm: str, flags: int) -> list[str]:
@@ -276,6 +349,11 @@ class FontEngine:
         # page_index -> {normalized basefont match -> xref}; built lazily.
         self._xref_cache: dict[tuple, int | None] = {}
         self._resolve_cache: dict[tuple, ResolvedFont] = {}
+        # xref -> extracted (basefont,ext,type,buffer) | None. The embedded font for
+        # an xref is fixed per doc; memoizing it stops embedded_xref's filter and
+        # resolve's fetch from decoding the same ~400 KB buffer twice (and a fresh
+        # copy per distinct glyph-set typed -> the cache was unbounded).
+        self._embedded_buffer_cache: dict[int, tuple | None] = {}
         # Make the bundled DejaVu faces renderable by Qt (idempotent; needs a
         # live QApplication, which exists by the time a document is opened).
         type(self).register_bundled_fonts()
@@ -390,10 +468,12 @@ class FontEngine:
         call, never ``info_only`` -- that returns an empty buffer). Returns
         ``(basefont, ext, type, buffer)`` or None when the buffer is empty.
         """
+        if xref in self._embedded_buffer_cache:
+            return self._embedded_buffer_cache[xref]
         basefont, ext, ftype, buffer = self.doc.extract_font(xref)
-        if not buffer or len(buffer) == 0:
-            return None
-        return basefont, ext, ftype, buffer
+        out = None if (not buffer or len(buffer) == 0) else (basefont, ext, ftype, buffer)
+        self._embedded_buffer_cache[xref] = out
+        return out
 
     # =====================================================================
     # (b) glyph-availability check
@@ -448,7 +528,6 @@ class FontEngine:
                             tier=TIER_EMBEDDED,
                             exact=True,
                             pdf_fontname="EMB",
-                            pdf_fontfile=None,
                             pdf_fontbuffer=buffer,
                             base14_code=None,
                             qt_family=qt_family,
@@ -470,12 +549,10 @@ class FontEngine:
             qf.setBold(bold)
             qf.setItalic(italic)
             if QFontInfo(qf).exactMatch():
-                path = self.system_face_for(family, bold, italic)
                 rf = ResolvedFont(
                     tier=TIER_SYSTEM,
                     exact=True,
                     pdf_fontname="SYS",
-                    pdf_fontfile=path,
                     pdf_fontbuffer=None,
                     base14_code=None,
                     qt_family=family,
@@ -493,7 +570,6 @@ class FontEngine:
             tier=TIER_BASE14,
             exact=False,
             pdf_fontname=code,
-            pdf_fontfile=None,
             pdf_fontbuffer=None,
             base14_code=code,
             qt_family=qt_family,
@@ -536,6 +612,11 @@ class FontEngine:
     # ``available_families`` treat them like any installed font, with ZERO new
     # bake code (OCR_SPEC §8 Tier 1).
     _custom_faces: dict[str, str] = {}
+    # A custom face's runtime ALIAS (e.g. a bank 'ScanFont-NNNNN') -> the family
+    # Qt actually loaded it under (its own name-table family, e.g. 'Cousine'). The
+    # editor builds its QFont from this so Qt resolves the REAL face on screen
+    # instead of a system sans (the fallback that made OCR edits look like Arial).
+    _custom_qt_family: dict[str, str] = {}
 
     @classmethod
     def _custom_face_dir(cls) -> str:
@@ -564,7 +645,11 @@ class FontEngine:
         # Make Qt render it; the OTF's name table familyName IS ``family`` so
         # QFont(family).exactMatch() holds (the resolve_family Tier-2 gate).
         try:
-            QFontDatabase.addApplicationFontFromData(QByteArray(otf_bytes))
+            fid = QFontDatabase.addApplicationFontFromData(QByteArray(otf_bytes))
+            fams = (QFontDatabase.applicationFontFamilies(fid)
+                    if fid != -1 else [])
+            if fams:
+                cls._custom_qt_family[family] = fams[0]
         except Exception:
             pass
         index = cls._build_system_index()       # builds + caches if needed
@@ -575,6 +660,36 @@ class FontEngine:
         cls._custom_faces[family] = path
         cls._available_families = None           # picker re-derives with the new face
         return family
+
+    @classmethod
+    def qt_family_for(cls, family: str) -> str | None:
+        """The real QFontDatabase family a registered custom face loaded under
+        (its own name-table family, e.g. 'Cousine' for a bank 'ScanFont-NNNNN'),
+        so the on-screen editor can build a QFont Qt actually resolves. None when
+        the face is not a registered custom face."""
+        return cls._custom_qt_family.get(family)
+
+    @classmethod
+    def display_name_for(cls, family: str) -> str:
+        """The HUMAN-READABLE name to SHOW for ``family`` in the formatting bar /
+        picker. A scan-matched bank face is stored under an opaque alias
+        ('ScanFont-NNNNN') because that alias maps back to the exact bank TTF for
+        embedding -- but the user must see the real typeface (e.g. 'Courier New',
+        'Solway Medium') the OTF actually carries in its name table, which Qt
+        recovered at registration. Returns ``family`` unchanged for ordinary
+        families. Hidden system names ('.SF Numeric') are de-dotted."""
+        real = cls._custom_qt_family.get(family)
+        if real and real != family:
+            real = real.lstrip(".").strip()
+            return real or family
+        return family
+
+    @classmethod
+    def is_scan_alias(cls, family: str) -> bool:
+        """True when ``family`` is an opaque scan-bank alias whose real name
+        differs (so the picker hides the alias and shows the real name instead)."""
+        real = cls._custom_qt_family.get(family)
+        return bool(real) and real != family
 
     @classmethod
     def system_face_for(cls, family: str, bold: bool, italic: bool) -> str | None:
@@ -604,9 +719,12 @@ class FontEngine:
             return None
 
         def score(r: _FaceRecord) -> int:
-            s = 0
-            s += 2 if r.is_bold == bold else -2
-            s += 2 if r.is_italic == italic else -2
+            s = (2 if r.is_bold == bold else -2) + (2 if r.is_italic == italic else -2)
+            # Tie-break unstyled requests toward the PLAIN face, else Regular and
+            # Medium/Light/Book tie at 4 and disk order embeds the wrong weight.
+            if not bold and not italic and (r.subfamily or "").lower() in (
+                    "regular", "roman", "book", "normal", ""):
+                s += 1
             return s
 
         matches.sort(key=score, reverse=True)
@@ -633,6 +751,12 @@ class FontEngine:
         for rec in index:
             fam = (rec.family or "").strip()
             if not fam or fam.startswith("."):
+                continue
+            # An opaque scan-bank alias ('ScanFont-NNNNN') must NOT appear as a
+            # pickable family -- it is an internal handle to a bank TTF. The face's
+            # real typeface name shows on the matched box itself (display_name_for);
+            # the picker lists only genuinely pickable families.
+            if cls.is_scan_alias(fam):
                 continue
             names.add(fam)
         cls._available_families = sorted(names, key=str.casefold)
@@ -701,7 +825,6 @@ class FontEngine:
                     tier=TIER_SYSTEM,
                     exact=True,
                     pdf_fontname="SYS",
-                    pdf_fontfile=rec.path,
                     pdf_fontbuffer=None,
                     base14_code=None,
                     qt_family=family,
@@ -719,7 +842,6 @@ class FontEngine:
             tier=TIER_BASE14,
             exact=False,
             pdf_fontname=code,
-            pdf_fontfile=None,
             pdf_fontbuffer=None,
             base14_code=code,
             qt_family=qt_family,
@@ -785,12 +907,16 @@ class FontEngine:
     # internal helpers
     # =====================================================================
     @staticmethod
+    @lru_cache(maxsize=None)
     def normalize(name: str) -> str:
-        """Strip a subset tag, drop [space - _ ,], lowercase."""
+        """Strip a subset tag, drop [space - _ ,], lowercase. Cached: callers
+        (system_record_for, embedded_xref) re-normalize the same ~800 font names
+        every save; the key space is the doc's + system's font names (bounded)."""
         name = re.sub(r"^[A-Z]{6}\+", "", name or "")
         return re.sub(r"[\s\-_,]", "", name).lower()
 
     @classmethod
+    @lru_cache(maxsize=None)
     def _family_norm(cls, name: str) -> str:
         """Normalize to a BARE family: strip subset tag, PostScript artifacts
         (PSMT/MT/PS) and trailing style/weight words, lowercase, punctuation
@@ -798,14 +924,18 @@ class FontEngine:
         'TimesNewRomanPSMT' and 'Times New Roman Regular' collapse to the same
         key (verified across every fixture)."""
         s = cls.normalize(name)
-        s = _PS_ARTIFACT_RE.sub("", s)
-        # Strip ALL trailing style + weightless words so a PostScript span name
-        # (TimesNewRomanPSMT) and a basefont (Times New Roman Regular) converge
-        # to the same bare family. "Roman" must come off both sides, so the two
-        # token sets are stripped in one shared loop.
+        # Strip trailing style/weightless words AND PostScript artifacts (PSMT/MT/PS)
+        # in ONE loop. The artifact strip must run AFTER each style strip: a bold PS
+        # span (TimesNewRomanPS-BoldMT) needs "Bold" removed first to expose the "PS"
+        # tail, else it keeps a "ps" a plain basefont (TimesNewRomanPSMT) does not, and
+        # the two fail to converge. "Roman" comes off both sides via the shared loop.
         changed = True
         while changed:
             changed = False
+            s2 = _PS_ARTIFACT_RE.sub("", s)
+            if s2 != s:
+                s, changed = s2, True
+                continue
             for w in _STYLE_SUFFIXES + _WEIGHTLESS_SUFFIXES:
                 if s.endswith(w) and len(s) > len(w):
                     s = s[: -len(w)]
@@ -881,50 +1011,11 @@ class FontEngine:
         records: list[_FaceRecord] = []
 
         def read_face(tt: "TTFont", path: str, index: int) -> None:
-            try:
-                name = tt["name"]
-            except Exception:
+            postscript, family, subfamily, full_name, bold, italic = \
+                _style_from_ttfont(tt, path)
+            # No usable name table -> skip (matches the old early-return).
+            if not (postscript or family or subfamily or full_name):
                 return
-
-            def gn(*ids: int) -> str:
-                for nid in ids:
-                    rec = (name.getName(nid, 3, 1, 0x409)
-                           or name.getName(nid, 1, 0, 0)
-                           or name.getName(nid, 3, 0, 0x409))
-                    if rec is not None:
-                        try:
-                            return str(rec)
-                        except Exception:
-                            continue
-                return ""
-
-            postscript = gn(6)
-            family = gn(16, 1)
-            subfamily = gn(17, 2)
-            full_name = gn(4)
-            style_blob = f"{subfamily} {postscript} {full_name}".lower()
-            # OS/2 fsSelection / head macStyle are more reliable for bold/italic.
-            bold = italic = False
-            try:
-                os2 = tt["OS/2"]
-                fs = os2.fsSelection
-                italic = bool(fs & 0x01)
-                bold = bool(fs & 0x20)
-            except Exception:
-                pass
-            if not (bold or italic):
-                try:
-                    mac = tt["head"].macStyle
-                    bold = bool(mac & 0x01)
-                    italic = bool(mac & 0x02)
-                except Exception:
-                    pass
-            if not bold:
-                bold = "bold" in style_blob and "semibold" not in subfamily.lower()
-            if not italic:
-                italic = "italic" in style_blob or "oblique" in style_blob
-            if not family:
-                family = postscript or os.path.basename(path)
             records.append(_FaceRecord(
                 path=path, face_index=index, postscript=postscript,
                 family=family, subfamily=subfamily, full_name=full_name,

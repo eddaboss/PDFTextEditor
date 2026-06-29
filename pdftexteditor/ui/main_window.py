@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFrame,
+    QCheckBox,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -83,6 +84,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QRadioButton,
@@ -99,6 +101,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__, doctools, stamps
+from ..debuglog import log as dlog
 from ..document import (
     PDF_ENCRYPT_AES_256,
     PDF_ENCRYPT_NONE,
@@ -595,6 +598,7 @@ class BoxCommand(_ModelCommand):
 
     _LABELS = {"style": "Change style", "move": "Move box",
                "resize": "Resize box", "frame_resize": "Resize box",
+               "reflow": "Reflow box",
                "delete": "Delete box",
                "add": "Add text box",
                "img_add": "Insert image", "img_move": "Move image",
@@ -669,6 +673,10 @@ class BoxCommand(_ModelCommand):
             self._doc.resize_text_frame(page, box, p.get("x", 0.0),
                                         p.get("w", 0.0))
             return None
+        if kind == "reflow":
+            # OCR overlay resize = re-wrap the scanned words to the new column width.
+            self._doc.reflow_box(page, box, p.get("box_w", 0.0))
+            return None
         if kind == "delete":
             self._doc.delete_box(page, box)
             return None
@@ -679,7 +687,8 @@ class BoxCommand(_ModelCommand):
                 direction=p.get("direction", (1.0, 0.0)),
                 cover=p.get("cover", ()), render_mode=p.get("render_mode", 0),
                 box_w=p.get("box_w"), leading=p.get("leading", 0.0),
-                alignment=p.get("alignment", "left"))
+                alignment=p.get("alignment", "left"),
+                line_covers=p.get("line_covers", ()))
         # Placed images (images & signatures §4): the §2.3 model mutators.
         if kind == "img_add":
             return self._doc.add_image(
@@ -1886,6 +1895,11 @@ def _mark_file_recently_used(path: str) -> None:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Define the persistence gate FIRST: ``self.resize()`` / menubar creation
+        # below can dispatch a move/resize event before the rest of __init__ runs,
+        # and ``moveEvent`` -> ``_kick_persist`` reads this flag. Left False so those
+        # construction-time events are harmless no-ops; main() flips it on later.
+        self._persist_enabled = False
         # Kick the one-time system font-index scan onto a background thread
         # NOW, so the first paint does not pay it on the GUI thread and the
         # index is (usually) warm before the first edit resolves a font
@@ -1937,6 +1951,39 @@ class MainWindow(QMainWindow):
         self.canvas = CanvasContainer(self)
         self.view = self.canvas.view
         col.addWidget(self.canvas, 1)
+        # OCR progress now lives ON each page (the frosted per-page cover + bar),
+        # so there is no top progress strip.
+        # DEBUG console: a thin, always-visible top strip with two view toggles --
+        # MAP (the per-character + per-SPACE cells the caret/erase actually use, so a
+        # gap that collapses to one space shows as one wide red cell) and INVERTED (a
+        # negative of every page, so faint ink + what the binary map keys on reads clearly).
+        self._debug_strip = QWidget()
+        self._debug_strip.setObjectName("DebugStrip")
+        _dbl = QHBoxLayout(self._debug_strip)
+        _dbl.setContentsMargins(12, 3, 12, 3)
+        _dbl.setSpacing(14)
+        self._chk_debug_map = QCheckBox("Map view")
+        self._chk_debug_invert = QCheckBox("Inverted view")
+        self._chk_debug_borders = QCheckBox("Table borders")
+        self._chk_plain_fonts = QCheckBox("Plain fonts (no decorative)")
+        from ..ocr import fontbank as _FB
+        self._chk_plain_fonts.setChecked(bool(_FB.EXCLUDE_DECORATIVE))
+        self._chk_debug_map.toggled.connect(self.view.set_debug_map)
+        self._chk_debug_invert.toggled.connect(self.view.set_debug_invert)
+        self._chk_debug_borders.toggled.connect(self.view.set_debug_borders)
+        self._chk_plain_fonts.toggled.connect(self._on_plain_fonts_toggle)
+        _acc = theme.color_accent().name()
+        _dbl.addWidget(QLabel("Debug"))
+        _dbl.addWidget(self._chk_debug_map)
+        _dbl.addWidget(self._chk_debug_invert)
+        _dbl.addWidget(self._chk_debug_borders)
+        _dbl.addWidget(self._chk_plain_fonts)
+        _dbl.addStretch(1)
+        self._debug_strip.setStyleSheet(
+            f"#DebugStrip {{ border-bottom: 1px solid {_acc}; }}"
+            f"#DebugStrip QLabel {{ color: {theme.TEXT_PRIMARY}; font-weight: 600; }}"
+            f"#DebugStrip QCheckBox {{ color: {theme.TEXT_PRIMARY}; }}")
+        col.insertWidget(0, self._debug_strip)
         # Host the document view in a stack so Settings can appear as an in-app
         # PAGE (a second stack page) rather than a separate window. The document
         # view stays at index 0; the settings page is added lazily.
@@ -1989,7 +2036,7 @@ class MainWindow(QMainWindow):
         # the open-tab list are flushed on a debounced move/resize/tab change and
         # one last time on aboutToQuit, so a force-quit or crash still reopens at
         # the last size with the last session -- not just the clean-close path.
-        self._persist_enabled = False
+        # (_persist_enabled is initialised at the very top of __init__.)
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)
         self._geo_timer.setInterval(700)
@@ -2056,7 +2103,7 @@ class MainWindow(QMainWindow):
         # mid text-edit. Toggling drives view.enter/exit_add_text_mode.
         self.act_add_text = QAction("Add Text", self)
         self.act_add_text.setCheckable(True)
-        self.act_add_text.setShortcut(QKeySequence("T"))
+        # No bare "T" shortcut -- it fired on the 't' you type while editing.
         self.act_add_text.setIcon(make_icon("add_text"))
         self.act_add_text.toggled.connect(self._on_add_text_toggled)
         # Delete uses the platform Delete sequence; the view-level Delete/
@@ -2230,13 +2277,16 @@ class MainWindow(QMainWindow):
             "line": dict(_draw),
             "arrow": dict(_draw),
         }
+        # NO bare-letter shortcuts: window-level single keys fire on the letters you
+        # TYPE while editing a box (the 'h' in 'the' armed Highlight -> kicked out).
+        # Tools are reached via the toolbar; any shortcut must use Cmd/Ctrl.
         specs = [
-            ("highlight", "Highlight", "H", "highlight"),
-            ("underline", "Underline", "U", "underline"),
-            ("strikeout", "Strikethrough", "K", "strikethrough"),
+            ("highlight", "Highlight", None, "highlight"),
+            ("underline", "Underline", None, "underline"),
+            ("strikeout", "Strikethrough", None, "strikethrough"),
             ("squiggly", "Squiggly", None, "squiggly"),
-            ("note", "Sticky Note", "N", "note"),
-            ("ink", "Draw Ink", "D", "ink"),
+            ("note", "Sticky Note", None, "note"),
+            ("ink", "Draw Ink", None, "ink"),
             ("rect", "Rectangle", None, "rect"),
             ("ellipse", "Ellipse", None, "ellipse"),
             ("line", "Line", None, "line"),
@@ -2386,11 +2436,20 @@ class MainWindow(QMainWindow):
             "OCR This Page", None, lambda: self._do_ocr(scope="page"))
         self.act_ocr_document = mk(
             "OCR Document", None, lambda: self._do_ocr(scope="document"))
+        # Fresh re-OCR: delete the page's whole existing OCR layer (incl. any
+        # edits) and recognize the raw scan again from scratch.
+        self.act_ocr_reset_page = mk(
+            "Re-OCR This Page (fresh)…", None,
+            lambda: self._do_ocr(scope="page", fresh=True))
+        self.act_ocr_reset_document = mk(
+            "Re-OCR Document (fresh)…", None,
+            lambda: self._do_ocr(scope="document", fresh=True))
         for act in (self.act_properties, self.act_export_images,
                     self.act_export_text, self.act_print, self.act_optimize,
                     self.act_security, self.act_watermark,
                     self.act_header_footer, self.act_crop,
-                    self.act_ocr_page, self.act_ocr_document):
+                    self.act_ocr_page, self.act_ocr_document,
+                    self.act_ocr_reset_page, self.act_ocr_reset_document):
             self.addAction(act)
 
     def _build_forms_actions(self) -> None:
@@ -3455,6 +3514,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.act_ocr_page)
         m.addAction(self.act_ocr_document)
+        m.addAction(self.act_ocr_reset_page)
+        m.addAction(self.act_ocr_reset_document)
         return m
 
     def _build_menu_window(self, bar: QMenuBar) -> QMenu:
@@ -4245,6 +4306,7 @@ class MainWindow(QMainWindow):
         self._connect_signal("editCommittedRich", self._on_edit_committed_rich)
         self._connect_signal("editStarted", self._on_edit_started)
         self._connect_signal("editFinished", self._on_edit_finished)
+        self._connect_signal("caretStyleChanged", self._on_caret_style)
         self._connect_signal("pageChanged", self._on_page_changed)
         self._connect_signal("zoomChanged", self._on_zoom_changed)
         # Full-editor signals (BUILD_SPEC §3.4).
@@ -4347,6 +4409,30 @@ class MainWindow(QMainWindow):
                 style = None
             if style is not None:
                 self.inspector.set_target(span, style)
+
+    def _on_caret_style(self, box, cstyle) -> None:
+        """Update the format bar to the caret's LOCAL style as it moves through an
+        edited box (per-character), instead of the one whole-box style seeded at
+        edit-open. Merges the caret's bold/italic/colour/family over the box's
+        effective style; ``set_target`` populates under the inspector's ``_loading``
+        guard, so this never echoes back as a styleEdited write."""
+        if box is None or self.document is None or not isinstance(cstyle, dict):
+            return
+        if getattr(self, "_in_caret_style", False):   # re-entrancy guard (set_target may emit)
+            return
+        self._in_caret_style = True
+        page = getattr(box, "page_index", self.view_page_index())
+        try:
+            style = dict(self.document.effective_style(page, box))
+        except Exception:  # noqa: BLE001 - stale box must not crash chrome
+            style = {}
+        style.update(cstyle)
+        try:
+            self.inspector.set_target(box, style)
+        except (TypeError, RuntimeError):
+            pass
+        finally:
+            self._in_caret_style = False
 
     def _on_edit_finished(self) -> None:
         self.font_chip.hide()
@@ -4825,7 +4911,12 @@ class MainWindow(QMainWindow):
         # Bold / Italic / Underline / Strikethrough with a text SELECTION inside
         # the open inline editor style JUST the selection (per-selection rich
         # runs, staged on commit) -- not the whole box.
-        if set(overrides) <= {"bold", "italic", "underline", "strike"}:
+        # Colour AND font family join B/I/U/S as per-run selection styles: on a
+        # scanned box apply_style_to_selection re-faces / recolours JUST the
+        # selection; with no selection (or on a vector box) it declines and the
+        # value falls through to the whole-box route below.
+        if set(overrides) <= {"bold", "italic", "underline", "strike", "color",
+                              "font_family"}:
             sel_fn = getattr(self.view, "apply_style_to_selection", None)
             if callable(sel_fn):
                 try:
@@ -4855,6 +4946,10 @@ class MainWindow(QMainWindow):
             finally:
                 self._restyling_editor_box = False
             if handled:
+                # Refresh the format bar to the committed style (the other apply paths
+                # do this; without it the page changed but the bar showed the old value,
+                # which read as "formatting did nothing").
+                self._refresh_inspector_for(box)
                 self._sync_status()
                 return
         fn = getattr(self.view, "apply_style", None)
@@ -5100,6 +5195,22 @@ class MainWindow(QMainWindow):
         self._toast(
             f"Opened {os.path.basename(path)}", 2500
         )
+        # Restore an embedded editable OCR layer (saved by a prior OCR) FIRST, so
+        # the page edits exactly like a fresh OCR rather than falling through to
+        # the generic existing-text editor -- and so it is NOT re-OCR'd below.
+        restored = 0
+        if self.document is not None:
+            try:
+                restored = self.document.restore_ocr_layer()
+            except Exception:
+                restored = 0
+            if restored:
+                self.view.reload()
+                self.sidebar.refresh()
+                self._sync_all()
+                self._toast(
+                    f"Restored editable OCR — {restored} text "
+                    f"box{'es' if restored != 1 else ''}.", 3000)
         # A form-bearing doc gets the fill hint instead (forms §4; the later
         # toast owns the filename slot). Once per open; no-form docs see
         # zero new chrome.
@@ -5111,6 +5222,7 @@ class MainWindow(QMainWindow):
                 "Click a field to fill it.", 4000
             )
         elif (self.document is not None
+              and not restored
               and not getattr(self, "_ocr_running", False)
               and self.document.image_only_pages()):
             # Scanned/image-only document: OCR it automatically so the text is
@@ -6386,17 +6498,125 @@ class MainWindow(QMainWindow):
         fallback = (FontEngine.system_face_for("DejaVu Sans", False, False))
         return serif or fallback, sans or fallback
 
-    def _do_ocr(self, scope: str = "page") -> None:
+    def _ocr_layer_boxes(self, page_index: int) -> list:
+        """Every OCR-produced NewBox on a page -- untouched overlays (render_mode
+        3) AND ones the user has since edited (render_mode 0 but still carrying
+        their immutable ``ocr_text``). Boxes the user typed by hand have no
+        ``ocr_text`` and are excluded, so wiping the OCR layer never deletes
+        hand-added text."""
+        doc = self.document
+        if doc is None:
+            return []
+        out = []
+        for b in doc.new_boxes(page_index):
+            if getattr(b, "deleted", False):
+                continue
+            if (getattr(b, "ocr_text", "") or "").strip() or \
+                    getattr(b, "render_mode", 0) == 3:
+                out.append(b)
+        return out
+
+    def _ocr_layer_pages(self) -> list:
+        """Page indices that currently carry an OCR layer."""
+        doc = self.document
+        if doc is None:
+            return []
+        return [pi for pi in range(doc.page_count)
+                if self._ocr_layer_boxes(pi)]
+
+    def _ocr_edited_count(self, page_indices) -> int:
+        """How many OCR boxes on these pages the user has edited -- text that a
+        fresh re-OCR would discard. An untouched OCR overlay is render_mode 3;
+        editing flips it to render_mode 0, so an OCR box at render_mode 0 is an
+        edit."""
+        n = 0
+        for pi in page_indices:
+            for b in self._ocr_layer_boxes(pi):
+                if getattr(b, "render_mode", 0) != 3:
+                    n += 1
+        return n
+
+    def _ocr_clear_layer(self, page_indices) -> int:
+        """Delete the WHOLE OCR layer (every OCR box, edited or not) on the given
+        pages plus their per-page font-map cache, as ONE undo step. The scanned
+        pixels were never modified, so the pages revert to the raw scan. Returns
+        the number of boxes removed."""
+        doc = self.document
+        if doc is None:
+            return 0
+        victims = [(pi, b) for pi in page_indices
+                   for b in self._ocr_layer_boxes(pi)]
+        if victims:
+            self.undo_stack.beginMacro("Clear OCR layer")
+            try:
+                for pi, b in victims:
+                    self.undo_stack.push(BoxCommand(
+                        self.document, self.view, pi, b, "delete", {}))
+            finally:
+                self.undo_stack.endMacro()
+        cache = getattr(doc, "_pfm_cache", None)
+        if cache:
+            for pi in page_indices:
+                cache.pop(pi, None)
+        return len(victims)
+
+    def _do_ocr(self, scope: str = "page", fresh: bool = False) -> None:
         """Recognize scanned page(s) and inject the result as editable text in a
         font built from the scanned glyphs (OCR_SPEC §3/§4). ``scope`` is
         "page" (the current page) or "document" (every image-only page). The
         heavy recognition runs on a daemon thread; results are applied back on
-        the GUI thread, one undo step per page."""
+        the GUI thread, one undo step per page.
+
+        ``fresh`` re-OCRs from a clean slate. It targets the SCANNED pages (a
+        raster covering >= half the page) regardless of any text layer, removes
+        every trace of prior OCR -- the in-memory OCR boxes AND a text layer that
+        was baked into the PDF (saved then reopened, which is why plain OCR then
+        reports "no scanned pages") -- and recognizes the bare scan again. A
+        normal (non-fresh) rerun instead supersedes only the untouched overlays
+        and keeps the user's edits."""
         doc = self.document
         if doc is None or getattr(self, "_ocr_running", False):
             return
         self._flush_open_editor()
-        if scope == "page":
+        if fresh:
+            scans = set(doc.scanned_pages())
+            if scope == "page":
+                pi = self.view_page_index()
+                cand = [pi] if pi in scans else []
+            else:
+                cand = sorted(scans)
+            if not cand:
+                self._toast("No scanned page to re-OCR." if scope == "page"
+                            else "No scanned pages to re-OCR.")
+                return
+            # What gets removed: in-memory edits + any baked-in text layer.
+            n_edit = self._ocr_edited_count(cand)
+            baked = [pi for pi in cand if doc.page_has_text_layer(pi)]
+            if n_edit or baked:
+                bits = []
+                if baked:
+                    bits.append(f"the existing text layer on {len(baked)} "
+                                f"page{'s' if len(baked) != 1 else ''}")
+                if n_edit:
+                    bits.append(f"{n_edit} edited text "
+                                f"box{'es' if n_edit != 1 else ''}")
+                if QMessageBox.question(
+                        self, "Re-OCR from scratch",
+                        "Re-OCR from the original scan? This removes "
+                        + " and ".join(bits) + ". You can undo it.",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No) != QMessageBox.Yes:
+                    return
+            self._ocr_clear_layer(cand)               # in-memory OCR boxes
+            if baked:                                 # baked-in PDF text layer
+                self._run_structural(
+                    lambda d: d.strip_text_layer(baked))
+            else:
+                self.view.reload()
+                self.sidebar.refresh()
+                self._sync_all()
+            targets = cand
+        elif scope == "page":
             pi = self.view_page_index()
             if doc.page_has_text_layer(pi):
                 self._toast("This page already has text — OCR is for scans.")
@@ -6420,6 +6640,31 @@ class MainWindow(QMainWindow):
             return
         self._ocr_begin(jobs, serif, sans)
 
+    def _ocr_worker_count(self, n_jobs: int) -> int:
+        """How many pages to recognize AT ONCE. The heavy per-page step is
+        ``reconstruct`` (font build + matching), which is mostly Python and so
+        GIL-bound: measured throughput climbs to ~1.85x at 3-4 threads and then
+        REGRESSES (more threads just make each page crawl, which is the opposite
+        of what we want). So the cap is hard at 4 no matter how many cores the
+        box has -- the limit is the GIL, not the cores. Process pools were
+        measured SLOWER here (per-process model + font reload dwarfs the gain).
+        We still scale DOWN when the machine is already busy. Single-page OCR
+        stays sequential."""
+        # The font matcher now uses a PREBUILT bank (no per-page library renders),
+        # so reconstruct barely touches PyMuPDF -- the MuPDF-lock contention that
+        # made concurrent workers deadlock is gone, and pages can run in parallel.
+        # Cap at 4: reconstruct is still largely GIL-bound Python (cv2 + fontbuild),
+        # so throughput plateaus around there; scale DOWN when the box is busy.
+        if n_jobs <= 1:
+            return 1
+        cpu = os.cpu_count() or 4
+        try:
+            load1 = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            load1 = 0.0
+        free = max(1.0, cpu - load1)
+        return max(1, min(4, n_jobs, int(round(free))))
+
     def _ocr_begin(self, jobs: list, serif: str, sans: str) -> None:
         import queue
         import threading
@@ -6430,45 +6675,71 @@ class MainWindow(QMainWindow):
         self._ocr_seen = 0
         self._ocr_applied = 0
         self._ocr_errors: list = []
-        self._ocr_progress = QProgressDialog(
-            "Recognizing scanned text…", "Cancel", 0, len(jobs), self)
-        self._ocr_progress.setWindowTitle("OCR")
-        self._ocr_progress.setMinimumDuration(0)
-        self._ocr_progress.setValue(0)
-        self._ocr_progress.canceled.connect(self._ocr_on_cancel)
+        self._ocr_pending: list = []       # (page, res) stashed for apply-at-finish
+        workers = self._ocr_worker_count(len(jobs))
+        # Frost EVERY target page right now -- before any worker runs -- so the
+        # whole document reads "being recognized" from the start. Each page's bar
+        # then tracks that page's REAL progress (set_ocr_progress).
+        for pi, _img in jobs:
+            self.view.start_ocr_overlay(pi)
         # Engine choice (Settings): macOS user toggle (Apple Vision / RapidOCR);
         # Windows is always RapidOCR. Read on the GUI thread; the worker uses it.
         engine = self._ocr_engine_pref()
+        dlog("ocr", "begin", jobs=len(jobs), workers=workers, engine=engine)
 
-        def worker():
+        def run_one(pi, img):
+            if self._ocr_cancel:
+                return
             from pdftexteditor.ocr import recognize_and_reconstruct
-            for pi, img in jobs:
-                if self._ocr_cancel:
-                    break
-                try:
-                    res = recognize_and_reconstruct(
-                        img, 300.0, serif, sans, engine_name=engine,
-                        family_label=f"Scanned p{pi + 1}")
-                except Exception as exc:               # noqa: BLE001
-                    res = exc
-                self._ocr_queue.put((pi, res))
-            self._ocr_queue.put(None)                  # done sentinel
+            dlog("ocr", "worker_enter", page=pi + 1)
+            t0 = time.monotonic()
+
+            def _prog(frac):                   # REAL per-page progress -> the bar
+                self._ocr_queue.put(("progress", pi, frac))
+
+            try:
+                res = recognize_and_reconstruct(
+                    img, 300.0, serif, sans, engine_name=engine,
+                    family_label=f"Scanned p{pi + 1}", progress_cb=_prog)
+                dlog("ocr", "worker_ok", page=pi + 1,
+                     secs=round(time.monotonic() - t0, 2))
+            except Exception as exc:                   # noqa: BLE001
+                res = exc
+                dlog("ocr", "worker_err", page=pi + 1, err=repr(exc)[:80])
+            self._ocr_queue.put(("result", pi, res, time.monotonic() - t0))
+
+        def coordinator():
+            from concurrent.futures import ThreadPoolExecutor
+            try:
+                # ALL pages fan out across the pool at once (no warm-first page),
+                # so they recognize in parallel from the start.
+                if jobs and not self._ocr_cancel:
+                    dlog("ocr", "pool_begin", jobs=len(jobs), workers=workers)
+                    with ThreadPoolExecutor(
+                            max_workers=workers, thread_name_prefix="ocr") as ex:
+                        list(ex.map(lambda j: run_one(*j), jobs))
+                    dlog("ocr", "pool_end")
+            finally:
+                dlog("ocr", "sentinel")
+                self._ocr_queue.put(None)              # done sentinel
 
         self._ocr_thread = threading.Thread(
-            target=worker, name="ocr-worker", daemon=True)
+            target=coordinator, name="ocr-coordinator", daemon=True)
         self._ocr_thread.start()
         self._ocr_timer = QTimer(self)
         self._ocr_timer.timeout.connect(self._ocr_poll)
-        self._ocr_timer.start(60)
+        self._ocr_timer.start(50)
         self._sync_actions()
 
     def _ocr_on_cancel(self) -> None:
         self._ocr_cancel = True
 
     def _ocr_poll(self) -> None:
-        """GUI-thread drain of the OCR worker's result queue: apply finished
-        pages (register font + one undo macro of NewBoxes), advance progress,
-        finish on the sentinel."""
+        """GUI-thread drain of the OCR workers' queue: snap a page's bar to 100%
+        as it lands and STASH its result. The actual apply (which bakes the page
+        via fitz = MuPDF) is DEFERRED to _ocr_finish so no GUI-thread MuPDF runs
+        while workers are still font-building (they share PyMuPDF's global lock).
+        Pages arrive out of order (thread pool)."""
         import queue
         while True:
             try:
@@ -6478,18 +6749,19 @@ class MainWindow(QMainWindow):
             if item is None:
                 self._ocr_finish()
                 return
-            pi, res = item
+            if item[0] == "progress":           # ("progress", page_index, frac)
+                self.view.set_ocr_progress(item[1], item[2])
+                continue
+            # ("result", page_index, res_or_exc, seconds)
+            _, pi, res, dur = item
             self._ocr_seen += 1
+            dlog("ocr", "poll_result", page=pi + 1, secs=round(dur, 2),
+                 ok=not isinstance(res, Exception))
             if isinstance(res, Exception):
                 self._ocr_errors.append((pi, res))
             elif res is not None and res.lines:
-                try:
-                    self._ocr_apply_page(pi, res)
-                    self._ocr_applied += 1
-                except Exception as exc:               # noqa: BLE001
-                    self._ocr_errors.append((pi, exc))
-            if hasattr(self, "_ocr_progress"):
-                self._ocr_progress.setValue(self._ocr_seen)
+                self._ocr_pending.append((pi, res))     # apply at finish
+            self.view.complete_ocr_overlay(pi)          # bar lands at 100%
         if self._ocr_cancel:
             self._ocr_finish()
 
@@ -6501,13 +6773,37 @@ class MainWindow(QMainWindow):
         page stays pixel-identical to the scan; each box carries its area rect as a
         cover that paints only if the box is edited (which makes it visible).
         Acrobat's "Searchable Image (Exact)" + font-matched, paragraph editing."""
-        # 0.3.0: the matched family is a real BUNDLED font (Tinos/Arimo/Cousine),
-        # resolved + embedded like any bundled family, so there is no per-page
-        # custom face to register. Older results carried a scan-built OTF.
+        # Each BOX carries its OWN matched font now (a mono body and a bold-sans header
+        # on one page get different fonts), so register per-box faces, not one page
+        # face. ``res.family_name``/``res.otf_bytes`` remain only as a fallback for a
+        # box too sparse to match on its own.
         if res.otf_bytes:
             FontEngine.register_custom_face(res.family_name, res.otf_bytes)
+        for lb in res.lines:
+            fam = getattr(lb, "family", "") or res.family_name
+            if getattr(lb, "otf_bytes", b""):
+                FontEngine.register_custom_face(fam, lb.otf_bytes)
+        # The PER-WORD font map is built AFTER the boxes are added (below), since pagefont
+        # reads doc.new_boxes -- and while the page is still UNROTATED for OCR, so its
+        # text-space covers line up with the render. (res.font_map from the old super-res
+        # matcher is left unused.)
         self.undo_stack.beginMacro(f"OCR page {page_index + 1}")
         try:
+            # REPLACE, don't stack: a re-run of OCR on this page must supersede a prior
+            # one (e.g. after a spacing / recognition change), not layer a second invisible
+            # set of boxes over the first -- otherwise the user edits a STALE box and the
+            # new text never shows. Drop this page's untouched OCR overlays (render_mode 3)
+            # first, in the SAME undo step. Boxes the user added or already edited
+            # (render_mode 0) are left alone.
+            for old in [b for b in self.document.new_boxes(page_index)
+                        if getattr(b, "render_mode", 0) == 3]:
+                self.undo_stack.push(BoxCommand(
+                    self.document, self.view, page_index, old, "delete", {}))
+            # Re-quantize each box's inter-word spacing from the SCAN at apply time, so a
+            # wide gap reads as the right number of spaces. Char-box based off the line's
+            # own crop, which the cover mapping makes upright for EVERY box, so the same
+            # path runs regardless of page rotation. Render the page ONCE and reuse.
+            _prgb = self.document.render_page_image(page_index, 300.0)
             for lb in res.lines:
                 # The reconstruction works in the rendered (display) image; map
                 # each origin back to text space + writing direction so the text
@@ -6522,25 +6818,110 @@ class MainWindow(QMainWindow):
                     # matches its cell, not the page-wide paper median (which
                     # painted every edit a single off-white/cream).
                     cover = (cx0, cy0, cx1, cy1) + tuple(lb.bg)
+                # Map each paragraph line's own cover (display pts) to text space the
+                # same way, preserving its local bg, so the unified raster can keep
+                # each untouched line's scan pixels. Single lines carry none.
+                line_covers = ()
+                if getattr(lb, "line_covers", None):
+                    lcs = []
+                    for lc in lb.line_covers:
+                        lx0, ly0, lx1, ly1 = self.document.ocr_cover_rect(
+                            page_index, lc[:4])
+                        # Tighten the per-line cover's CROSS extent to its own ink so it does
+                        # not reach into the line below. The OCR line box is loosely tall, so
+                        # an over-tall line cover bakes its paper fill over the next line's cap
+                        # tops (the "edit bleeds into the line below" bug). cross_only keeps the
+                        # full reading width; nlines=1 anchors it to this single line.
+                        tc = self.document._tight_cover(
+                            page_index, (lx0, ly0, lx1, ly1), _prgb,
+                            nlines=1, cross_only=True)
+                        lcs.append(tuple(tc[:4]) + tuple(lc[4:7]))
+                    line_covers = tuple(lcs)
+                # TIGHTEN each cover to its actual scanned ink, per box -- the OCR line
+                # box is a loose full-line height, so a box whose text doesn't reach the
+                # bottom carries a blank chin and overlaps its neighbour. Measured from
+                # the scan, not a fixed shave; descenders are part of the ink so they stay.
+                # Tighten only the AREA cover (the visible box border + what drives inter-box
+                # overlap), anchored to the box's own text-line count: it spans first-line-top
+                # to last-line-bottom, dropping the blank chin and any adjacent-line bleed an
+                # over-tall OCR cover caught, but never shrinking below its real lines. The
+                # per-line `line_covers` are left exactly as OCR mapped them so each untouched
+                # line's scan pixels stay byte-identical in the compose.
+                if cover:
+                    _nl = len([s for s in (lb.text or "").split("\n") if s.strip()]) or 1
+                    cover = self.document._tight_cover(
+                        page_index, cover, _prgb, nlines=_nl)
+                fam = (getattr(lb, "family", "") or res.family_name)
+                box_text = lb.text
+                if cover:
+                    box_text = self.document.respace_ocr_text(
+                        page_index, cover, line_covers, lb.text, fam,
+                        lb.size, direction, page_rgb=_prgb)
                 self.undo_stack.push(BoxCommand(
                     self.document, self.view, page_index, None, "add", {
                         "origin": origin, "direction": direction,
                         "cover": cover, "render_mode": 3,
-                        "text": lb.text, "family": res.family_name,
+                        "text": box_text,
+                        "family": fam,
                         "size": lb.size, "color": (0.0, 0.0, 0.0),
                         "bold": False, "italic": False,
                         "box_w": lb.box_w, "leading": lb.leading,
-                        "alignment": "left"}))
+                        "alignment": "left", "line_covers": line_covers}))
         finally:
             self.undo_stack.endMacro()
+        # PER-WORD font map: build NOW -- the boxes exist (pagefont reads doc.new_boxes) and
+        # the page is still UNROTATED for OCR, so pagefont's text-space covers match the
+        # render and each WORD gets its own font (multiple fonts per box). The editor reads
+        # this at edit time (_edit_synth_font -> _page_font_map). This is the word-for-word
+        # matcher that was built (ocr/pagefont) but had never been wired in.
+        try:
+            from ..ocr import pagefont
+            cache = getattr(self.document, "_pfm_cache", None)
+            if cache is None:
+                cache = self.document._pfm_cache = {}
+            cache[page_index] = pagefont.build(self.document, page_index)
+        except Exception:
+            pass
+
+    def _on_plain_fonts_toggle(self, checked: bool) -> None:
+        """Decorative-font toggle: when CHECKED, the matcher only considers text-class fonts
+        (text_fonts.txt), so it stops picking novelty faces (Redacted/Jersey/Bahianita) on a
+        degraded scan. Clears the per-word font maps + match caches so the next edit
+        re-resolves the font under the new candidate set."""
+        from ..ocr import fontbank
+        fontbank.EXCLUDE_DECORATIVE = bool(checked)
+        for attr in ("_pfm_cache", "_synth_match_cache"):
+            c = getattr(self.document, attr, None)
+            if c:
+                c.clear()
 
     def _ocr_finish(self) -> None:
         if not getattr(self, "_ocr_running", False):
             return
+        dlog("ocr", "finish", applied=self._ocr_applied,
+             errors=len(self._ocr_errors), seen=self._ocr_seen,
+             total=self._ocr_total)
+        self._ocr_warm = True       # model + caches now loaded for this session
         if hasattr(self, "_ocr_timer"):
             self._ocr_timer.stop()
-        if hasattr(self, "_ocr_progress"):
-            self._ocr_progress.close()
+        # Paint the bars at 100% NOW (synchronously) -- the apply below blocks the
+        # GUI thread, so without this the user never sees the bars reach 100.
+        self.view._ocr_overlay.repaint()
+        # Apply every recognized page NOW -- all workers are done, so these fitz
+        # (MuPDF) bakes don't contend with anything.
+        for pi, res in getattr(self, "_ocr_pending", []):
+            try:
+                dlog("ocr", "apply_begin", page=pi + 1)
+                self._ocr_apply_page(pi, res)
+                self._ocr_applied += 1
+                dlog("ocr", "apply_end", page=pi + 1)
+            except Exception as exc:               # noqa: BLE001
+                self._ocr_errors.append((pi, exc))
+                dlog("ocr", "apply_err", page=pi + 1, err=repr(exc)[:80])
+        self._ocr_pending = []
+        # Lift every page cover now that the whole OCR is done, before reload
+        # rebuilds the scene.
+        self.view.clear_ocr_overlays()
         self._ocr_running = False
         if self._ocr_applied:
             self.view.reload()
@@ -6936,9 +7317,16 @@ class MainWindow(QMainWindow):
                 page_is_scan = True
             self.act_ocr_page.setEnabled(page_is_scan)
             self.act_ocr_document.setEnabled(True)
+            # Fresh re-OCR stays available even when the page already has a text
+            # layer (a baked-in prior OCR), since that's exactly what it wipes.
+            # The handler validates there's a real scan to redo and toasts if not.
+            self.act_ocr_reset_page.setEnabled(True)
+            self.act_ocr_reset_document.setEnabled(True)
         else:
             self.act_ocr_page.setEnabled(False)
             self.act_ocr_document.setEnabled(False)
+            self.act_ocr_reset_page.setEnabled(False)
+            self.act_ocr_reset_document.setEnabled(False)
         # The ws2 M1/M3 actions track has_doc; their handlers additionally
         # no-op without an applicable target (editor selection / selected
         # box / pasteable clipboard). ws7 M2 layers editor-aware enablement

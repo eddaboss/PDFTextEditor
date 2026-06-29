@@ -60,6 +60,13 @@ class RapidOcrEngine(OcrEngine):
     name = "rapidocr"
     _engine = None
     _lock = threading.Lock()
+    # Inference is serialized: one RapidOCR session is shared across pages, and
+    # its ONNX Runtime sessions already saturate the CPU with intra-op threads,
+    # so running recognitions concurrently would only oversubscribe the cores
+    # (and the Python wrapper is not guaranteed reentrant). With page OCR now
+    # running on a thread pool, the CPU win comes from overlapping this step
+    # with the parallel reconstruct of OTHER pages, not from parallel inference.
+    _infer_lock = threading.Lock()
 
     @staticmethod
     def available() -> bool:
@@ -83,7 +90,8 @@ class RapidOcrEngine(OcrEngine):
     def recognize(self, image_rgb: np.ndarray) -> "list[OcrLine]":
         ocr = self._session()
         # RapidOCR accepts an ndarray; it expects BGR/!-agnostic uint8.
-        result, _ = ocr(np.ascontiguousarray(image_rgb))
+        with self._infer_lock:
+            result, _ = ocr(np.ascontiguousarray(image_rgb))
         out: list[OcrLine] = []
         for row in result or []:
             quad, text, conf = row[0], row[1], row[2]

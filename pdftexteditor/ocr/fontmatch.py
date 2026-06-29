@@ -22,6 +22,43 @@ _DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 # family name -> bundled file. Order = preference on ties.
 _CANDIDATES = {"Tinos": "Tinos-Regular.ttf", "Arimo": "Arimo[wght].ttf",
                "Cousine": "Cousine-Regular.ttf"}
+# family -> {(bold, italic): bundled file}. The bold/italic siblings ship in
+# assets/fonts/ but _CANDIDATES only wired the regular; this completes them.
+# GAPS: Tinos has no bold-italic, Cousine no italic, Arimo's weight is a [wght]
+# variable axis (discrete bold deferred). variant_file_for returns the nearest
+# REAL file for a missing cell -- it never synth-bolds/slants.
+_VARIANTS = {
+    "Tinos": {(False, False): "Tinos-Regular.ttf",
+              (True, False): "Tinos-Bold.ttf",
+              (False, True): "Tinos-Italic.ttf"},
+    "Arimo": {(False, False): "Arimo[wght].ttf",
+              (False, True): "Arimo-Italic[wght].ttf"},
+    "Cousine": {(False, False): "Cousine-Regular.ttf",
+                (True, False): "Cousine-Bold.ttf"},
+}
+
+
+def variant_file_for(family: str, bold: bool, italic: bool) -> "str | None":
+    """The bundled TTF for (family, bold, italic), or the nearest available cell
+    when that exact variant is not bundled (Tinos bold-italic, Cousine italic,
+    Arimo discrete bold). ``family`` is a bundled key ('Tinos'/'Arimo'/'Cousine').
+    Absolute path, or None for an unknown family. Never synth-styles."""
+    cells = _VARIANTS.get(family)
+    if not cells:
+        return None
+    want = (bool(bold), bool(italic))
+    fn = cells.get(want)
+    if fn is None:
+        best, best_score = None, -10
+        for (b, i), f in cells.items():
+            score = (2 if i == want[1] else -2) + (1 if b == want[0] else -1)
+            if score > best_score:
+                best, best_score = f, score
+        fn = best
+    if fn is None:
+        return None
+    p = os.path.join(_DIR, fn)
+    return p if os.path.exists(p) else None
 _REF = "aeonrstilcdhmugbpAERNTHSILOG23456789"
 S = 24
 _FILL = S - 4

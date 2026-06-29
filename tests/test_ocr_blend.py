@@ -120,6 +120,107 @@ def _inked_cols(region_i16):
     return (int(cols.min()), int(cols.max())) if len(cols) else None
 
 
+PARA = ["First account line", "Second middle row", "Third closing line"]
+
+
+def _scanned_paragraph_pdf(path):
+    """A one-page PDF whose page IS a clean scan of 3 stacked lines. Returns
+    (union_cover, line_covers, origin) -- the real per-line geometry a paragraph
+    OCR box carries, so the unified per-line engine can be exercised."""
+    f = fitz.Font(fontfile=SERIF)
+    lead = 1.7 * EM
+    widest = max(f.text_length(t, EM) for t in PARA)
+    Wpt = MARGIN + widest + MARGIN
+    Hpt = MARGIN + lead * len(PARA) + MARGIN
+    doc = fitz.open(); pg = doc.new_page(width=Wpt, height=Hpt)
+    tw = fitz.TextWriter(pg.rect)
+    baselines = []
+    y = MARGIN + EM
+    for t in PARA:
+        tw.append((MARGIN, y), t, font=f, fontsize=EM)
+        baselines.append(y); y += lead
+    tw.write_text(pg, color=(0.07, 0.07, 0.09))
+    pm = pg.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+    rgb = np.frombuffer(pm.samples, np.uint8).reshape(
+        pm.height, pm.width, pm.n)[..., :3].copy()
+    import PIL.Image
+    buf = io.BytesIO(); PIL.Image.fromarray(rgb).save(buf, "PNG")
+    out = fitz.open(); page = out.new_page(width=Wpt, height=Hpt)
+    page.insert_image(page.rect, stream=buf.getvalue())
+    out.save(path); out.close(); doc.close()
+    pad = 0.12 * EM; paper = (248 / 255, 247 / 255, 244 / 255)
+    line_covers = []
+    for t, bl in zip(PARA, baselines):
+        lw = f.text_length(t, EM)
+        line_covers.append((MARGIN - pad, bl - 0.80 * EM,
+                            MARGIN + lw + pad, bl + 0.26 * EM) + paper)
+    ux0 = min(c[0] for c in line_covers); uy0 = min(c[1] for c in line_covers)
+    ux1 = max(c[2] for c in line_covers); uy1 = max(c[3] for c in line_covers)
+    return (ux0, uy0, ux1, uy1) + paper, tuple(line_covers), (MARGIN, baselines[0])
+
+
+def test_paragraph_unifies_on_single_line_engine():
+    """The box unification: a PARAGRAPH (multi-line OCR box) edits on the SAME
+    single-line in-place engine, ONE line at a time. Editing the middle line keeps
+    every UNTOUCHED line byte-identical scan pixels and re-synthesizes only the
+    changed line; the edit bakes + saves + reopens stably."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "para.pdf")
+        union, line_covers, origin = _scanned_paragraph_pdf(path)
+        doc = PDFDocument(path)
+        base = _px(doc.render(0, 2.0))
+        box = doc.add_box(0, origin, "\n".join(PARA), "Tinos", EM, (0.0, 0.0, 0.0),
+                          False, False, cover=union, render_mode=3,
+                          box_w=(union[2] - union[0]), leading=1.7 * EM,
+                          line_covers=line_covers)
+        assert box.is_paragraph and len(box.line_covers) == 3
+        # unedited overlay: the page is still pixel-identical to the scan
+        inv = _px(doc.render_with_edits(0, 2.0))
+        assert int(np.abs(inv - base).max()) == 0, \
+            "unedited paragraph overlay must match the scan exactly"
+        print("  ok  paragraph overlay renders pixel-identical to the scan")
+
+        # edit ONLY the middle line
+        new = "First account line\nSecond MIDDLE row\nThird closing line"
+        doc.stage_edit(0, box, new)
+        eb = doc._new_boxes[box.edit_key]
+        assert eb.render_mode == 0 and eb.edit_image and eb.edit_image_rect, \
+            "a paragraph edit must build a blend raster"
+
+        # The composite (300 dpi) is the precise place to assert the invariant: each
+        # untouched line band is BYTE-IDENTICAL to the scan crop; the edited band is not.
+        out = doc.compose_lines_block(box, new)
+        assert out is not None, "compose_lines_block must run on a 3-line box"
+        canvas, _disp = out
+        ppi = 300.0 / 72.0
+        prgb = doc.render_page_image(0, 300.0)
+        bx0 = int(round(union[0] * ppi)); by0 = int(round(union[1] * ppi))
+        bx1 = int(round(union[2] * ppi)); by1 = int(round(union[3] * ppi))
+        crop = prgb[by0:by1, bx0:bx1]
+        wmin = min(canvas.shape[1], crop.shape[1])
+        diffs = []
+        for cov in line_covers:
+            a0 = max(0, int(round(cov[1] * ppi)) - by0)
+            a1 = min(crop.shape[0], int(round(cov[3] * ppi)) - by0)
+            diffs.append(float(np.abs(canvas[a0:a1, :wmin].astype(int)
+                                      - crop[a0:a1, :wmin].astype(int)).mean()))
+        assert diffs[0] == 0.0 and diffs[2] == 0.0, \
+            f"untouched paragraph lines must be byte-identical scan pixels (got {diffs})"
+        assert diffs[1] > 1.0, f"edited line must re-synthesize (got {diffs})"
+        print(f"  ok  paragraph keeps untouched lines 1-for-1 (line diffs "
+              f"{[round(x, 2) for x in diffs]})")
+
+        # bake -> save -> reopen must be stable (screen == file)
+        edited = _px(doc.render_with_edits(0, 2.0))
+        outp = os.path.join(d, "po.pdf"); doc.save_as(outp)
+        doc2 = PDFDocument(outp); re = _px(doc2.render(0, 2.0))
+        assert re.shape == edited.shape
+        assert float(np.abs(re - edited).mean()) < 6.0, \
+            "paragraph save and screen disagree"
+        print("  ok  paragraph edit save -> reopen stable")
+        doc2.close(); doc.close()
+
+
 def test_clean_stays_clean_and_reflows():
     """The composite keeps a CLEAN line's edit clean (no hard-degrade speckle the
     neighbours lack) and reflows cleanly on a delete -- the two things the user
@@ -153,12 +254,14 @@ def test_clean_stays_clean_and_reflows():
     assert sc < 0.04, f"clean edit should be near speckle-free (got {sc:.3f})"
     print(f"  ok  clean edit stays clean (speckle {sc:.3f} << degraded {sd:.3f})")
 
-    # DELETE a middle word: the line must reflow left, not leave a hole.
+    # DELETE a word: it is ERASED in place (the scan stays the canvas), so the
+    # line loses that word's ink while the rest stays the original pixels.
     base_reg, del_reg = run(False, "Total owed today")
-    b, e = _inked_cols(base_reg), _inked_cols(del_reg)
-    assert b and e and e[1] < b[1] - 4, \
-        f"deleting a word must reflow the line shorter (was right={b[1]} now {e[1]})"
-    print(f"  ok  delete reflows the line ({b[1]} -> {e[1]} px right edge)")
+    d_base = int((base_reg.mean(2) < 130).sum())
+    d_del = int((del_reg.mean(2) < 130).sum())
+    assert d_del < d_base * 0.92, \
+        f"deleting a word must remove its ink ({d_base} -> {d_del} dark px)"
+    print(f"  ok  delete removes the word's ink ({d_base} -> {d_del} dark px)")
 
 
 def main():
@@ -206,7 +309,8 @@ def main():
         print(f"  ok  save -> reopen stable (mean diff {diff:.2f})")
         doc2.close(); doc.close()
     test_clean_stays_clean_and_reflows()
-    print("\n6 ocr-blend tests passed.")
+    test_paragraph_unifies_on_single_line_engine()
+    print("\n7 ocr-blend tests passed.")
 
 
 if __name__ == "__main__":
