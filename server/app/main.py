@@ -267,7 +267,7 @@ DONATE_URL = os.environ.get("PDFTE_DONATE_URL",
 # watermarks, daily caps, upload-to-our-cloud) simply do not apply.
 _PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>PDF Text Editor - the free PDF editor that's actually free</title>
+<title>PDF for Free - the PDF editor that's actually free</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="mask-icon" href="/favicon.svg" color="#C2643F">
 <meta name="theme-color" content="#C2643F">
@@ -286,6 +286,9 @@ _PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name="twitter:title" content="PDF for Free - the PDF editor that's actually free">
 <meta name="twitter:description" content="A real PDF editor that runs on your Mac. No subscription, no watermark, no upload.">
 <meta name="twitter:image" content="https://pdf-for-free.com/og.png">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"PDF for Free","alternateName":"PDF Text Editor","url":"https://pdf-for-free.com/","description":"A real PDF editor that runs on your Mac or PC. Retype text in place in the document's own font. No subscription, no watermark, no upload. Actually free.","applicationCategory":"UtilitiesApplication","operatingSystem":"macOS, Windows","downloadUrl":"https://pdf-for-free.com/","screenshot":"https://pdf-for-free.com/og.png","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"publisher":{"@type":"Organization","name":"PDF for Free","url":"https://pdf-for-free.com/"}}
+</script>
 <link rel=preconnect href="https://fonts.googleapis.com">
 <link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel=stylesheet>
