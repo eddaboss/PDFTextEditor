@@ -224,6 +224,92 @@ def _respace_area(area: list) -> None:
             ln["text"] = _requantize_from_words(words, ln["text"], med, 0.0)
 
 
+def recover_dropped_lines(image_rgb: np.ndarray, lines: list, engine) -> list:
+    """Re-OCR a focused crop of any same-column line BLOCK whose vertical PITCH jumps
+    to ~2x the page's normal line pitch with real ink in the gap. The full-page text
+    DETECTOR silently drops a faint line (e.g. a faint address row) even though that
+    same line reads fine from a focused crop -- which leaves the surviving lines welded
+    across the gap into one wrong box, or a present line with broken geometry. Returns
+    the recovered ``OcrLine``s (deduped against the existing detections); ``[]`` when
+    nothing qualifies, which is the common case -- so a clean page pays NO extra OCR.
+
+    General by construction: it keys ONLY on relative line pitch (median of the page's
+    own same-column line spacings) and ink presence vs the page's own paper -- no document
+    coordinates, strings, or absolute thresholds. ``engine`` is the same OcrEngine used
+    for the page, so the crop re-OCR is identical on the RapidOCR/Windows path."""
+    from .engine import OcrLine
+    if len(lines) < 2 or image_rgb is None:
+        return []
+    H, W = image_rgb.shape[:2]
+    g = image_rgb.mean(2) if image_rgb.ndim == 3 else image_rgb
+    cov = (255.0 - g.astype(np.float32)) / 255.0
+    items = sorted(lines, key=lambda o: o.bbox[1])
+    boxes = [o.bbox for o in items]
+
+    def _next_same_col(i):
+        ax0, ay0, ax1, ay1 = boxes[i]
+        for j in range(i + 1, len(items)):
+            bx0, by0, bx1, by1 = boxes[j]
+            if min(ax1, bx1) - max(ax0, bx0) > 0.5 * min(ax1 - ax0, bx1 - bx0):
+                return j
+        return -1
+
+    pitches = []
+    for i in range(len(items)):
+        j = _next_same_col(i)
+        if j >= 0:
+            p = boxes[j][1] - boxes[i][1]
+            if 0 < p < (boxes[i][3] - boxes[i][1]) * 4:
+                pitches.append(p)
+    if not pitches:
+        return []
+    med = float(np.median(pitches))
+    seen = list(boxes)
+    out: list = []
+    for i in range(len(items)):
+        j = _next_same_col(i)
+        if j < 0:
+            continue
+        ax0, ay0, ax1, ay1 = boxes[i]
+        bx0, by0, bx1, by1 = boxes[j]
+        if by0 - ay0 < 1.6 * med:                       # < ~one skipped row -> no gap
+            continue
+        cx0, cx1 = int(max(0, min(ax0, bx0))), int(min(W, max(ax1, bx1)))
+        gy0, gy1 = int(max(0, ay0)), int(min(H, by1))
+        # require real ink BETWEEN the two lines (an empty gap is a true blank, not a miss)
+        gap = cov[int(ay1):int(by0), cx0:cx1] if by0 > ay1 else cov[gy0:gy1, cx0:cx1]
+        if gap.size == 0 or float((gap > 0.30).mean()) < 0.01:
+            continue
+        crop = image_rgb[gy0:gy1, cx0:cx1]
+        if crop.shape[0] < 8 or crop.shape[1] < 8:
+            continue
+        try:
+            rec = engine.recognize(np.ascontiguousarray(crop))
+        except Exception:
+            continue
+        for o in rec:
+            ox0, oy0, ox1, oy1 = o.bbox
+            px = (ox0 + cx0, oy0 + gy0, ox1 + cx0, oy1 + gy0)
+            if o.confidence < 0.5 or not o.text.strip():
+                continue
+            pa = (px[2] - px[0]) * (px[3] - px[1])
+            dup = False
+            for s in seen:
+                ix = min(px[2], s[2]) - max(px[0], s[0])
+                iy = min(px[3], s[3]) - max(px[1], s[1])
+                if ix > 0 and iy > 0 and ix * iy > 0.3 * min(
+                        pa, (s[2] - s[0]) * (s[3] - s[1])):
+                    dup = True
+                    break
+            if dup:
+                continue
+            out.append(OcrLine(quad=[[px[0], px[1]], [px[2], px[1]],
+                                     [px[2], px[3]], [px[0], px[3]]],
+                               text=o.text, confidence=o.confidence))
+            seen.append(px)
+    return out
+
+
 def reconstruct_page(image_rgb: np.ndarray, dpi: float, ocr_lines: list,
                      base_font_serif: str, base_font_sans: str,
                      family_label: str = "Scanned Text",
@@ -545,7 +631,14 @@ def _merge_row_fragments(raw_lines: list, space_em_ratio: float = 0.0,
             b = items[j]
             bh = max(b["y1"] - b["y0"], 1.0)
             ov = min(a["y1"], b["y1"]) - max(a["y0"], b["y0"])   # overlap with the SEED row
-            if ov >= 0.5 * min(ah, bh):
+            # Two boxes share a text ROW only when their heights are COMPARABLE. One physical
+            # line at a single font size has a fixed ascender-to-descender envelope, so two
+            # fragments of it differ in box height by at most ~1.3x; a box over 2x another's
+            # height is a different row band or a non-text GRAPHIC. Without this gate a tall
+            # logo box vertically overlaps several short header rows and welds them all into
+            # one scrambled line (the nso-logo header bug). The gate only ever SPLITS a row
+            # (the tall outlier opens its own), never fuses, so it cannot create a scramble.
+            if ov >= 0.5 * min(ah, bh) and max(ah, bh) < 2.0 * min(ah, bh):
                 row.append(b)
                 used[j] = True
         row.sort(key=lambda l: l["x0"])
@@ -622,9 +715,42 @@ def _group_lines_into_areas(raw_lines: list, h_rules: list = None) -> list:
                 best, best_gap = area, vgap
         if best is None:
             areas.append([ln])
+        elif _join_nests_other_area(best, ln, areas):
+            # A join must not widen the area's union cover so it NEWLY overlaps a SEPARATE
+            # existing area -- the multi-column-list doubled-box: a narrow column entry
+            # (e.g. one bullet) pulls in a full-width continuation row whose width reaches
+            # across the sibling column boxes sitting between them, drawing a cover AROUND
+            # another box's whole content. Keep this line as its own area instead.
+            areas.append([ln])
         else:
             best.append(ln)
     return areas
+
+
+def _join_nests_other_area(area: list, ln: dict, areas: list) -> bool:
+    """True iff appending ``ln`` to ``area`` would widen ``area``'s union cover so it
+    overlaps ANOTHER existing area that ``area`` does not already overlap. Pure geometry
+    in relative coords -- the signature of a column entry swallowing a wider continuation
+    row that engulfs sibling column boxes between them. A normal paragraph is a no-op:
+    its lines are similar width and no separate box sits between them, so the widened
+    cover overlaps nothing new."""
+    def _cover(ls):
+        return (min(l["x0"] for l in ls), min(l["y0"] for l in ls),
+                max(l["x1"] for l in ls), max(l["y1"] for l in ls))
+
+    def _ov(r, s):
+        return (min(r[2], s[2]) - max(r[0], s[0]) > 0
+                and min(r[3], s[3]) - max(r[1], s[1]) > 0)
+
+    cur = _cover(area)
+    new = _cover(area + [ln])
+    for a in areas:
+        if a is area:
+            continue
+        ar = _cover(a)
+        if _ov(new, ar) and not _ov(cur, ar):
+            return True
+    return False
 
 
 def _area_to_box(area: list, ppi: float, family: str = "",

@@ -367,6 +367,25 @@ def unit_checks() -> list[str]:
                          f"{rec and rec.subfamily!r}, want 'Regular'")
     finally:
         FontEngine._system_index = saved
+    # bold-weight reconcile: a per-word font match that lands on the SAME family at a DIFFERENT
+    # weight (Courier New Bold vs Regular are shape-identical, so a weight-blind matcher flips
+    # them) must snap back to the scan run's OWN font, so a typed glyph is as bold as the text it
+    # sits in with no hand-bolding. A genuinely different family is left exactly as matched.
+    import tempfile as _tf
+    from pdftexteditor.document import PDFDocument as _Doc
+    _bd = fitz.open(); _bd.new_page(width=200, height=100)
+    _bp = os.path.join(_tf.gettempdir(), "_weight_reconcile_probe.pdf")
+    _bd.save(_bp); _bd.close()
+    _doc = _Doc(_bp)
+    _doc._ttf_style_cache = {                       # bypass file reads: seed the style cache
+        "/bold.ttf": ("Courier New", True, False),
+        "/reg.ttf": ("Courier New", False, False),
+        "/arial.ttf": ("Arial", False, False)}
+    if _doc._synth_weight_reconcile("/reg.ttf", {"fpath": "/bold.ttf"}) != "/bold.ttf":
+        fails.append("weight reconcile: same-family regular match did not snap to the scan's bold")
+    if _doc._synth_weight_reconcile("/arial.ttf", {"fpath": "/bold.ttf"}) != "/arial.ttf":
+        fails.append("weight reconcile: a different-family per-word match was wrongly overridden")
+    _doc.close()
     return fails
 
 

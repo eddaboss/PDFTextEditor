@@ -41,11 +41,19 @@ def recognize_and_reconstruct(
     from ..debuglog import log as _dlog
     if not pack.ensure_on_path():
         raise OcrPackMissing("The OCR component is not installed.")
-    from .reconstruct import reconstruct_page  # needs the pack (opencv, vtracer)
+    from .reconstruct import reconstruct_page, recover_dropped_lines  # needs the pack
     engine = get_engine(engine_name)
     _dlog("ocr", "recognize_call", page=family_label, engine=engine_name)
     lines = engine.recognize(image_rgb)
     _dlog("ocr", "recognize_done", page=family_label, lines=len(lines))
+    # The full-page detector silently drops faint lines (a faint address row); a focused
+    # re-OCR of the same-column gap recovers them, so the surviving lines do not weld
+    # across the hole into one wrong box. No-op (no extra OCR) on a clean page.
+    if lines:
+        recovered = recover_dropped_lines(image_rgb, lines, engine)
+        if recovered:
+            _dlog("ocr", "recovered_lines", page=family_label, n=len(recovered))
+            lines = lines + recovered
     if progress_cb is not None:
         progress_cb(0.30)                     # recognition complete
     if not lines:

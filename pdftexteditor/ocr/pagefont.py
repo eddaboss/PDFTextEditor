@@ -23,10 +23,33 @@ from __future__ import annotations
 import os
 from collections import Counter
 
+import cv2
 import numpy as np
 
 from . import fontbank as FB
 from . import supermatch as SM
+
+# Relative stroke-width difference above which two same-letterform glyphs are treated as
+# DIFFERENT weights (bold vs regular) and are NOT pooled into one font group. Same scanned
+# font reads ~0 here for the same char; a bold-vs-regular pair reads ~0.18 (measured), so
+# 0.13 cleanly splits them while shrugging off scan-to-scan noise. ponytail: one knob; widen
+# toward 0.16 if a genuine regular face ever gets split from its own slightly-uneven scan.
+_WEIGHT_TOL = 0.13
+
+
+def _glyph_weight(tile: np.ndarray) -> "float | None":
+    """Stroke WEIGHT of a glyph coverage tile = stroke width / glyph height (scale-free),
+    via the distance transform of the ink. ``None`` if the tile has too little ink."""
+    m = (tile > 0.4).astype(np.uint8)
+    ys, xs = np.where(m)
+    if ys.size < 8:
+        return None
+    h = int(ys.max() - ys.min() + 1)
+    if h < 4:
+        return None
+    dt = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    sk = dt[dt > 0.5]
+    return (2.0 * float(np.median(sk)) / float(h)) if sk.size else None
 
 
 def _coarse_from_tiles(tiles_by_char):
@@ -57,6 +80,33 @@ def _coarse_from_tiles(tiles_by_char):
     return ms
 
 
+# How hard the rerank penalises a candidate whose STROKE WEIGHT differs from the scan's.
+# The shape descriptor is weight-blind, so a bold font with the right letterform can outscore
+# the regular font that actually matches; this term subtracts the relative stroke-width gap
+# from the cosine so a same-weight font wins a close shape tie. A ~0.18 bold-vs-regular gap
+# costs ~0.07 here -- enough to flip a tie, small enough not to override a real shape win.
+_RERANK_WEIGHT = 0.40
+
+
+def _cand_glyph_weight(key, ch):
+    """Stroke WEIGHT of a bank candidate's glyph (clean render), cached per (key, char)."""
+    c = _CAND_WEIGHT_CACHE.get((key, ch), "unset")
+    if c != "unset":
+        return c
+    w = None
+    try:
+        f = FB._cand_font(os.path.join(FB._ensure_ttf_cache(), key))
+        if f is not None and f.has_glyph(ord(ch)):
+            w = _glyph_weight(FB._render_glyph_cov(f, ch))
+    except Exception:
+        w = None
+    _CAND_WEIGHT_CACHE[(key, ch)] = w
+    return w
+
+
+_CAND_WEIGHT_CACHE: dict = {}
+
+
 def _match_cluster_tiles(tiles_by_char, residual=None, deg_cache=None):
     """Super-resolve a group's chars, then match vs the full bank (coarse shortlist
     + hi-res super-glyph rerank). Returns a tar-member key or None.
@@ -68,6 +118,7 @@ def _match_cluster_tiles(tiles_by_char, residual=None, deg_cache=None):
     real font. ``deg_cache`` memoizes the degraded descriptor per (key, char) -- the
     residual is page-wide and fixed, so every cluster reuses the same renders (fast)."""
     sdesc = {}
+    sw_scan = {}                      # per-char SCAN stroke weight (the target the rerank matches)
     for ch, tiles in tiles_by_char.items():
         sg = SM._superres(tiles)
         if sg is None:
@@ -81,6 +132,9 @@ def _match_cluster_tiles(tiles_by_char, residual=None, deg_cache=None):
             hd = SM._hdesc(sg)
             if hd is not None:
                 sdesc[ch] = hd
+                w = _glyph_weight(sg)
+                if w is not None:
+                    sw_scan[ch] = w
     if len(sdesc) < SM._MIN_CHARS:
         return None
     keys = FB._load_fingerprints()["paths"]
@@ -101,12 +155,20 @@ def _match_cluster_tiles(tiles_by_char, residual=None, deg_cache=None):
     best, best_s = None, -1.0
     for ci in cand:
         s, n = 0.0, 0
+        wpen, wn = 0.0, 0
         for ch, hd in sdesc.items():
             cd = _cd(ci, ch)
             if cd is not None:
                 s += float(cd @ hd)
                 n += 1
+            if ch in sw_scan:                # weight mismatch vs the scan, relative
+                cw = _cand_glyph_weight(keys[ci], ch)
+                if cw is not None:
+                    wpen += abs(cw - sw_scan[ch]) / max(sw_scan[ch], 1e-6)
+                    wn += 1
         sc = s / n if n else -1.0
+        if wn:                               # a same-weight font wins a close shape tie
+            sc -= _RERANK_WEIGHT * (wpen / wn)
         if sc > best_s:
             best, best_s = ci, sc
     if best is None or best_s < SM._MIN_SCORE:
@@ -133,8 +195,14 @@ class PageFontMap:
         if not len(inside):
             mx, my = (x0 + x1) / 2, (y0 + y1) / 2
             inside = [int(np.argmin((cx - mx) ** 2 + (cy - my) ** 2))]
+        # NEVER vote a BLOCKED / non-text-class font (Workbench 02771 and other display faces):
+        # a group whose stored font is junk must not be returned just because it is the local
+        # majority -- re-check candidate_ok here, the same gate the coarse match uses, so an
+        # edit never lands on a font Edward pulled from the bank. No candidate group -> None,
+        # and _edit_synth_font falls through to its next (filtered) matcher.
         votes = Counter(self.groups[i] for i in inside
-                        if self.group_path.get(self.groups[i]))
+                        if self.group_path.get(self.groups[i])
+                        and FB.candidate_ok(self.group_path.get(self.groups[i])))
         if not votes:
             return None
         return self.group_path.get(votes.most_common(1)[0][0])
@@ -209,6 +277,19 @@ def build(doc, page_index: int) -> "PageFontMap":
                 if d is not None:
                     per.setdefault(ch, []).append(d)
         wdesc.append({c: np.mean(v, 0) for c, v in per.items()})
+    # Per-word, per-character stroke WEIGHT, so the link step can refuse to pool a bold
+    # word with a regular one even when their letterforms agree (the shape descriptor is
+    # unit-normalised and cannot see weight). Keyed by char so the comparison is same-char
+    # vs same-char -- robust to a word's glyph mix.
+    wcw = []
+    for word in units:
+        per = {}
+        for ch, tile in word:
+            if ch in FB._CIDX:
+                w = _glyph_weight(tile)
+                if w is not None:
+                    per.setdefault(ch, []).append(w)
+        wcw.append({c: float(np.median(v)) for c, v in per.items()})
     n = len(units)
     parent = list(range(n))
 
@@ -228,10 +309,22 @@ def build(doc, page_index: int) -> "PageFontMap":
             if len(shared) < SM._GROUP_MIN_SHARE:
                 continue
             sim = float(np.mean([wdesc[i][c] @ wdesc[j][c] for c in shared]))
-            if sim >= SM._GROUP_SIM:
-                ra, rb = _find(i), _find(j)
-                if ra != rb:
-                    parent[ra] = rb
+            if sim < SM._GROUP_SIM:
+                continue
+            # WEIGHT GATE: same letterform is not enough -- a bold word and a regular word
+            # share shape but are a DIFFERENT style, and pooling them lands the group's
+            # super-resolved shape between the two weights so it matches a font of the wrong
+            # weight (a regular scan matched LINE Seed Bold). Refuse the link when the SHARED
+            # characters' stroke weights disagree by more than the tolerance.
+            shared_w = [c for c in shared if c in wcw[i] and c in wcw[j]]
+            if shared_w:
+                wd = float(np.mean([abs(wcw[i][c] - wcw[j][c])
+                                    / max(wcw[i][c], wcw[j][c], 1e-6) for c in shared_w]))
+                if wd > _WEIGHT_TOL:
+                    continue
+            ra, rb = _find(i), _find(j)
+            if ra != rb:
+                parent[ra] = rb
     label = {i: _find(i) for i in range(n) if wdesc[i]}
 
     # one super-res match per cluster (pool every same-style word -> strong, stable)

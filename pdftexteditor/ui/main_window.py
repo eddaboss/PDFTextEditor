@@ -143,287 +143,6 @@ ZOOM_MAX = 6.0
 ZOOM_PRESETS = (0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 4.00)
 
 
-# ===========================================================================
-# Icon factory: vector glyphs drawn with QPainter.
-# ===========================================================================
-# BUILD_SPEC §6.2 calls for SF Symbols rendered to QIcon, falling back to
-# bundled SVGs in assets/icons/. SF Symbols are not exposed as a usable Qt font
-# family (verified: QFontDatabase has only .AppleSystemUIFont / Apple Symbols),
-# and no assets/icons/ exists yet, so we draw clean monochrome line icons in
-# code. This keeps the toolbar fully styled with zero external dependencies;
-# swapping in real SF Symbol PNGs or SVGs later means replacing only `make_icon`.
-def _icon_from_path(painter_fn, *, size: int = 64, color: str = theme.TOOLBAR_ICON,
-                    disabled_color: str = theme.TOOLBAR_ICON_DISABLED) -> QIcon:
-    """Render ``painter_fn(painter, n)`` (n = canvas size) into a QIcon with a
-    Normal and a Disabled pixmap so toolbar buttons dim correctly."""
-    icon = QIcon()
-    for state_color, mode in ((color, QIcon.Normal), (disabled_color, QIcon.Disabled)):
-        pm = QPixmap(size, size)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor(state_color))
-        pen.setWidthF(size * 0.075)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        painter_fn(p, size)
-        p.end()
-        icon.addPixmap(pm, mode)
-    return icon
-
-
-def _draw_open(p: QPainter, n: float) -> None:
-    # Folder drawn as ONE continuous outline (tab + body) so the lid and the
-    # body do not overlap and double the stroke weight at the top-left, which
-    # made this icon read heavier than the others.
-    path = QPainterPath()
-    path.moveTo(n * 0.16, n * 0.74)          # bottom-left
-    path.lineTo(n * 0.16, n * 0.32)          # up the left edge to the tab
-    path.lineTo(n * 0.40, n * 0.32)          # tab top
-    path.lineTo(n * 0.47, n * 0.42)          # tab notch down to body top
-    path.lineTo(n * 0.84, n * 0.42)          # body top edge
-    path.lineTo(n * 0.84, n * 0.74)          # down the right edge
-    path.closeSubpath()                       # bottom edge back to start
-    p.drawPath(path)
-
-
-def _draw_save(p: QPainter, n: float) -> None:
-    # Down arrow into a tray (square.and.arrow.down).
-    cx = n * 0.5
-    p.drawLine(cx, n * 0.18, cx, n * 0.56)
-    arrow = QPainterPath()
-    arrow.moveTo(n * 0.34, n * 0.42)
-    arrow.lineTo(cx, n * 0.60)
-    arrow.lineTo(n * 0.66, n * 0.42)
-    p.drawPath(arrow)
-    tray = QPainterPath()
-    tray.moveTo(n * 0.22, n * 0.66)
-    tray.lineTo(n * 0.22, n * 0.80)
-    tray.lineTo(n * 0.78, n * 0.80)
-    tray.lineTo(n * 0.78, n * 0.66)
-    p.drawPath(tray)
-
-
-def _draw_save_as(p: QPainter, n: float) -> None:
-    # Save with a small overlaid square (square.and.arrow.down.on.square).
-    cx = n * 0.44
-    p.drawLine(cx, n * 0.16, cx, n * 0.48)
-    arrow = QPainterPath()
-    arrow.moveTo(n * 0.30, n * 0.36)
-    arrow.lineTo(cx, n * 0.52)
-    arrow.lineTo(n * 0.58, n * 0.36)
-    p.drawPath(arrow)
-    p.drawRect(n * 0.20, n * 0.58, n * 0.44, n * 0.22)
-    p.drawRect(n * 0.52, n * 0.30, n * 0.30, n * 0.30)
-
-
-def _draw_undo(p: QPainter, n: float) -> None:
-    path = QPainterPath()
-    path.moveTo(n * 0.30, n * 0.34)
-    path.lineTo(n * 0.20, n * 0.44)
-    path.lineTo(n * 0.30, n * 0.54)
-    p.drawPath(path)
-    arc = QPainterPath()
-    arc.moveTo(n * 0.20, n * 0.44)
-    arc.cubicTo(n * 0.50, n * 0.40, n * 0.80, n * 0.46, n * 0.78, n * 0.74)
-    p.drawPath(arc)
-
-
-def _draw_redo(p: QPainter, n: float) -> None:
-    path = QPainterPath()
-    path.moveTo(n * 0.70, n * 0.34)
-    path.lineTo(n * 0.80, n * 0.44)
-    path.lineTo(n * 0.70, n * 0.54)
-    p.drawPath(path)
-    arc = QPainterPath()
-    arc.moveTo(n * 0.80, n * 0.44)
-    arc.cubicTo(n * 0.50, n * 0.40, n * 0.20, n * 0.46, n * 0.22, n * 0.74)
-    p.drawPath(arc)
-
-
-def _thicken_chevron_pen(p: QPainter, n: float) -> None:
-    """Bump the prev/next chevron stroke from the default icon weight
-    (n*0.075) to ~n*0.11 with round caps/joins, so the page nav chevrons read as
-    clearly clickable next to the bold page field instead of as faint hairlines
-    (review minor). Keeps the current pen color (full-strength when enabled,
-    disabled tint when the icon's Disabled pixmap is drawn)."""
-    pen = p.pen()
-    pen.setWidthF(n * 0.11)
-    pen.setCapStyle(Qt.RoundCap)
-    pen.setJoinStyle(Qt.RoundJoin)
-    p.setPen(pen)
-
-
-def _draw_chevron_left(p: QPainter, n: float) -> None:
-    _thicken_chevron_pen(p, n)
-    path = QPainterPath()
-    path.moveTo(n * 0.60, n * 0.26)
-    path.lineTo(n * 0.38, n * 0.50)
-    path.lineTo(n * 0.60, n * 0.74)
-    p.drawPath(path)
-
-
-def _draw_chevron_right(p: QPainter, n: float) -> None:
-    _thicken_chevron_pen(p, n)
-    path = QPainterPath()
-    path.moveTo(n * 0.40, n * 0.26)
-    path.lineTo(n * 0.62, n * 0.50)
-    path.lineTo(n * 0.40, n * 0.74)
-    p.drawPath(path)
-
-
-def _draw_zoom_out(p: QPainter, n: float) -> None:
-    r = n * 0.24
-    cx, cy = n * 0.42, n * 0.42
-    p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-    p.drawLine(cx - r * 0.5, cy, cx + r * 0.5, cy)
-    p.drawLine(n * 0.60, n * 0.60, n * 0.80, n * 0.80)
-
-
-def _draw_zoom_in(p: QPainter, n: float) -> None:
-    r = n * 0.24
-    cx, cy = n * 0.42, n * 0.42
-    p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-    p.drawLine(cx - r * 0.5, cy, cx + r * 0.5, cy)
-    p.drawLine(cx, cy - r * 0.5, cx, cy + r * 0.5)
-    p.drawLine(n * 0.60, n * 0.60, n * 0.80, n * 0.80)
-
-
-def _draw_doc(p: QPainter, n: float) -> None:
-    # Empty-state document glyph (doc.text), filled lighter.
-    path = QPainterPath()
-    path.moveTo(n * 0.26, n * 0.14)
-    path.lineTo(n * 0.60, n * 0.14)
-    path.lineTo(n * 0.74, n * 0.28)
-    path.lineTo(n * 0.74, n * 0.86)
-    path.lineTo(n * 0.26, n * 0.86)
-    path.closeSubpath()
-    p.drawPath(path)
-    p.drawLine(n * 0.60, n * 0.14, n * 0.60, n * 0.28)
-    p.drawLine(n * 0.60, n * 0.28, n * 0.74, n * 0.28)
-    for yy in (0.42, 0.54, 0.66):
-        p.drawLine(n * 0.34, n * yy, n * 0.66, n * yy)
-
-
-def _draw_add_text(p: QPainter, n: float) -> None:
-    # An "A" with a small "+" badge (BUILD_SPEC §5.2): the add-text tool glyph.
-    # The A is drawn as two legs + a crossbar; the + sits at the upper right.
-    a = QPainterPath()
-    a.moveTo(n * 0.16, n * 0.74)
-    a.lineTo(n * 0.34, n * 0.26)
-    a.lineTo(n * 0.52, n * 0.74)
-    p.drawPath(a)
-    p.drawLine(n * 0.23, n * 0.56, n * 0.45, n * 0.56)   # A crossbar
-    # Plus badge, upper right.
-    p.drawLine(n * 0.70, n * 0.30, n * 0.70, n * 0.50)
-    p.drawLine(n * 0.60, n * 0.40, n * 0.80, n * 0.40)
-
-
-def _draw_close(p: QPainter, n: float) -> None:
-    # A small centered "x" for the tab close affordance (a muted glyph that
-    # reads as "close", not the raw red Fusion square).
-    p.drawLine(n * 0.34, n * 0.34, n * 0.66, n * 0.66)
-    p.drawLine(n * 0.66, n * 0.34, n * 0.34, n * 0.66)
-
-
-def _draw_trash(p: QPainter, n: float) -> None:
-    # A trash can (BUILD_SPEC §5.2): lid, body, and two slats.
-    p.drawLine(n * 0.26, n * 0.30, n * 0.74, n * 0.30)   # lid
-    # Lid handle.
-    p.drawLine(n * 0.42, n * 0.30, n * 0.44, n * 0.22)
-    p.drawLine(n * 0.44, n * 0.22, n * 0.56, n * 0.22)
-    p.drawLine(n * 0.56, n * 0.22, n * 0.58, n * 0.30)
-    # Body (tapered can).
-    body = QPainterPath()
-    body.moveTo(n * 0.32, n * 0.30)
-    body.lineTo(n * 0.36, n * 0.78)
-    body.lineTo(n * 0.64, n * 0.78)
-    body.lineTo(n * 0.68, n * 0.30)
-    p.drawPath(body)
-    # Vertical slats.
-    p.drawLine(n * 0.44, n * 0.40, n * 0.45, n * 0.68)
-    p.drawLine(n * 0.56, n * 0.40, n * 0.55, n * 0.68)
-
-
-def _draw_select(p: QPainter, n: float) -> None:
-    # An arrow cursor (the Select tool): a filled-look pointer outline.
-    path = QPainterPath()
-    path.moveTo(n * 0.30, n * 0.22)
-    path.lineTo(n * 0.30, n * 0.72)
-    path.lineTo(n * 0.42, n * 0.60)
-    path.lineTo(n * 0.50, n * 0.78)
-    path.lineTo(n * 0.58, n * 0.74)
-    path.lineTo(n * 0.50, n * 0.56)
-    path.lineTo(n * 0.66, n * 0.56)
-    path.closeSubpath()
-    p.drawPath(path)
-
-
-def _draw_text_edit(p: QPainter, n: float) -> None:
-    # An I-beam over a baseline (the Text Edit tool): a capital-I caret.
-    cx = n * 0.5
-    p.drawLine(cx, n * 0.24, cx, n * 0.76)        # vertical stem
-    p.drawLine(n * 0.40, n * 0.24, n * 0.60, n * 0.24)   # top serif
-    p.drawLine(n * 0.40, n * 0.76, n * 0.60, n * 0.76)   # bottom serif
-
-
-def _draw_find(p: QPainter, n: float) -> None:
-    # A magnifier (Find & Replace tool).
-    r = n * 0.22
-    cx, cy = n * 0.44, n * 0.44
-    p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-    p.drawLine(n * 0.60, n * 0.60, n * 0.80, n * 0.80)
-
-
-def _draw_align_left(p: QPainter, n: float) -> None:
-    for i, yy in enumerate((0.30, 0.44, 0.58, 0.72)):
-        x1 = n * (0.78 if i % 2 == 0 else 0.62)
-        p.drawLine(n * 0.22, n * yy, x1, n * yy)
-
-
-def _draw_align_center(p: QPainter, n: float) -> None:
-    for i, yy in enumerate((0.30, 0.44, 0.58, 0.72)):
-        half = (0.28 if i % 2 == 0 else 0.20)
-        p.drawLine(n * (0.5 - half), n * yy, n * (0.5 + half), n * yy)
-
-
-def _draw_align_right(p: QPainter, n: float) -> None:
-    for i, yy in enumerate((0.30, 0.44, 0.58, 0.72)):
-        x0 = n * (0.22 if i % 2 == 0 else 0.38)
-        p.drawLine(x0, n * yy, n * 0.78, n * yy)
-
-
-def _draw_align_justify(p: QPainter, n: float) -> None:
-    for yy in (0.30, 0.44, 0.58, 0.72):
-        p.drawLine(n * 0.22, n * yy, n * 0.78, n * yy)
-
-
-_ICON_DRAWERS = {
-    "open": _draw_open,
-    "save": _draw_save,
-    "save_as": _draw_save_as,
-    "undo": _draw_undo,
-    "redo": _draw_redo,
-    "prev": _draw_chevron_left,
-    "next": _draw_chevron_right,
-    "zoom_out": _draw_zoom_out,
-    "zoom_in": _draw_zoom_in,
-    "doc": _draw_doc,
-    "add_text": _draw_add_text,
-    "delete": _draw_trash,
-    "close": _draw_close,
-    "select": _draw_select,
-    "text_edit": _draw_text_edit,
-    "find": _draw_find,
-    "align_left": _draw_align_left,
-    "align_center": _draw_align_center,
-    "align_right": _draw_align_right,
-    "align_justify": _draw_align_justify,
-}
-
-
 def make_icon(name: str, color: str = theme.TOOLBAR_ICON) -> QIcon:
     """Return the named icon from the shared SVG icon set (ui/icons.py).
 
@@ -1322,9 +1041,7 @@ _THUMB_H = 150
 _META_H = 56
 _CARD_H = _THUMB_H + _META_H
 _CARD_GAP = 16
-_CARD_RADIUS = 11
-_CARD_BG = theme.CARD_BG          # a warm tile that reads above the canvas gutter
-_CARD_BG_HOVER = theme.CARD_BG_HOVER   # a touch brighter under the pointer
+_CARD_RADIUS = 12   # Clay radius band: panels' cards = 12
 
 
 class _ThumbLabel(QWidget):
@@ -1365,7 +1082,7 @@ class _ThumbLabel(QWidget):
             p.fillRect(0, 0, w, h, QColor("#FFFFFF"))
             p.drawPixmap(0, 0, self._pm)
         else:
-            p.fillRect(0, 0, w, h, QColor(_CARD_BG_HOVER))
+            p.fillRect(0, 0, w, h, QColor(theme.CARD_BG_HOVER))
             gx = (w - self._placeholder.width()) // 2
             gy = (h - self._placeholder.height()) // 2
             p.drawPixmap(gx, gy, self._placeholder)
@@ -1388,7 +1105,7 @@ class RecentCard(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setProperty("hover", False)
         self.setToolTip(path)
-        self.setStyleSheet(_CARD_QSS)
+        self.setStyleSheet(_card_qss())
 
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
@@ -1472,6 +1189,159 @@ class RecentCard(QFrame):
         super().mouseReleaseEvent(event)
 
 
+def _recent_pages(path: str):
+    """Page count of a recent PDF (cheap: fitz reads the xref lazily)."""
+    try:
+        import fitz
+        with fitz.open(path) as d:
+            return d.page_count
+    except Exception:
+        return None
+
+
+def _recent_date_str(path: str) -> str:
+    """A relative 'last opened' string from the file's mtime."""
+    import time
+    import datetime
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return ""
+    days = (time.time() - mt) / 86400.0
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "yesterday"
+    if days < 7:
+        return f"{int(days)} days ago"
+    if days < 14:
+        return "last week"
+    return datetime.date.fromtimestamp(mt).strftime("%b %d").replace(" 0", " ")
+
+
+def _recent_meta(path: str):
+    n = _recent_pages(path)
+    pages = (f"{n} page" + ("" if n == 1 else "s")) if n is not None else ""
+    return pages, _recent_date_str(path)
+
+
+class FeatureCard(QFrame):
+    """The most-recent file as a large 'Continue editing' card: a page preview,
+    the filename in the editorial serif, page count, and the clay CTA."""
+
+    def __init__(self, path: str, on_open):
+        super().__init__()
+        self.path = path
+        self._on_open = on_open
+        self.setObjectName("FeatureCard")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMaximumWidth(520)   # narrower than the Earlier rows, per the design
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setStyleSheet(
+            f"QFrame#FeatureCard {{ background: {theme.CARD_BG}; "
+            f"border: 1px solid {theme.CHROME_BORDER}; border-radius: 14px; }}")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 20, 20, 20)
+        row.setSpacing(22)
+        self.thumb = _ThumbLabel(150, 188, 8)
+        row.addWidget(self.thumb, 0, Qt.AlignTop)
+        meta = QVBoxLayout()
+        meta.setSpacing(0)
+        pages, date = _recent_meta(path)
+        opened = QHBoxLayout()
+        opened.setSpacing(6)
+        clock = QLabel()
+        clock.setPixmap(make_icon("clock", color=theme.TEXT_TERTIARY).pixmap(QSize(14, 14)))
+        olbl = QLabel(f"Last opened {date}" if date else "Recently opened")
+        olbl.setFont(theme.ui_font(12))
+        olbl.setStyleSheet(f"color: {theme.TEXT_TERTIARY};")
+        opened.addWidget(clock, 0, Qt.AlignVCenter)
+        opened.addWidget(olbl, 0, Qt.AlignVCenter)
+        opened.addStretch(1)
+        meta.addLayout(opened)
+        meta.addSpacing(8)
+        name = QLabel(os.path.basename(path))
+        name.setFont(theme.display_font(22))
+        name.setWordWrap(True)
+        name.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        meta.addWidget(name)
+        meta.addSpacing(4)
+        pl = QLabel(pages)
+        pl.setFont(theme.ui_font(12))
+        pl.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        meta.addWidget(pl)
+        meta.addSpacing(18)
+        btn = QPushButton("Continue editing")
+        btn.setObjectName("PrimaryButton")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(36)
+        btn.setLayoutDirection(Qt.RightToLeft)
+        btn.setIcon(make_icon("arrow_right", color="#FFFFFF"))
+        btn.setIconSize(QSize(16, 16))
+        btn.setStyleSheet(_primary_button_qss())
+        btn.clicked.connect(lambda: on_open(path))
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addWidget(btn)
+        btn_row.addStretch(1)
+        meta.addLayout(btn_row)
+        meta.addStretch(1)
+        row.addLayout(meta, 1)
+
+    def set_thumbnail(self, pm: QPixmap) -> None:
+        self.thumb.set_pixmap(pm)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self._on_open(self.path)
+        super().mouseReleaseEvent(event)
+
+
+class EarlierRow(QFrame):
+    """A compact 'Earlier' recent-file row: a file glyph, the name, and the page
+    count plus date. The whole row opens the file."""
+
+    def __init__(self, path: str, on_open):
+        super().__init__()
+        self.path = path
+        self._on_open = on_open
+        self.setObjectName("EarlierRow")
+        self.setMaximumWidth(700)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(path)
+        self.setStyleSheet(
+            f"QFrame#EarlierRow {{ background: {theme.CARD_BG}; "
+            f"border: 1px solid {theme.CHROME_BORDER}; border-radius: 10px; }}"
+            f"QFrame#EarlierRow:hover {{ border: 1px solid {theme.ACCENT_BORDER}; }}"
+            f"QFrame#EarlierRow QLabel {{ background: transparent; }}")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 9, 14, 9)
+        row.setSpacing(12)
+        ic = QLabel()
+        ic.setFixedWidth(28)
+        ic.setPixmap(make_icon("doc", color=theme.TEXT_TERTIARY).pixmap(QSize(26, 26)))
+        row.addWidget(ic, 0, Qt.AlignVCenter)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        nm = QLabel(os.path.basename(path))
+        nm.setFont(theme.ui_font(13, semibold=True))
+        nm.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        pages, date = _recent_meta(path)
+        sub = " · ".join(x for x in (pages, date) if x)
+        mt = QLabel(sub)
+        mt.setFont(theme.ui_font(12))
+        mt.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        col.addWidget(nm)
+        col.addWidget(mt)
+        row.addLayout(col, 1)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self._on_open(self.path)
+        super().mouseReleaseEvent(event)
+
+
 class EmptyState(QWidget):
     """Start screen shown on the canvas while no PDF is open. With recent files
     it is a GALLERY: a greeting, an Open button, and a reflowing grid of
@@ -1498,206 +1368,237 @@ class EmptyState(QWidget):
         self._loader = ThumbnailLoader(max_px=600, parent=self)
         self._loader.ready.connect(self._on_thumb_ready)
 
-        outer = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        self._hero = self._build_hero()
-        self._gallery = self._build_gallery()
-        outer.addWidget(self._hero)
-        outer.addWidget(self._gallery)
-        self._hero.hide()
-        self._gallery.hide()
+        self._last_recents = None
+        self._rail = self._build_rail()
+        self._recents = self._build_recents()
+        outer.addWidget(self._rail)
+        outer.addWidget(self._recents, 1)
+        theme.events.changed.connect(self._restyle)
 
-    # --- hero (no recents) ------------------------------------------------
-    def _build_hero(self) -> QWidget:
-        host = QWidget()
-        v = QVBoxLayout(host)
-        v.setContentsMargins(40, 40, 40, 40)
-        v.setAlignment(Qt.AlignCenter)
-        # A clay-washed rounded tile holding the document glyph in the accent --
-        # the one place the empty state carries the brand color.
-        tile = QFrame()
-        tile.setObjectName("HeroIconTile")
-        tile.setFixedSize(78, 78)
-        tile.setStyleSheet(
-            f"QFrame#HeroIconTile {{ background: {theme.ACCENT_HOVER}; "
-            f"border: 1px solid {theme.ACCENT_BORDER}; border-radius: 18px; }}")
-        tile_layout = QVBoxLayout(tile)
-        tile_layout.setContentsMargins(0, 0, 0, 0)
+    def _restyle(self) -> None:
+        """Rebuild the rail + recents pane so every inline-styled start-screen
+        widget re-reads live tokens after a light/dark switch."""
+        lay = self.layout()
+        for w in (self._rail, self._recents):
+            lay.removeWidget(w)
+            w.deleteLater()
+        self._cards = []
+        self._by_path = {}
+        self._rail = self._build_rail()
+        self._recents = self._build_recents()
+        lay.addWidget(self._rail)
+        lay.addWidget(self._recents, 1)
+        paths, pinned = self._last_recents or ([], set())
+        self.set_recents(paths, pinned)
+
+    # --- left rail: identity + a tall drag/open zone that fills it --------
+    def _build_rail(self) -> QWidget:
+        rail = QWidget()
+        rail.setObjectName("StartRail")
+        rail.setFixedWidth(330)
+        rail.setStyleSheet(
+            f"#StartRail {{ background: {theme.PANEL_BG}; "
+            f"border-right: 1px solid {theme.CHROME_BORDER}; }}")
+        v = QVBoxLayout(rail)
+        v.setContentsMargins(28, 34, 28, 22)
+        v.setSpacing(0)
+        # Identity: a light clay-wash mark + the wordmark (the one serif moment).
+        ident = QHBoxLayout()
+        ident.setSpacing(12)
+        mark = QFrame()
+        mark.setObjectName("RailMark")
+        mark.setFixedSize(42, 42)
+        mark.setStyleSheet(
+            f"#RailMark {{ background: {theme.ACCENT_HOVER}; "
+            f"border: 1px solid {theme.ACCENT_BORDER}; border-radius: 11px; }}")
+        ml = QVBoxLayout(mark)
+        ml.setContentsMargins(0, 0, 0, 0)
         glyph = QLabel()
         glyph.setAlignment(Qt.AlignCenter)
-        glyph.setPixmap(make_icon("doc", color=theme.ACCENT).pixmap(QSize(38, 38)))
-        tile_layout.addWidget(glyph, 0, Qt.AlignCenter)
-        # The ONE editorial-serif display moment (Newsreader): the largest text on
-        # screen, the only serif in the chrome.
-        headline = QLabel("Open a PDF to start editing")
-        headline.setAlignment(Qt.AlignCenter)
-        headline.setFont(theme.display_font(33))
-        headline.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
-        subtext = QLabel("Click any line of text to edit it in place.")
-        subtext.setAlignment(Qt.AlignCenter)
-        subtext.setFont(theme.ui_font(13))
-        subtext.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
-        button = QPushButton("Open PDF…")
-        button.setObjectName("PrimaryButton")
-        button.setCursor(Qt.PointingHandCursor)
-        button.setFixedHeight(36)
-        button.setMinimumWidth(160)
-        button.setStyleSheet(_PRIMARY_BUTTON_QSS)
-        button.clicked.connect(self._on_open)
-        hint = QLabel("or drag a PDF here")
-        hint.setAlignment(Qt.AlignCenter)
-        hint.setFont(theme.ui_font(12))
-        hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
-        for w, sp in ((tile, 22), (headline, 8), (subtext, 22),
-                      (button, 14), (hint, 0)):
-            v.addWidget(w, 0, Qt.AlignCenter)
-            if sp:
-                v.addSpacing(sp)
-        return host
+        glyph.setPixmap(make_icon("doc", color=theme.ACCENT).pixmap(QSize(22, 22)))
+        ml.addWidget(glyph, 0, Qt.AlignCenter)
+        idcol = QVBoxLayout()
+        idcol.setSpacing(1)
+        name = QLabel("PDF Text Editor")
+        name.setFont(theme.display_font(18))
+        name.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        tag = QLabel("Edit the real text inside any PDF, in place.")
+        tag.setFont(theme.ui_font(12))
+        tag.setWordWrap(True)
+        tag.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        idcol.addWidget(name)
+        idcol.addWidget(tag)
+        ident.addWidget(mark, 0, Qt.AlignVCenter)
+        ident.addLayout(idcol, 1)
+        v.addLayout(ident)
+        v.addSpacing(20)
+        # The drag/open zone FILLS the rail: one tall dashed card, content centred.
+        drop = QFrame()
+        drop.setObjectName("StartDrop")
+        drop.setStyleSheet(
+            f"#StartDrop {{ background: {theme.CONTROL_FILL}; "
+            f"border: 1px dashed {theme.BORDER_STRONG}; border-radius: 16px; }}")
+        dv = QVBoxLayout(drop)
+        dv.setContentsMargins(26, 26, 26, 26)
+        dv.setSpacing(0)
+        dv.addStretch(1)
+        circ = QFrame()
+        circ.setObjectName("DropIcon")
+        circ.setFixedSize(58, 58)
+        circ.setStyleSheet(
+            f"#DropIcon {{ background: {theme.SHEET_WHITE}; border-radius: 29px; "
+            f"border: 1px solid {theme.CHROME_BORDER}; }}")
+        cl = QVBoxLayout(circ)
+        cl.setContentsMargins(0, 0, 0, 0)
+        ci = QLabel()
+        ci.setAlignment(Qt.AlignCenter)
+        ci.setPixmap(make_icon("file_up", color=theme.ACCENT).pixmap(QSize(26, 26)))
+        cl.addWidget(ci, 0, Qt.AlignCenter)
+        dv.addWidget(circ, 0, Qt.AlignCenter)
+        dv.addSpacing(16)
+        d1 = QLabel("Drag a PDF here")
+        d1.setAlignment(Qt.AlignCenter)
+        d1.setFont(theme.ui_font(14, semibold=True))
+        d1.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        dv.addWidget(d1, 0, Qt.AlignCenter)
+        dv.addSpacing(14)
+        # OR divider: a hairline -- OR -- hairline row.
+        orrow = QHBoxLayout()
+        orrow.setSpacing(10)
 
-    # --- gallery (with recents) -------------------------------------------
-    def _build_gallery(self) -> QWidget:
+        def _rule():
+            ln = QFrame()
+            ln.setFixedHeight(1)
+            ln.setStyleSheet(f"background: {theme.DIVIDER};")
+            return ln
+        orlbl = QLabel("OR")
+        orlbl.setFont(theme.ui_font(11))
+        orlbl.setStyleSheet(f"color: {theme.TEXT_TERTIARY};")
+        orrow.addWidget(_rule(), 1)
+        orrow.addWidget(orlbl, 0, Qt.AlignVCenter)
+        orrow.addWidget(_rule(), 1)
+        dv.addLayout(orrow)
+        dv.addSpacing(14)
+        btn = QPushButton("Open a PDF")
+        btn.setObjectName("PrimaryButton")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFixedHeight(38)
+        btn.setMinimumWidth(150)
+        btn.setIcon(make_icon("open", color="#FFFFFF"))
+        btn.setIconSize(QSize(16, 16))
+        btn.setStyleSheet(_primary_button_qss())
+        btn.clicked.connect(self._on_open)
+        dv.addWidget(btn, 0, Qt.AlignCenter)
+        dv.addStretch(1)
+        v.addWidget(drop, 1)
+        return rail
+
+    # --- right pane: a 'Continue editing' feature card + 'Earlier' list ---
+    def _build_recents(self) -> QWidget:
         host = QWidget()
+        host.setObjectName("StartRecents")
+        host.setStyleSheet(f"#StartRecents {{ background: {theme.CANVAS_BG}; }}")
         v = QVBoxLayout(host)
-        v.setContentsMargins(44, 36, 44, 28)
+        v.setContentsMargins(40, 40, 40, 28)
         v.setSpacing(0)
-
         header = QHBoxLayout()
-        greet_col = QVBoxLayout()
-        greet_col.setSpacing(2)
-        greeting = QLabel("Welcome back")
-        greeting.setFont(theme.ui_font(20, semibold=True))
-        greeting.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
-        sub = QLabel("Open a document, or pick up where you left off.")
-        sub.setFont(theme.ui_font(13))
-        sub.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
-        greet_col.addWidget(greeting)
-        greet_col.addWidget(sub)
-        header.addLayout(greet_col)
+        title = QLabel("Recent files")
+        title.setFont(theme.ui_font(20, semibold=True))
+        title.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        header.addWidget(title, 0, Qt.AlignVCenter)
         header.addStretch(1)
-        open_btn = QPushButton("Open PDF…")
-        open_btn.setObjectName("PrimaryButton")
-        open_btn.setCursor(Qt.PointingHandCursor)
-        open_btn.setFixedHeight(36)
-        open_btn.setMinimumWidth(130)
-        open_btn.setStyleSheet(_PRIMARY_BUTTON_QSS)
-        open_btn.clicked.connect(self._on_open)
-        header.addWidget(open_btn, 0, Qt.AlignVCenter)
+        self._clear_link = QPushButton("Clear")
+        self._clear_link.setObjectName("ClearRecents")
+        self._clear_link.setCursor(Qt.PointingHandCursor)
+        self._clear_link.setStyleSheet(_clear_recents_qss())
+        if self._on_clear_recents is not None:
+            self._clear_link.clicked.connect(self._on_clear_recents)
+        header.addWidget(self._clear_link, 0, Qt.AlignVCenter)
         v.addLayout(header)
-        v.addSpacing(22)
-
-        eyebrow_row = QHBoxLayout()
-        title = QLabel("RECENT")
-        title.setFont(theme.caps_header_font())
-        title.setStyleSheet(f"color: {theme.PANEL_HEADER};")
-        eyebrow_row.addWidget(title, 0, Qt.AlignVCenter)
-        eyebrow_row.addStretch(1)
-        self._search = QLineEdit()
-        self._search.setObjectName("RecentSearch")
-        self._search.setPlaceholderText("Search recent files")
-        self._search.setClearButtonEnabled(True)
-        self._search.setFixedWidth(220)
-        self._search.setStyleSheet(_SEARCH_QSS)
-        self._search.textChanged.connect(self._apply_filter)
-        eyebrow_row.addWidget(self._search, 0, Qt.AlignVCenter)
-        v.addLayout(eyebrow_row)
-        v.addSpacing(12)
+        v.addSpacing(18)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.NoFrame)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._scroll.viewport().setStyleSheet("background: transparent;")
-        self._grid_host = QWidget()
-        self._grid_host.setStyleSheet("background: transparent;")
-        self._grid = QGridLayout(self._grid_host)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setHorizontalSpacing(_CARD_GAP)
-        self._grid.setVerticalSpacing(_CARD_GAP)
-        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._scroll.setWidget(self._grid_host)
+        body = QWidget()
+        body.setStyleSheet("background: transparent;")
+        # The body spans the pane; the feature card + rows cap their OWN width
+        # and sit left (the feature card narrower than the Earlier rows).
+        bv = QVBoxLayout(body)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(0)
+        self._feature_host = QVBoxLayout()
+        self._feature_host.setSpacing(0)
+        bv.addLayout(self._feature_host)
+        self._earlier_eyebrow = QLabel("EARLIER")
+        self._earlier_eyebrow.setFont(theme.caps_header_font())
+        self._earlier_eyebrow.setStyleSheet(f"color: {theme.PANEL_HEADER};")
+        self._earlier_eyebrow.setContentsMargins(2, 26, 0, 10)
+        bv.addWidget(self._earlier_eyebrow, 0, Qt.AlignLeft)
+        self._earlier_host = QVBoxLayout()
+        self._earlier_host.setSpacing(8)
+        bv.addLayout(self._earlier_host)
+        bv.addStretch(1)
+        self._scroll.setWidget(body)
         v.addWidget(self._scroll, 1)
 
-        v.addSpacing(8)
-        self._empty_filter = QLabel("No recent files match your search.")
-        self._empty_filter.setFont(theme.ui_font(12))
-        self._empty_filter.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
-        self._empty_filter.hide()
-        v.addWidget(self._empty_filter, 0, Qt.AlignLeft)
-
-        self._clear_link = QPushButton("Clear Recents")
-        self._clear_link.setObjectName("ClearRecents")
-        self._clear_link.setCursor(Qt.PointingHandCursor)
-        self._clear_link.setIcon(make_icon("clear_recent",
-                                            color=theme.TEXT_SECONDARY))
-        self._clear_link.setIconSize(QSize(14, 14))
-        self._clear_link.setStyleSheet(_CLEAR_RECENTS_QSS)
-        if self._on_clear_recents is not None:
-            self._clear_link.clicked.connect(self._on_clear_recents)
-        v.addWidget(self._clear_link, 0, Qt.AlignLeft)
+        self._zero = QWidget()
+        zv = QVBoxLayout(self._zero)
+        zv.setAlignment(Qt.AlignCenter)
+        zh = QLabel("No recent files yet")
+        zh.setAlignment(Qt.AlignCenter)
+        zh.setFont(theme.display_font(26))
+        zh.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
+        zs = QLabel("Open a PDF from the left and it shows up here.")
+        zs.setAlignment(Qt.AlignCenter)
+        zs.setFont(theme.ui_font(13))
+        zs.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        zv.addWidget(zh)
+        zv.addSpacing(8)
+        zv.addWidget(zs)
+        self._zero.hide()
+        v.addWidget(self._zero, 1)
         return host
 
     # --- population -------------------------------------------------------
     def set_recents(self, paths: list, pinned=None) -> None:
-        """Rebuild the gallery from ``paths`` (already filtered to existing
-        files; pinned-first ordering decided by the caller). ``pinned`` is the
-        set of pinned paths so each card draws its star correctly. An empty list
-        shows the hero call-to-action instead."""
+        """The most recent file becomes the large 'Continue editing' feature
+        card; the rest fall into the compact 'Earlier' list. No recents shows
+        the first-run zero-state."""
         self._pinned = set(pinned or ())
+        self._last_recents = (list(paths), set(pinned or ()))   # for live re-theme
         self._loader.reset()
-        for card in self._cards:
-            card.setParent(None)
-            card.deleteLater()
-        self._cards = []
+        self._clear_layout(self._feature_host)
+        self._clear_layout(self._earlier_host)
         self._by_path = {}
-
-        if not paths:
-            self._gallery.hide()
-            self._hero.show()
+        has = bool(paths)
+        self._zero.setVisible(not has)
+        self._scroll.setVisible(has)
+        self._clear_link.setVisible(has)
+        if not has:
+            self._earlier_eyebrow.hide()
             return
-        self._hero.hide()
-        self._gallery.show()
-        # The search field only earns its space once the list is long enough to
-        # be worth filtering.
-        self._search.setVisible(len(paths) > 8)
-        if not self._search.isVisible():
-            self._search.clear()
+        feat = FeatureCard(paths[0], self._on_open_recent)
+        self._by_path[paths[0]] = feat
+        self._feature_host.addWidget(feat)
+        self._loader.request(paths[0])
+        rest = paths[1:]
+        self._earlier_eyebrow.setVisible(bool(rest))
+        for p in rest:
+            self._earlier_host.addWidget(EarlierRow(p, self._on_open_recent))
 
-        for path in paths:
-            card = RecentCard(path, path in self._pinned,
-                              self._on_open_recent, self._handle_remove,
-                              self._handle_toggle_pin)
-            self._cards.append(card)
-            self._by_path[path] = card
-            self._loader.request(path)
-        self._apply_filter()
-
-    def _visible_cards(self) -> list:
-        q = self._search.text().strip().lower() if self._search.isVisible() else ""
-        out = []
-        for card in self._cards:
-            match = (not q) or q in os.path.basename(card.path).lower()
-            card.setVisible(match)
-            if match:
-                out.append(card)
-        return out
-
-    def _apply_filter(self) -> None:
-        visible = self._visible_cards()
-        self._empty_filter.setVisible(bool(self._cards) and not visible)
-        self._reflow(visible)
-
-    def _reflow(self, cards=None) -> None:
-        if cards is None:
-            cards = [c for c in self._cards if c.isVisible()]
-        while self._grid.count():
-            self._grid.takeAt(0)
-        avail = self._scroll.viewport().width() if hasattr(self, "_scroll") else 0
-        cols = max(1, (avail + _CARD_GAP) // (_CARD_W + _CARD_GAP)) if avail else 3
-        for i, card in enumerate(cards):
-            self._grid.addWidget(card, i // cols, i % cols,
-                                 Qt.AlignTop | Qt.AlignLeft)
+    def _clear_layout(self, lay) -> None:
+        while lay.count():
+            it = lay.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
 
     def _on_thumb_ready(self, path: str, pm: QPixmap) -> None:
         card = self._by_path.get(path)
@@ -1714,8 +1615,6 @@ class EmptyState(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self._gallery.isVisible():
-            self._reflow()
 
 
 def _elide(text: str, font, width: int) -> str:
@@ -1727,7 +1626,8 @@ def _elide(text: str, font, width: int) -> str:
 # ASSUMPTION: theme.py (owned by another developer) does not expose a
 # primary-button QSS helper, so the empty-state button style is defined here
 # from theme tokens. If theme adds one, swap this constant for it.
-_PRIMARY_BUTTON_QSS = f"""
+def _primary_button_qss() -> str:
+    return f"""
 QPushButton#PrimaryButton {{
     background: {theme.ACCENT_FILL};
     color: #FFFFFF;
@@ -1744,14 +1644,15 @@ QPushButton#PrimaryButton:pressed {{ background: {theme.ACCENT_DEEP}; }}
 
 # A Recent gallery card: a tile that brightens its border under the pointer
 # (the [hover="true"] dynamic property is toggled in RecentCard).
-_CARD_QSS = f"""
+def _card_qss() -> str:
+    return f"""
 QFrame#RecentCard {{
-    background: {_CARD_BG};
+    background: {theme.CARD_BG};
     border: 1px solid {theme.CHROME_BORDER};
     border-radius: {_CARD_RADIUS}px;
 }}
 QFrame#RecentCard[hover="true"] {{
-    background: {_CARD_BG_HOVER};
+    background: {theme.CARD_BG_HOVER};
     border: 1px solid {theme.ACCENT_BORDER};
 }}
 """
@@ -1771,7 +1672,8 @@ QPushButton#CardOverlay:hover { background: rgba(0,0,0,.78); }
 
 
 # The gallery's recent-file search field.
-_SEARCH_QSS = f"""
+def _search_qss() -> str:
+    return f"""
 QLineEdit#RecentSearch {{
     background: {theme.CONTROL_FILL};
     border: 1px solid {theme.CHROME_BORDER};
@@ -1787,7 +1689,8 @@ QLineEdit#RecentSearch:focus {{ border: 1px solid {theme.ACCENT_BORDER}; }}
 # The "Clear Recents" link: quiet text that only reads as a control on hover
 # (it is housekeeping, not a call to action). Uses a light wash so it is
 # visible on the dark canvas.
-_CLEAR_RECENTS_QSS = f"""
+def _clear_recents_qss() -> str:
+    return f"""
 QPushButton#ClearRecents {{
     border: none;
     border-radius: 6px;
@@ -1917,6 +1820,9 @@ class MainWindow(QMainWindow):
         self.resize(theme.WINDOW_DEFAULT_W if hasattr(theme, "WINDOW_DEFAULT_W") else 1180,
                     theme.WINDOW_DEFAULT_H if hasattr(theme, "WINDOW_DEFAULT_H") else 920)
         self.setStyleSheet(theme.global_stylesheet())
+        # Live re-theme: the window owns its own stylesheet (re-applied here) plus
+        # a few widgets that paint with live tokens outside the global sheet.
+        theme.events.changed.connect(self._on_theme_changed)
 
         # Undo stack: commands delegate to the model (BUILD_SPEC §6.4).
         self.undo_stack = QUndoStack(self)
@@ -1953,37 +1859,9 @@ class MainWindow(QMainWindow):
         col.addWidget(self.canvas, 1)
         # OCR progress now lives ON each page (the frosted per-page cover + bar),
         # so there is no top progress strip.
-        # DEBUG console: a thin, always-visible top strip with two view toggles --
-        # MAP (the per-character + per-SPACE cells the caret/erase actually use, so a
-        # gap that collapses to one space shows as one wide red cell) and INVERTED (a
-        # negative of every page, so faint ink + what the binary map keys on reads clearly).
-        self._debug_strip = QWidget()
-        self._debug_strip.setObjectName("DebugStrip")
-        _dbl = QHBoxLayout(self._debug_strip)
-        _dbl.setContentsMargins(12, 3, 12, 3)
-        _dbl.setSpacing(14)
-        self._chk_debug_map = QCheckBox("Map view")
-        self._chk_debug_invert = QCheckBox("Inverted view")
-        self._chk_debug_borders = QCheckBox("Table borders")
-        self._chk_plain_fonts = QCheckBox("Plain fonts (no decorative)")
-        from ..ocr import fontbank as _FB
-        self._chk_plain_fonts.setChecked(bool(_FB.EXCLUDE_DECORATIVE))
-        self._chk_debug_map.toggled.connect(self.view.set_debug_map)
-        self._chk_debug_invert.toggled.connect(self.view.set_debug_invert)
-        self._chk_debug_borders.toggled.connect(self.view.set_debug_borders)
-        self._chk_plain_fonts.toggled.connect(self._on_plain_fonts_toggle)
-        _acc = theme.color_accent().name()
-        _dbl.addWidget(QLabel("Debug"))
-        _dbl.addWidget(self._chk_debug_map)
-        _dbl.addWidget(self._chk_debug_invert)
-        _dbl.addWidget(self._chk_debug_borders)
-        _dbl.addWidget(self._chk_plain_fonts)
-        _dbl.addStretch(1)
-        self._debug_strip.setStyleSheet(
-            f"#DebugStrip {{ border-bottom: 1px solid {_acc}; }}"
-            f"#DebugStrip QLabel {{ color: {theme.TEXT_PRIMARY}; font-weight: 600; }}"
-            f"#DebugStrip QCheckBox {{ color: {theme.TEXT_PRIMARY}; }}")
-        col.insertWidget(0, self._debug_strip)
+        # DEBUG toggles (Map / Inverted / Table borders / Plain fonts) live in a
+        # native "Debug" menu (dev builds only), not an in-app strip -- built in
+        # _build_menubar so they stay out of the document chrome.
         # Host the document view in a stack so Settings can appear as an in-app
         # PAGE (a second stack page) rather than a separate window. The document
         # view stays at index 0; the settings page is added lazily.
@@ -2439,10 +2317,10 @@ class MainWindow(QMainWindow):
         # Fresh re-OCR: delete the page's whole existing OCR layer (incl. any
         # edits) and recognize the raw scan again from scratch.
         self.act_ocr_reset_page = mk(
-            "Re-OCR This Page (fresh)…", None,
+            "Re-OCR This Page…", None,
             lambda: self._do_ocr(scope="page", fresh=True))
         self.act_ocr_reset_document = mk(
-            "Re-OCR Document (fresh)…", None,
+            "Re-OCR Document…", None,
             lambda: self._do_ocr(scope="document", fresh=True))
         for act in (self.act_properties, self.act_export_images,
                     self.act_export_text, self.act_print, self.act_optimize,
@@ -2767,6 +2645,21 @@ class MainWindow(QMainWindow):
         twl.addWidget(self.filename_label)
         twl.addSpacing(10)
         twl.addWidget(self.titlebar_meta)
+
+        # Home: return to the start page (recents / open) without closing tabs.
+        self.act_home = QAction(make_icon("home"), "Home", self)
+        self.act_home.setToolTip("Back to the start page")
+        self.act_home.triggered.connect(self._go_home)
+        home_btn = QToolButton()
+        home_btn.setObjectName("TopGlobalBtn")
+        home_btn.setDefaultAction(self.act_home)
+        home_btn.setCursor(Qt.PointingHandCursor)
+        # Left breathing room so the home button is not jammed against the edge
+        # (the toolbar's own QSS padding is not honoured for the first widget).
+        lead = QWidget()
+        lead.setFixedWidth(10)
+        bar.addWidget(lead)
+        bar.addWidget(home_btn)
         bar.addWidget(titlewrap)
 
         # Right spacer.
@@ -3323,19 +3216,12 @@ class MainWindow(QMainWindow):
         self.toolbar.show()
 
     def _sync_toggle_labels(self, *_args) -> None:
-        """Show <-> Hide flips for the View menu's checkable panel toggles
-        (navigation M2). Label follows the action's checked state (the
-        strip/dock state mirrors), not raw widget visibility, so the
-        empty state's temporary dock hide never lies about intent."""
-        self.act_toggle_pages.setText(
-            "Hide Pages Sidebar" if self.act_toggle_pages.isChecked()
-            else "Show Pages Sidebar")
-        self.act_show_comments.setText(
-            "Hide Comments" if self.act_show_comments.isChecked()
-            else "Show Comments")
-        self.act_toggle_bookmarks.setText(
-            "Hide Bookmarks" if self.act_toggle_bookmarks.isChecked()
-            else "Show Bookmarks")
+        """Fixed labels for the View panel toggles; the CHECKMARK shows on/off
+        state (standard), so the label no longer flips Show<->Hide (which, with
+        the checkmark, was redundant). Runs at startup + on every toggle."""
+        self.act_toggle_pages.setText("Pages Sidebar")
+        self.act_show_comments.setText("Comments")
+        self.act_toggle_bookmarks.setText("Bookmarks")
 
     def _build_menubar(self) -> None:
         """The 7-menu skeleton: File / Edit / View / Tools / Document / Window /
@@ -3367,8 +3253,12 @@ class MainWindow(QMainWindow):
         self.menu_view = self._build_menu_view(bar)
         self.menu_tools = self._build_menu_tools(bar)
         self.menu_document = self._build_menu_document(bar)
+        self._build_menu_ocr(bar)         # OCR home -- between Document and Window
         self.menu_window = self._build_menu_window(bar)
         self.menu_help = self._build_menu_help(bar)
+        from .. import appconfig
+        if appconfig.IS_DEV:
+            self._build_menu_debug(bar)   # dev-only debug view toggles, far right
         # The View menu's checkable panel toggles flip Show <-> Hide with
         # their checked state (navigation M2: the static labels read "Show"
         # even while the panel was open). toggled covers the action-driven
@@ -3467,6 +3357,88 @@ class MainWindow(QMainWindow):
         nav.addAction(self.act_last)
         nav.addAction(self.act_goto)
         self.menu_page_nav = nav
+        m.addSeparator()
+        self._build_appearance_menu(m)
+        return m
+
+    def _build_appearance_menu(self, m: QMenu) -> None:
+        """Light / Dark / Use system — the in-app Clay mode toggle (sun/moon).
+        Persisted via the QSettings seam; 'Use system' follows the OS live."""
+        from PySide6.QtGui import QActionGroup
+        sub = m.addMenu(make_icon("sun"), "Appearance")
+        grp = QActionGroup(self)
+        grp.setExclusive(True)
+        self._appearance_actions: dict[str, QAction] = {}
+        for label, pref in (("Light", "light"), ("Dark", "dark"),
+                            ("Use system", "auto")):
+            a = sub.addAction(label)
+            a.setCheckable(True)
+            grp.addAction(a)
+            a.triggered.connect(lambda _checked=False, p=pref:
+                                self._set_appearance(p))
+            self._appearance_actions[pref] = a
+        self._sync_appearance_checks()
+
+    def _appearance_pref(self) -> str:
+        return self._settings().value("appearance/mode", "auto") or "auto"
+
+    def _resolve_appearance(self, pref: "str | None" = None) -> str:
+        pref = pref or self._appearance_pref()
+        return pref if pref in ("light", "dark") else theme.detect_os_mode()
+
+    def _set_appearance(self, pref: str) -> None:
+        self._settings().setValue("appearance/mode", pref)
+        theme.retheme(self._resolve_appearance(pref))
+        self._sync_appearance_checks()
+
+    def _sync_appearance_checks(self) -> None:
+        acts = getattr(self, "_appearance_actions", None)
+        if acts:
+            cur = self._appearance_pref()
+            for p, a in acts.items():
+                a.setChecked(p == cur)
+
+    def _apply_saved_appearance(self) -> None:
+        """Honor a saved Light/Dark choice at startup (theme imported with the
+        OS mode; a fixed pref overrides). Called once after construction."""
+        theme.retheme(self._resolve_appearance())
+        self._sync_appearance_checks()
+
+    def on_os_appearance_changed(self) -> None:
+        """OS flipped light/dark while running: follow it only under 'Use system'."""
+        if self._appearance_pref() == "auto":
+            theme.retheme(theme.detect_os_mode())
+
+    @staticmethod
+    def _menu_toggle(m: QMenu, label: str, slot, checked: bool = False) -> QAction:
+        a = m.addAction(label)
+        a.setCheckable(True)
+        a.setChecked(checked)
+        a.toggled.connect(slot)
+        return a
+
+    def _build_menu_debug(self, bar: QMenuBar) -> None:
+        """Dev-only debug VIEW toggles (Map / Inverted / Table borders) tucked
+        into the native menu bar instead of an in-app strip."""
+        m = bar.addMenu("Debug")
+        self.act_debug_map = self._menu_toggle(m, "Map view", self.view.set_debug_map)
+        self.act_debug_invert = self._menu_toggle(m, "Inverted view", self.view.set_debug_invert)
+        self.act_debug_borders = self._menu_toggle(m, "Table borders", self.view.set_debug_borders)
+
+    def _build_menu_ocr(self, bar: QMenuBar) -> QMenu:
+        """The OCR home in the menu bar: make scanned pages editable, undo it,
+        and the OCR config. Always shown (OCR is a product feature, not dev)."""
+        m = bar.addMenu("OCR")
+        m.addAction(self.act_ocr_page)
+        m.addAction(self.act_ocr_document)
+        m.addAction(self.act_ocr_reset_page)
+        m.addAction(self.act_ocr_reset_document)
+        m.addSeparator()
+        from ..ocr import fontbank as _FB
+        self.act_plain_fonts = self._menu_toggle(
+            m, "Plain fonts (no decorative)", self._on_plain_fonts_toggle,
+            bool(_FB.EXCLUDE_DECORATIVE))
+        self.menu_ocr = m
         return m
 
     def _build_menu_tools(self, bar: QMenuBar) -> QMenu:
@@ -3510,12 +3482,7 @@ class MainWindow(QMainWindow):
         anchor = self._menu_anchor(m, "doc_file")
         # ws6 M4 (doc tools §2.7): Security inserted AT the doc_file anchor.
         m.insertAction(anchor, self.act_security)
-        # OCR (OCR_SPEC): make scanned pages editable. Own separator group.
-        m.addSeparator()
-        m.addAction(self.act_ocr_page)
-        m.addAction(self.act_ocr_document)
-        m.addAction(self.act_ocr_reset_page)
-        m.addAction(self.act_ocr_reset_document)
+        # OCR actions moved to their own top-level OCR menu (_build_menu_ocr).
         return m
 
     def _build_menu_window(self, bar: QMenuBar) -> QMenu:
@@ -5095,6 +5062,19 @@ class MainWindow(QMainWindow):
         if wsp is not None and hasattr(self, "tab_bar"):
             self.tab_bar.set_tab_dirty(wsp.active_index, dirty)
 
+    def _on_theme_changed(self) -> None:
+        """Live mode switch: re-apply the window's own stylesheet (the global
+        app sheet is re-applied by ``theme.retheme``) and refresh the bits that
+        paint with live tokens outside that sheet. The canvas refreshes itself
+        off the same ``theme.events.changed`` signal."""
+        self.setStyleSheet(theme.global_stylesheet())
+        self._refresh_dirty_dot()                 # dot + Save CTA colors
+        if hasattr(self, "form_badge"):
+            self.form_badge.setStyleSheet(f"color: {theme.ACCENT};")
+        self._sync_appearance_checks()
+        if hasattr(self, "empty_state"):
+            self.empty_state._restyle()           # start-screen cards / hero
+
     def _refresh_dirty_dot(self) -> None:
         """The top-bar status dot: GREEN when the document is saved/clean, the
         clay accent when there are unsaved changes. Hidden with no document."""
@@ -5171,6 +5151,7 @@ class MainWindow(QMainWindow):
         a ``None`` answer (Cancel) aborts silently."""
         password = None
         idx = None
+        count_before = self.workspace.count   # to detect an already-open de-dup
         for attempt in range(self._PASSWORD_ATTEMPTS + 1):
             try:
                 idx = self.workspace.open(path, password)
@@ -5192,6 +5173,13 @@ class MainWindow(QMainWindow):
         _mark_file_recently_used(path)   # show in Finder Recents + Dock recents
         self._hide_empty_state()
         self._activate_document(idx)
+        # Already open (e.g. "Continue editing" on the live doc, or re-open from
+        # recents): behave exactly like clicking its tab -- switch and stop. Do
+        # NOT run the fresh-open block below, which would re-OCR the in-memory doc
+        # (its OCR text is staged boxes, not a real text layer, so image_only_pages
+        # still reports it as a scan) and discard the session's unsaved edits.
+        if self.workspace.count == count_before:
+            return
         self._toast(
             f"Opened {os.path.basename(path)}", 2500
         )
@@ -5653,6 +5641,7 @@ class MainWindow(QMainWindow):
             self._sync_all()
             self._kick_persist()
             return
+        self._hide_empty_state()   # returning to a tab leaves the start page
         self.view.set_document(document)
         self.sidebar.set_document(document)
         self.sidebar.set_current_page(self.view_page_index())
@@ -7285,11 +7274,12 @@ class MainWindow(QMainWindow):
         # centered empty-state CTA left of true window center (the canvas width is
         # reduced by the dock). The dock has NoDockWidgetFeatures, so hiding it
         # leaves no ghost handle; it reappears on open via this same path.
+        _home = getattr(self, "_home_active", False)   # start page over a live doc
         if hasattr(self, "format_dock"):
-            self.format_dock.setVisible(has_doc)
+            self.format_dock.setVisible(has_doc and not _home)
             # Size the Format column to the current window width on open (the
             # resize path keeps it proportional as the window changes).
-            if has_doc:
+            if has_doc and not _home:
                 self._apply_left_dock_width()
         # Mirror the same treatment for the Pages dock: in the empty state a blank
         # 220px gray panel both reads as unfinished and shoves the centered CTA
@@ -7536,6 +7526,7 @@ class MainWindow(QMainWindow):
     # Empty state
     # ===================================================================
     def _hide_empty_state(self) -> None:
+        self._home_active = False   # leaving the start page; docks may return
         if self.empty_state.isHidden():
             return
         # Stop intercepting input immediately so state is correct the instant a
@@ -7556,6 +7547,21 @@ class MainWindow(QMainWindow):
 
         self._fade_anim.finished.connect(done)
         self._fade_anim.start()
+
+    def _go_home(self) -> None:
+        """Show the start page over the editor (recents + open) without closing
+        any open tabs. Clicking a tab or opening a file returns to editing."""
+        self._home_active = True
+        self._sync_actions()        # collapse the Format / Pages docks so the
+        self._show_empty_state()    # start page reads full-bleed, not squeezed
+        # Keep every open document reachable while the start page is up: force the
+        # tab strip visible even for a single doc (it normally hides at <=1), so an
+        # unsaved or just-opened file is never stranded behind the start page.
+        # Its tab sits above the canvas, so it shows over the overlay; clicking it
+        # returns to the live doc with edits intact (a new doc has no recents row).
+        if self.workspace.count >= 1:
+            self._tab_strip.setVisible(True)
+        QTimer.singleShot(0, self._position_empty_state)   # after docks collapse
 
     def _show_empty_state(self) -> None:
         self._refresh_empty_recents()
@@ -7579,7 +7585,8 @@ class MainWindow(QMainWindow):
         on, AND a wide-enough window: it auto-yields its width to the document
         when the window is narrow, so the page stays visible on small screens.
         Widen the window (or it auto-returns above 1024px) to get it back."""
-        return (self.document is not None
+        return (not getattr(self, "_home_active", False)
+                and self.document is not None
                 and getattr(self, "act_toggle_pages", None) is not None
                 and self.act_toggle_pages.isChecked()
                 and self.width() >= _PAGES_AUTOHIDE_W)

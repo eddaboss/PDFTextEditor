@@ -1,8 +1,9 @@
 """Generate the macOS app icon (assets/AppIcon.icns) from a drawn 1024 master.
 
-A blue rounded-square (squircle-ish) with a white document page, grey text
-lines, and an accent text-edit caret -- reads as a text/PDF editor. Run with
-the venv python; requires Pillow + macOS `iconutil`.
+The Clay brand mark: a SOLID terracotta squircle (no gradient -- Clay forbids
+them) with a centered white I-beam (text-cursor) mark, matching the design
+system's brand-wordmark. Run with the venv python; requires Pillow + macOS
+`iconutil`.
 """
 import os
 import subprocess
@@ -11,52 +12,27 @@ import sys
 from PIL import Image, ImageDraw
 
 S = 1024
-ACCENT = (194, 100, 63)       # clay-500 #C2643F (burnt orange, app accent)
-ACCENT_DARK = (139, 62, 35)   # clay-700 #8B3E23 (gradient foot)
-CARET = (224, 64, 64)
-INK = (60, 62, 66)
+CLAY = (194, 100, 63)         # clay-500 #C2643F -- the one accent, solid fill
+WHITE = (255, 255, 255, 255)
 
 img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
 d = ImageDraw.Draw(img)
 
-# Background squircle (vertical accent gradient on a rounded square).
-bg = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-bgd = ImageDraw.Draw(bg)
-for y in range(S):
-    t = y / S
-    r = int(ACCENT[0] * (1 - t) + ACCENT_DARK[0] * t)
-    g = int(ACCENT[1] * (1 - t) + ACCENT_DARK[1] * t)
-    b = int(ACCENT[2] * (1 - t) + ACCENT_DARK[2] * t)
-    bgd.line([(0, y), (S, y)], fill=(r, g, b, 255))
-mask = Image.new("L", (S, S), 0)
-ImageDraw.Draw(mask).rounded_rectangle(
-    [80, 80, S - 80, S - 80], radius=200, fill=255)
-img.paste(bg, (0, 0), mask)
-d = ImageDraw.Draw(img)
+# Solid clay squircle (no gradient).
+d.rounded_rectangle([80, 80, S - 80, S - 80], radius=220, fill=CLAY + (255,))
 
-# White document page with a soft shadow.
-px0, py0, px1, py1 = 300, 250, 724, 800
-shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-ImageDraw.Draw(shadow).rounded_rectangle(
-    [px0 + 14, py0 + 22, px1 + 14, py1 + 22], radius=34, fill=(0, 0, 0, 70))
-img.alpha_composite(shadow)
-d.rounded_rectangle([px0, py0, px1, py1], radius=34, fill=(255, 255, 255, 255))
-
-# Text lines on the page.
-lx0 = px0 + 70
-lw = (px1 - px0) - 140
-line_ys = [py0 + 130, py0 + 230, py0 + 330, py0 + 430]
-widths = [1.0, 0.82, 0.92, 0.6]
-for y, wf in zip(line_ys, widths):
-    d.rounded_rectangle([lx0, y, lx0 + int(lw * wf), y + 34],
-                        radius=17, fill=(200, 204, 210, 255))
-
-# Accent text-edit caret over the last line (the "editing" cue).
-cx = lx0 + int(lw * 0.6) + 26
-cy0, cy1 = py0 + 408, py0 + 472
-d.rectangle([cx - 5, cy0, cx + 5, cy1], fill=CARET)
-d.rectangle([cx - 18, cy0, cx + 18, cy0 + 10], fill=CARET)
-d.rectangle([cx - 18, cy1 - 10, cx + 18, cy1], fill=CARET)
+# Centered white I-beam mark: a vertical stem with top + bottom serifs -- the
+# text-cursor glyph that is Clay's brand mark (edit the words inside a PDF).
+cx = S // 2
+stem_w, serif_w = 78, 230
+top, bot = 300, 724
+serif_h = 50
+r = stem_w // 2
+d.rounded_rectangle([cx - r, top, cx + r, bot], radius=r, fill=WHITE)        # stem
+d.rounded_rectangle([cx - serif_w // 2, top, cx + serif_w // 2, top + serif_h],
+                    radius=serif_h // 2, fill=WHITE)                          # top serif
+d.rounded_rectangle([cx - serif_w // 2, bot - serif_h, cx + serif_w // 2, bot],
+                    radius=serif_h // 2, fill=WHITE)                          # bottom serif
 
 os.makedirs("assets", exist_ok=True)
 img.save("assets/icon_1024.png")

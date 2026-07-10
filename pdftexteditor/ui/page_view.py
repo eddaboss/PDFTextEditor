@@ -1534,6 +1534,7 @@ class PageView(QGraphicsView):
             | QGraphicsView.DontAdjustForAntialiasing)
         self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
         self.setBackgroundBrush(QBrush(theme.color_canvas_bg()))
+        theme.events.changed.connect(self._on_theme_changed)
         self.setAlignment(Qt.AlignCenter)
         # The vertical scrollbar is pinned ON (not AsNeeded) so the viewport
         # width is STABLE: under fit-width, an AsNeeded bar flickers on/off as
@@ -1903,6 +1904,13 @@ class PageView(QGraphicsView):
         self._image_place_drag: tuple[int, QPointF] | None = None
         self._image_place_rubber: QGraphicsRectItem | None = None
         self._drag_image_preview: QGraphicsPixmapItem | None = None
+
+    def _on_theme_changed(self) -> None:
+        """Live mode switch: re-fill the gutter and repaint. The page pixmaps are
+        the user's white PDF (mode-independent); selection/edit overlays read
+        live theme QColors at paint time, so a viewport repaint is enough."""
+        self.setBackgroundBrush(QBrush(theme.color_canvas_bg()))
+        self.viewport().update()
 
     # =====================================================================
     # Construction / document
@@ -5155,6 +5163,7 @@ class PageView(QGraphicsView):
         cache: list = []
         if self.document is None or not self._layers:
             return cache
+        prior = self._debug_cache or []          # carry edited boxes' map across a full rebuild
         for layer in self._layers:
             page = layer.page_index
             if only_page is not None and page != only_page:
@@ -5165,11 +5174,19 @@ class PageView(QGraphicsView):
                 page_rgb = None
             for box in self.document.new_boxes(page):
                 rm = getattr(box, "render_mode", 0)
-                # Un-edited scan overlays only (render_mode 3). An EDITED box (render_mode 0)
-                # gets its map from _remap_one_box on edit-close (its live edited geometry);
-                # adding a committed full-text entry here DOUBLED with the live map.
+                # Un-edited scan overlays (render_mode 3) are measured below. An EDITED box
+                # (render_mode 0) CANNOT be re-measured here -- measure_box_glyphs re-segments
+                # the RAW scan's ORIGINAL ocr_text, not the edited glyphs -- so CARRY FORWARD its
+                # existing per-glyph map entries (spliced by _remap_one_box on edit-close) instead
+                # of dropping it. Without this, a reload's full rebuild silently removed the edited
+                # line from the map ("the map dies after an edit"). Native (non-scan) boxes have no
+                # prior entries, so nothing is carried and they stay off the map as before.
                 if rm != 3:
-                    dlog("MAP", "skip_box", box=id(box), page=page, rm=rm, reason="render_mode!=3")
+                    bid = getattr(box, "box_id", None) or id(box)
+                    carried = [e for e in prior if e[5] == bid]
+                    cache.extend(carried)
+                    if not carried:
+                        dlog("MAP", "skip_box", box=id(box), page=page, rm=rm, reason="render_mode!=3")
                     continue
                 try:
                     meas = self.document.measure_box_glyphs(box, page_rgb=page_rgb)
@@ -5225,10 +5242,37 @@ class PageView(QGraphicsView):
                 continue
             if len(edges) < 2:
                 continue
-            live.append((page, edges, line_text,
-                         float(ml.get("top", 0.0)),
-                         float(ml.get("bottom", ml.get("top", 0.0))), eid,
-                         self._glyph_boxes_disp(ml)))
+            top_d = float(ml.get("top", 0.0))
+            bot_d = float(ml.get("bottom", top_d))
+            # LIVE per-glyph boxes: x from the caret EDGES (so the boxes follow what you type),
+            # y from each glyph's REAL ink top/bottom for every UNCHANGED prefix/suffix glyph --
+            # reuse the frozen edit-open per-glyph boxes, since a kept scan glyph's height never
+            # changes -- and the line band ONLY for the TYPED middle (new glyphs have no scan ink
+            # to measure). The old version used the line band for EVERY glyph, drawing uniform
+            # "standard-height" boxes; since _remap_one_box reuses this live entry, that flat band
+            # then persisted into the committed map. Anchoring kept glyphs to their ink y restores
+            # the per-glyph map while still tracking the caret horizontally.
+            ot_l = ml.get("text", "") or ""
+            orig = self._glyph_boxes_disp(ml)            # frozen per-glyph ink (display pts)
+            _n = min(len(ot_l), len(line_text))
+            p = 0
+            while p < _n and ot_l[p] == line_text[p]:
+                p += 1
+            s = 0
+            while s < _n - p and ot_l[-1 - s] == line_text[-1 - s]:
+                s += 1
+            gb = None
+            if len(edges) >= 2:
+                gb = []
+                for k in range(len(edges) - 1):
+                    y0, y1 = top_d, bot_d
+                    oi = (k if k < p
+                          else (len(ot_l) - (len(line_text) - k)
+                                if k >= len(line_text) - s else None))
+                    if orig and oi is not None and 0 <= oi < len(orig) and orig[oi]:
+                        y0, y1 = orig[oi][1], orig[oi][3]
+                    gb.append((edges[k], y0, edges[k + 1], y1))
+            live.append((page, edges, line_text, top_d, bot_d, eid, gb))
         self._debug_live = live
         dlog("MAP", "remap_edited", box=eid, lines=len(live))
         self.viewport().update()
@@ -5356,6 +5400,8 @@ class PageView(QGraphicsView):
             fmt.setFontItalic(bool(italic))
             if rs is not None and getattr(rs, "color", None):
                 fmt.setForeground(QColor.fromRgbF(*rs.color))
+            if rs is not None and getattr(rs, "underline", False):
+                fmt.setFontUnderline(True)
             cursor.mergeCharFormat(fmt)
             pos += len(text)
 
@@ -5393,6 +5439,7 @@ class PageView(QGraphicsView):
         base = editor.font()
         base_bold, base_italic = base.bold(), base.italic()
         base_family = base.family()
+        base_underline = base.underline()
         runs: list = []
         block = editor.document().begin()
         while block.isValid():
@@ -5419,9 +5466,14 @@ class PageView(QGraphicsView):
                         italic = cf.fontItalic()
                     else:
                         italic = base_italic
-                    rs = None
+                    # UNDERLINE is a per-run style on the VECTOR (text-layer) path too, so
+                    # read it regardless of ``rich`` (colour/family stay scanned-only). Qt
+                    # stores underline as TextUnderlineStyle (NOT the FontUnderline property,
+                    # whose hasProperty() is always False), so read it via fontUnderline();
+                    # an unset fragment reports False, so only user-underlined runs carry it.
+                    underline = bool(cf.fontUnderline()) or base_underline
+                    color = family = None
                     if rich:
-                        color = family = None
                         if cf.hasProperty(QTextFormat.ForegroundBrush):
                             col = cf.foreground().color()
                             if col.alpha() > 0:      # transparent default == no override
@@ -5432,8 +5484,9 @@ class PageView(QGraphicsView):
                                    else fams if isinstance(fams, str) else None)
                             if fam and fam != base_family:
                                 family = fam
-                        if color is not None or family is not None:
-                            rs = RunStyle(font_family=family, color=color)
+                    rs = (RunStyle(font_family=family, color=color, underline=underline)
+                          if (underline or color is not None or family is not None)
+                          else None)
                     runs.append((text, bold, italic, rs) if rs is not None
                                 else (text, bold, italic))
                 it += 1
@@ -5696,7 +5749,7 @@ class PageView(QGraphicsView):
         runs = self._extract_selection_runs(self._editor)
         if not runs:
             return False
-        text = "".join(t for t, _, _ in runs)
+        text = "".join(r[0] for r in runs)     # runs may carry a 4th RunStyle element
         md = QMimeData()
         md.setText(text)
         md.setData(RUNS_MIME, QByteArray(
@@ -5745,10 +5798,14 @@ class PageView(QGraphicsView):
                 # NewBox editor: uniform style only -> plain text.
                 cursor.insertText(decoded["text"])
             else:
-                for t, b, i in decoded["runs"]:
+                for seg in decoded["runs"]:
+                    t, b, i = seg[0], seg[1], seg[2]
+                    rs = seg[3] if len(seg) > 3 else None
                     fmt = QTextCharFormat()
                     fmt.setFontWeight(QFont.Bold if b else QFont.Normal)
                     fmt.setFontItalic(bool(i))
+                    if rs is not None and getattr(rs, "underline", False):
+                        fmt.setFontUnderline(True)
                     cursor.insertText(t, fmt)
             self._editor.setTextCursor(cursor)
             return True
@@ -8180,7 +8237,11 @@ class PageView(QGraphicsView):
         if isinstance(box, NewBox):
             return getattr(box, "render_mode", 0) == 0
         page = getattr(box, "page_index", self._page_index)
-        return self.document.staged_text(page, box) != box.text
+        # A STYLE-only edit (underline / bold / italic on a selection, text
+        # unchanged) stages rich runs but no text change -- still an edit, so it
+        # must wear the affordance. Check staged runs too, not just the text.
+        return (self.document.staged_text(page, box) != box.text
+                or self.document.staged_runs(page, box) is not None)
 
     def is_unsaved_edit(self, box) -> bool:
         """True when ``box`` carries an edit made since the last save. Drives

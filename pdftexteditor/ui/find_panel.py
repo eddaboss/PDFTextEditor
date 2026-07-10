@@ -67,6 +67,12 @@ class FindReplacePanel(QWidget):
         self._last_flags = (False, False)
 
         self._build()
+        theme.events.changed.connect(self._restyle)
+
+    # --- theming ---------------------------------------------------------
+    def _restyle(self) -> None:
+        """Re-read live tokens after a light/dark switch (count_label color)."""
+        self.count_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
 
     # --- construction ----------------------------------------------------
     def _build(self) -> None:

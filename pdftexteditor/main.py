@@ -172,6 +172,14 @@ def main() -> int:
     window = MainWindow()
     window._restore_window_geometry()   # reopen at the last size + position
     window._enable_persistence()        # flush geometry+session on crash/quit
+    window._apply_saved_appearance()    # honor a saved Light/Dark choice
+    # Follow the OS live: when macOS/Windows flips appearance while we run, the
+    # window re-themes (only under the 'Use system' preference). Qt 6.5+ signal.
+    try:
+        app.styleHints().colorSchemeChanged.connect(
+            lambda _scheme: window.on_os_appearance_changed())
+    except (AttributeError, TypeError):
+        pass
     window.show()
     app.installEventFilter(_FileOpenFilter(window))
     cli_paths = [p for p in sys.argv[1:]

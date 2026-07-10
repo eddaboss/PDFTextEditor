@@ -53,7 +53,14 @@ def sample_ink_paper(scan_rgb: np.ndarray, ink_mask: np.ndarray | None = None,
         if ink_mask is not None:
             core = core & ink_mask
     if int(np.count_nonzero(core)) >= 5:
-        ink = np.median(flat[core.reshape(-1)], axis=0)
+        # DEEPEST HALF of the cores, not their median: the cov>0.7 set still includes the
+        # 0.7-coverage rim, whose lighter pixels drag the median up to a mid-grey -- so the synth's
+        # ink never reaches the real stroke's dark peak and reads grey next to it. Take the darker
+        # half of the core pixels for the true deep-stroke colour. Self-calibrating: a faint scan's
+        # cores are all faint, so its ink stays faint.
+        cpx = flat[core.reshape(-1)]
+        o = np.argsort(cpx.mean(1))
+        ink = np.median(cpx[o[:max(1, len(o) // 2)]], axis=0)
     elif ink_mask is not None and ink_mask.sum() >= 20:
         px = scan_rgb[ink_mask].astype(np.float32)
         o = np.argsort(px.mean(1))
@@ -343,6 +350,7 @@ def apply_residual_filter(clean_strip_rgb, ink, paper, prof, R):
     paper = np.asarray(paper, np.float32).reshape(1, 1, 3)
     bands = prof.get("bands") if isinstance(prof, dict) else prof
     bg = prof.get("bg") if isinstance(prof, dict) else None
+    he = prof.get("hard_edge") if isinstance(prof, dict) else None
     g = clean_strip_rgb.mean(2) if clean_strip_rgb.ndim == 3 else clean_strip_rgb
     base = np.clip((255.0 - g) / 255.0, 0.0, 1.0)
     solid = base > 0.45
@@ -359,7 +367,10 @@ def apply_residual_filter(clean_strip_rgb, ink, paper, prof, R):
     solid_d = max(inter, key=lambda d: float(bands[d].mean())) if inter else dmax
     cov2 = np.zeros((H, W), np.float32)
     # Coherent field for the SOLID CORE only; the edge is laid SCATTERED (hard 1px jaggedness).
-    fld = _field((H, W), R, cell=2)
+    # cell=3 (was 2): the interior mottle patches are COARSER, so they survive the downsample
+    # to normal viewing zoom instead of averaging back to flat grey (the synth read too clean
+    # next to the scan's coarse fax breaks at 1x-2.5x view; only visible at 8x+).
+    fld = _field((H, W), R, cell=3)
     fld = np.clip(fld + (R.rand(H, W).astype(np.float32) - 0.5) * 0.12, 0.0, 1.0)
     for d in range(dmin, dmax + 1):
         band = sd == d
@@ -374,9 +385,12 @@ def apply_residual_filter(clean_strip_rgb, ink, paper, prof, R):
             # OUTSIDE the letterform / boundary: keep ONLY the hard protruding spikes (high
             # samples) and DROP the continuous low-grey antialiasing rim -- that rim is what
             # widens every stroke and bolds it. Result: sparse hard black specks protruding past
-            # the edge (the speckle), no added width.
+            # the edge (the speckle), no added width. This is measured per line, so a clean scan
+            # yields few spikes and a faxy scan yields many.
             samp = s[R.randint(0, s.size, nb)]
             samp = np.where(samp >= 0.45, samp, 0.0)
+            if he:                                  # crisp scan -> shed most protruding spikes so a
+                samp = np.where(R.rand(nb) < (1.0 - float(he)), samp, 0.0)  # clean digit is not furry
         elif d == 1:
             # inner edge, scattered: white bites raggedly INTO the stroke (no added width).
             samp = s[R.randint(0, s.size, nb)]
@@ -411,10 +425,23 @@ def apply_residual_filter(clean_strip_rgb, ink, paper, prof, R):
     # scan's (a high percentile, so it never exceeds the real ink and adapts to a faint scan).
     core = prof.get("core") if isinstance(prof, dict) else None
     if core and target and core > target + 0.02:
-        solid = cov2 > 0.55                      # the true core only -- leave mid-tones light
+        # >0.85 (was >0.55): floor ONLY the already-darkest pixels up to the scan's core. The old
+        # 0.55 gate darkened the whole interior to near-solid, erasing the coarse toner-starvation
+        # BREAKS that make the scan read as faxed -- the synth came out a uniform dark block that
+        # looked "not degraded" at normal zoom. Leaving mid-tones (0.55-0.85) light keeps the breaks.
+        solid = cov2 > 0.85
         if solid.any():
             cov2[solid] = np.maximum(cov2[solid],
                                      np.clip(float(core) - 0.06 + 0.10 * fld[solid], 0.0, 1.0))
+    # EDGE CRISPNESS: the scan's measured crispness (``hard_edge``) was never applied, so the synth
+    # keeps a furry mid-grey fringe of half-ink speckle around every stroke. On a crisp scan (a clean
+    # digit) that fringe reads as roughness the real ink does not have -- and it is far more visible now
+    # the ink is dark. Push coverage away from the visual threshold (0.5) in proportion to crispness:
+    # sub-threshold fringe fades to paper (clean edge), solid ink stays solid. Width is preserved (the
+    # 0.5 boundary barely moves); only the fringe below it is cleaned. Scaled by ``hard_edge`` so a
+    # genuinely degraded/soft scan (faxy caps) barely moves and keeps its ragged look.
+    if he and he > 0.05:
+        cov2 = np.clip(0.5 + (cov2 - 0.5) * (1.0 + 1.3 * float(he)), 0.0, 1.0)
     # HARD DROPOUTS: the scan punches sharp WHITE pixels clean through solid ink. Reproduce them
     # at the measured ``hard_drop`` rate by knocking that fraction of the synth's solid pixels to
     # 0 -- per-pixel and sharp, unlike the soft coherent fade that the bands already supply.
@@ -422,6 +449,18 @@ def apply_residual_filter(clean_strip_rgb, ink, paper, prof, R):
     if hard_drop and hard_drop > 0.01:
         knock = (cov2 > 0.45) & (R.rand(H, W) < float(hard_drop))
         cov2[knock] = 0.0
+    # CONNECTIVITY: never fully SEVER a stroke. The bites/drops above rag the EDGES (the fax look
+    # Edward wants), but on a 2-3px digit stroke or slash they can cut clean through and break the
+    # glyph ("text getting cut"). Floor the clean stroke's MEDIAL RIDGE -- the 1px local-maxima
+    # centreline of the interior distance transform -- to the glyph's own measured darkness. Only
+    # ~1px per stroke, so the ragged edges are preserved; just the centre can't drop out. A faint
+    # scan floors to its faint target, so its thin strokes still break like the real ink.
+    if din is not None:
+        _maxf = cv2.dilate(din, np.ones((3, 3), np.float32))
+        ridge = (din >= _maxf) & (din >= 1.0)
+        if ridge.any():
+            _lvl = float(prof.get("target")) if (isinstance(prof, dict) and prof.get("target")) else 0.6
+            cov2[ridge] = np.maximum(cov2[ridge], min(_lvl, 0.9))
     # PAPER GRAIN: every background pixel that isn't already inked gets a faint coverage drawn
     # from the real paper distribution, so the synth paper is grainy like the scan (no flat-255
     # whiteout block). Most draws are ~0, so it stays paper -- just never perfectly flat.

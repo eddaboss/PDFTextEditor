@@ -107,18 +107,6 @@ _PS_ARTIFACT_RE = re.compile(r"(psmt|mt|ps)$")
 _MIN_PIXEL_SIZE = 1.0
 
 
-def _logical_dpi() -> float | None:
-    """The primary screen's logical DPI, or None when no screen is available
-    (so ``qfont`` can fall back to integer pixel sizing). Used to convert a
-    device-independent pixel size to fractional points for the preview/editor."""
-    from PySide6.QtGui import QGuiApplication
-    screen = QGuiApplication.primaryScreen()
-    if screen is None:
-        return None
-    dpi = screen.logicalDotsPerInch()
-    return dpi if dpi and dpi > 0 else None
-
-
 @dataclass(frozen=True)
 class ResolvedFont:
     """The outcome of resolving one edit. Consumed by BOTH the UI and save_as."""

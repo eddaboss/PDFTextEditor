@@ -173,6 +173,11 @@ class Span:
     # e.g. a full span plus fragments) carries all of them, so editing the box
     # erases every duplicate instead of leaving residue behind.
     redact_bboxes: tuple = ()
+    # True only for a GENUINE page-centered single line (a title/subtitle alone on
+    # its baseline row). Set at extraction; ``_maybe_recenter`` re-centers ONLY these,
+    # so a table/form cell (which shares its row with other cells) keeps its LEFT edge
+    # fixed on a resize/edit instead of sliding (Edward: "the first letter jumps").
+    centered_line: bool = False
 
     @property
     def key(self) -> tuple:
@@ -201,13 +206,6 @@ class Span:
     def is_horizontal(self) -> bool:
         """True when the run reads left-to-right (no page/text rotation)."""
         return abs(self.dir[0] - 1.0) < 1e-3 and abs(self.dir[1]) < 1e-3
-
-    @property
-    def rotation_degrees(self) -> float:
-        """Writing-direction angle in degrees, CCW positive. line['dir'] is
-        (cos θ, -sin θ) in PDF space, so θ = atan2(-dir[1], dir[0])."""
-        return math.degrees(math.atan2(-self.dir[1], self.dir[0]))
-
 
 @dataclass(frozen=True)
 class ParagraphBox:
@@ -272,10 +270,6 @@ class ParagraphBox:
         return abs(self.dir[0] - 1.0) < 1e-3 and abs(self.dir[1]) < 1e-3
 
     @property
-    def rotation_degrees(self) -> float:
-        return 0.0
-
-    @property
     def is_paragraph(self) -> bool:
         return True
 
@@ -302,8 +296,6 @@ class Box(Protocol):
     @property
     def is_horizontal(self) -> bool: ...
     @property
-    def rotation_degrees(self) -> float: ...
-    @property
     def identity(self) -> tuple: ...
 
 
@@ -319,10 +311,12 @@ class RunStyle:
 
     font_family: str | None = None
     color: tuple | None = None          # (r, g, b) 0..1
+    underline: bool = False             # per-run underline (vector text-layer spans)
 
     @property
     def is_empty(self) -> bool:
-        return self.font_family is None and self.color is None
+        return (self.font_family is None and self.color is None
+                and not self.underline)
 
 
 @dataclass(frozen=True)
@@ -523,13 +517,6 @@ class NewBox:
     def is_horizontal(self) -> bool:
         return abs(self.dir[0] - 1.0) < 1e-3 and abs(self.dir[1]) < 1e-3
 
-    @property
-    def rotation_degrees(self) -> float:
-        return math.degrees(math.atan2(-self.dir[1], self.dir[0]))
-
-    def with_changes(self, **kwargs) -> "NewBox":
-        return replace(self, **kwargs)
-
 
 # Sentinel for "no staged form value" in a _BoxState: a staged value of None
 # could never be told apart from "unset", so form commands carry this marker
@@ -651,10 +638,6 @@ class ImageBox:
         return True
 
     @property
-    def rotation_degrees(self) -> float:
-        return 0.0
-
-    @property
     def dir(self) -> tuple:
         return (1.0, 0.0)
 
@@ -663,9 +646,6 @@ class ImageBox:
         """An ImageBox has no original page ink, so it contributes NO
         redaction (Box-protocol parity with NewBox; unused by the bake)."""
         return ()
-
-    def with_changes(self, **kwargs) -> "ImageBox":
-        return replace(self, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -718,10 +698,6 @@ class ExistingImage:
     @property
     def is_horizontal(self) -> bool:
         return True
-
-    @property
-    def rotation_degrees(self) -> float:
-        return 0.0
 
     @property
     def dir(self) -> tuple:
@@ -1337,6 +1313,47 @@ class PDFDocument:
             min_len = 0.0
         s = 72.0 / float(dpi)
         h, v = detect_borders(img, min_len=min_len)
+        # THICKNESS filter: a genuine rule is a THIN line -- its ink forms a shallow band
+        # perpendicular to its length. Heavy dense scanned TEXT (a near-black VIN) trips
+        # detect_borders as one long horizontal run; every downstream consumer then treats it as
+        # a rule -- the tile-restore stamps the old scan back, and _restore_line_in_cover redraws
+        # a solid ink bar OVER the edited tile (the "delete one letter -> the prefix goes solid
+        # black" bug). Measure the median longest dark run PERPENDICULAR to the line, in a
+        # text-height window around it: a thin rule stays small (its own thickness), a glyph mass
+        # runs tall. Drop the tall ones. Fixing it here fixes every consumer at once
+        # (page_border_lines is the single detection source). vcap ties to the page's text height
+        # so it is GENERAL, not tuned to one scan.
+        import numpy as np
+        gray = img.mean(2) if img.ndim == 3 else img
+        Hs, Ws = gray.shape[:2]
+        th = max(8, int(round(min_len / 2.5))) if min_len else 20   # ~ median text height (px)
+        vcap = max(9.0, 0.28 * th)
+
+        def _thin(rule, vertical):
+            x0, y0, x1, y1 = (int(round(c)) for c in rule)
+            xa, xb = max(0, min(x0, x1)), min(Ws, max(x0, x1) + 1)
+            ya, yb = max(0, min(y0, y1)), min(Hs, max(y0, y1) + 1)
+            if xb <= xa or yb <= ya:
+                return True
+            if vertical:                                     # run ALONG x (perp to the line)
+                win = gray[ya:yb, max(0, xa - th):min(Ws, xb + th)] < 130
+                lines = [win[j, :] for j in range(0, win.shape[0], 3)]
+            else:                                            # run ALONG y (perp to the line)
+                win = gray[max(0, ya - th):min(Hs, yb + th), xa:xb] < 130
+                lines = [win[:, j] for j in range(0, win.shape[1], 3)]
+            if not lines:
+                return True
+            runs = []
+            for ln in lines:                                 # longest contiguous dark run
+                best = r = 0
+                for val in ln:
+                    r = r + 1 if val else 0
+                    if r > best:
+                        best = r
+                runs.append(best)
+            return float(np.median(runs)) <= vcap
+        h = [r for r in h if _thin(r, False)]
+        v = [r for r in v if _thin(r, True)]
         scale = lambda L: [(x0 * s, y0 * s, x1 * s, y1 * s) for (x0, y0, x1, y1) in L]
         return scale(h), scale(v)
 
@@ -2240,8 +2257,20 @@ class PDFDocument:
                 # only the vertical bleed into the line below is the bug.
                 t_dx0, t_dx1 = dx0, dx1
             else:
-                t_dx0 = dx0 + max(0, int(cols.min()) - 1) / ppi
-                t_dx1 = dx0 + min(cw, int(cols.max()) + 2) / ppi
+                # HORIZONTAL: snap to the glyph's FULL ink, not the dark-threshold column. The
+                # old +1/+2 px shrank onto the last glyph's antialiased edge -- and on a rotated
+                # page the crop round-trip ate even that -- so the final letter was sliced off
+                # (the cover "cutoff"). Use a FAINT (paper-relative) threshold so the tapered edge
+                # counts, plus a stroke-scaled margin, still capped at the ORIGINAL cover so it
+                # never grows past OCR's layout (field/paragraph-safe). Vertical stays tight above,
+                # which is what keeps stacked lines from merging -- only the reading extent relaxes.
+                mgn = max(10, int(round(0.22 * (bot - top + 1))))
+                faint = crop.mean(2) < 215.0
+                fc = np.where(faint[top:bot + 1].any(0))[0]
+                lo = min(int(cols.min()), int(fc.min())) if fc.size else int(cols.min())
+                hi = max(int(cols.max()), int(fc.max())) if fc.size else int(cols.max())
+                t_dx0 = dx0 + max(0, lo - mgn) / ppi
+                t_dx1 = dx0 + min(cw, hi + mgn) / ppi
             tpts = [fitz.Point(px, py) * dm for px, py in
                     ((t_dx0, t_dy0), (t_dx1, t_dy0), (t_dx1, t_dy1), (t_dx0, t_dy1))]
             nx0, ny0 = min(p.x for p in tpts), min(p.y for p in tpts)
@@ -2804,6 +2833,35 @@ class PDFDocument:
         cache[fpath] = r
         return r
 
+    def _font_x_ratio(self, fpath: "str | None") -> float:
+        """A font's X-HEIGHT as a fraction of its em (rendered 'x' ink-height / em), cached.
+        Paired with _font_cap_ratio this gives the font's x-height/cap-height proportion, so a
+        PURE x-height run seated to a scanned CAP band can be sized to its true x-height instead
+        of being stretched to fill the cap band."""
+        cache = self.__dict__.setdefault("_x_ratio_cache", {})
+        if fpath in cache:
+            return cache[fpath]
+        import numpy as np
+        r = 0.5
+        try:
+            f = fitz.Font(fontfile=fpath)
+            em = 100.0
+            doc = fitz.open()
+            pg = doc.new_page(width=em * 2, height=em * 3)
+            tw = fitz.TextWriter(pg.rect)
+            tw.append((em * 0.5, em * 2.0), "x", font=f, fontsize=em)
+            tw.write_text(pg, color=(0, 0, 0))
+            pm = pg.get_pixmap(alpha=False)
+            a = np.frombuffer(pm.samples, np.uint8).reshape(
+                pm.height, pm.width, pm.n)[..., :3]
+            ys = np.where(((255.0 - a.mean(2)) / 255.0).max(1) > 0.2)[0]
+            if len(ys):
+                r = float(ys.max() - ys.min() + 1) / em
+        except Exception:
+            pass
+        cache[fpath] = r
+        return r
+
     @staticmethod
     def _safe_measure_damage(region, geom):
         """The neighbour DAMAGE profile for this line (degrade.measure_damage), measured
@@ -2911,10 +2969,17 @@ class PDFDocument:
         # ONCE, then stamp the same per-pixel residual onto each synth letter so it fades,
         # breaks and speckles like its surroundings. Built once per line and cached on the ctx.
         from .ocr import degrade
-        bfilt = ctx.get("_bfilt", "unset")
+        # LOCAL residual (faithful profile from the RIGHT glyphs): measure the damage
+        # signature from the SAME-CHARACTER scanned glyphs on the line (the letter's own
+        # haze/dropout/speckle) PLUS the immediate neighbour glyphs (the local damage
+        # LEVEL) -- NOT one whole-line average -- so the synth reflects what the real glyphs
+        # around it actually have, and a clean spot stays clean while a wrecked spot wrecks.
+        # Cached per run text on the ctx.
+        _lrk = "_lr:" + text
+        bfilt = ctx.get(_lrk, "unset")
         if bfilt == "unset":
-            bfilt = degrade.build_residual_filter(ctx["region"], ctx.get("geom"))
-            ctx["_bfilt"] = bfilt
+            bfilt = self._local_residual_filter(ctx, text)
+            ctx[_lrk] = bfilt
         if bfilt is None:                                   # clean line -> plain crisp recolour
             cov = ((255.0 - strip.mean(2)) / 255.0)[..., None]
             out = np.clip(paper.reshape(1, 1, 3) * (1.0 - cov) +
@@ -2932,6 +2997,80 @@ class PDFDocument:
             if not _dcol.all():
                 out[Hr:, ~_dcol] = paper_u8
         return out, advpx
+
+    @staticmethod
+    def _line_band_rows(region):
+        """Rows of the region's PRIMARY text line = the largest contiguous run of DENSE
+        rows (>=25% of peak column-coverage). A PARAGRAPH line's crop can include the next
+        line's top across an inter-line white gap; this returns just the edited line's row
+        span so damage/size measurement never mixes in the neighbour. Single-line crops are
+        one run -> the full text extent. Returns (lo, hi) inclusive, or None."""
+        import numpy as np
+        if region is None:
+            return None
+        g = (255.0 - np.asarray(region).mean(2)) / 255.0
+        prof = (g > 0.4).mean(1)
+        mx = float(prof.max()) if prof.size else 0.0
+        if mx <= 0:
+            return None
+        dense = np.where(prof >= 0.25 * mx)[0]
+        if not dense.size:
+            return None
+        runs = np.split(dense, np.where(np.diff(dense) > 1)[0] + 1)
+        big = max(runs, key=len)
+        return int(big.min()), int(big.max())
+
+    def _local_residual_filter(self, ctx: dict, text: str):
+        """The degradation residual (degrade.build_residual_filter) measured from the
+        SAME-CHARACTER scanned glyphs on the line (the letter's own damage signature) PLUS
+        the immediate neighbour glyphs of THIS edit (the local damage level), instead of
+        one whole-line average. So a synthed glyph carries the haze / pixel-dropout /
+        speckle that the REAL glyphs around it actually have, at the level actually present
+        there. Falls back to the whole-line residual when the local scope is too small to
+        profile, so a degraded page still degrades the synth. Returns the residual or None
+        (a genuinely clean line -> crisp recolour)."""
+        from .ocr import degrade
+        geom = ctx.get("geom") or {}
+        cb = geom.get("char_boxes")
+        ot = ctx.get("orig_text") or ""
+        region = ctx.get("region")
+        if region is None:
+            return None
+        # A PARAGRAPH line's crop can swallow the next line's top; its char_boxes then span
+        # BOTH lines (a ~47px box on a ~30px line). Measuring damage over that dilutes the
+        # ink darkness/edges with inter-line paper -> the residual OVER-degrades and the synth
+        # renders thin, eaten, "mangled" (Edward's date edit). Clip every measured box to the
+        # edited line's own rows; single-line crops are one dense run -> unchanged.
+        _band = self._line_band_rows(region)
+
+        def _clip(boxes):
+            if _band is None:
+                return list(boxes)
+            _lo, _hi = _band
+            return [(b[0], max(b[1], _lo), b[2], min(b[3], _hi + 1))
+                    for b in boxes if b and min(b[3], _hi + 1) > max(b[1], _lo)]
+        if not cb or len(cb) != len(ot):
+            return degrade.build_residual_filter(
+                region, {"char_boxes": _clip(cb)} if cb else geom)
+        sel = set()
+        chars = set(text)
+        for i, c in enumerate(ot):                  # same character, anywhere on the line
+            if c in chars and i < len(cb) and cb[i]:
+                sel.add(i)
+        pos = ctx.get("_edit_pos")                  # immediate neighbours of THIS edit
+        if pos:
+            p, ns = int(pos[0]), int(pos[1])
+            for i in (list(range(max(0, p - 4), p))
+                      + list(range(ns, min(len(cb), ns + 4)))):
+                if 0 <= i < len(cb) and cb[i]:
+                    sel.add(i)
+        boxes = _clip([cb[i] for i in sorted(sel) if cb[i]])
+        prof = (degrade.build_residual_filter(region, {"char_boxes": boxes})
+                if boxes else None)
+        # Local scope too clean/sparse to profile -> use the whole line so the synth still
+        # picks up real page damage rather than rendering crisp on a degraded scan.
+        return prof if prof is not None else degrade.build_residual_filter(
+            region, {"char_boxes": _clip(cb)})
 
     def _local_font(self, ctx: dict, x_center: float):
         """The font AT THE CARET, matched from a COUPLE OF WORDS of scanned glyphs
@@ -3113,6 +3252,38 @@ class PDFDocument:
                 if cbx:
                     band = ink[band_top:band_bot]
                     Wb = band.shape[1]
+                    # DROP HORIZONTAL RULE ROWS before measuring per-glyph height. A table
+                    # border / underline can dip into the bottom of the band under PART of the
+                    # line (its dense core is stripped as ``struct`` above, but the anti-aliased
+                    # TAPERED edge rows fall under the 0.55*W width test while still carrying a
+                    # continuous ink run no glyph stroke can). Left in, that run stretches every
+                    # glyph box over it down to the rule (the "iability Insurance boxes all reach
+                    # the line floor and fuse" bug). A rule is the one thing with a run FAR longer
+                    # than a glyph; drop those rows so each box keeps its own ink extent. General:
+                    # the threshold scales with line width and x-height, never the document.
+                    if band.size and band.any():
+                        # A row is a RULE row if it holds a continuous ink run far longer than any
+                        # glyph stroke -- erosion by a 1xT bar survives only where such a run exists.
+                        # T scales with line width and x-height, never the document.
+                        T = max(int(0.12 * Wb), 3 * xheight)
+                        er = cv2.erode(band.astype(np.uint8), np.ones((1, T), np.uint8),
+                                       borderType=cv2.BORDER_CONSTANT, borderValue=0)
+                        rule_rows = np.where(er.any(1))[0]
+                        # A rule lives BELOW the baseline (a table border / underline under the
+                        # text). Heavy bold text -- a dense VIN, a stencil caps line -- has glyph
+                        # BODIES whose bottom rows merge into a long horizontal run too, and those
+                        # sit ABOVE the baseline; clearing from them chopped the real glyph height
+                        # and the synth then seated short and mangled at top/bottom. Only rows at or
+                        # below the baseline may count as a rule.
+                        _blr = int(round(baseline)) - band_top
+                        rule_rows = rule_rows[rule_rows >= _blr]
+                        if rule_rows.size:
+                            # The rule sits at the band FLOOR (below the descenders). Clear from
+                            # just above its topmost dense row to the bottom -- that also takes the
+                            # dithered fax fringe one row up (scattered dots, too short to be a run
+                            # but still rule ink that would drag a glyph box down).
+                            band = band.copy()
+                            band[max(0, int(rule_rows.min()) - 2):] = False
                     ncb = []
                     for bx in cbx:
                         if bx is None:
@@ -3596,6 +3767,46 @@ class PDFDocument:
         except Exception:
             return (float(eir[0]) - float(cov[0]), float(eir[1]) - float(cov[1]))
 
+    def _ttf_style_cached(self, path: str):
+        """``(family, bold, italic)`` for a bank/font file, cached per path (the tables read
+        opens the file)."""
+        c = getattr(self, "_ttf_style_cache", None)
+        if c is None:
+            c = self._ttf_style_cache = {}
+        v = c.get(path)
+        if v is None:
+            from .font_engine import detect_ttf_style
+            try:
+                v = detect_ttf_style(path)
+            except Exception:
+                v = ("", False, False)
+            c[path] = v
+        return v
+
+    def _synth_weight_reconcile(self, cand: "str | None", ctx: dict) -> "str | None":
+        """Keep a typed glyph as BOLD (or not) as the scan it sits in. The per-word matchers rank
+        on a shape descriptor that is weight-blind, so a bold scan can match the REGULAR sibling of
+        the same family -- Courier New Bold vs Regular have identical letterforms, so the synth came
+        out thin next to bold text and the user had to hand-bold it. When the picked font and the
+        run's OWN font (``ctx['fpath']``, resolved at OCR time from the whole box) are the SAME
+        family at a DIFFERENT weight, trust the run's font: it is the one weight signal that does
+        NOT depend on re-measuring the degraded ink (degradation thins strokes, which is what fools
+        the matcher in the first place). Only a same-family weight FLIP is corrected -- a genuinely
+        different per-word family is left exactly as the matcher chose it.
+
+        Known edge (post-1.0): if ONE box mixes the same family at two weights (a bold label + a
+        regular value in the same typeface), this snaps the edited word to the box's weight. Rare
+        for scanned letters/forms, where a box is one weight; revisit with degrade-matched weight
+        measurement if it shows up."""
+        base = ctx.get("fpath")
+        if not base or not cand or base == cand:
+            return cand
+        fam_b, bold_b, _ = self._ttf_style_cached(base)
+        fam_c, bold_c, _ = self._ttf_style_cached(cand)
+        if fam_b and fam_c and fam_b.lower() == fam_c.lower() and bold_b != bold_c:
+            return base
+        return cand
+
     def _edit_synth_font(self, ctx: dict) -> "str | None":
         """The font file to synthesize an edit in -- resolved PER GLYPH at the caret
         from the page-level SUPER-RESOLUTION map (ocr/supermatch): the caret region's
@@ -3621,8 +3832,9 @@ class PDFDocument:
             if _pm is not None and _er:
                 _fr = _pm.font_for_rect(_er[0], _er[1], _er[2], _er[3])
                 if _fr and os.path.exists(_fr[0]):
-                    ctx["_synth_fpath"] = _fr[0]
-                    return _fr[0]
+                    _rf = self._synth_weight_reconcile(_fr[0], ctx)
+                    ctx["_synth_fpath"] = _rf
+                    return _rf
         except Exception:
             pass
         # SHORT FIELD ONLY (a lone date / number, <=14 chars): a short field is one font, so
@@ -3671,8 +3883,9 @@ class PDFDocument:
             if pm is not None and dr:
                 fr = pm.font_for_rect(dr[0], dr[1], dr[2], dr[3])
                 if fr and os.path.exists(fr[0]):
-                    ctx["_synth_fpath"] = fr[0]
-                    return fr[0]
+                    _rf = self._synth_weight_reconcile(fr[0], ctx)
+                    ctx["_synth_fpath"] = _rf
+                    return _rf
         except Exception:
             pass
         # FALLBACK: the edge render-and-compare over this region's glyphs.
@@ -3688,6 +3901,7 @@ class PDFDocument:
                         out = p
         except Exception:
             pass
+        out = self._synth_weight_reconcile(out, ctx)
         ctx["_synth_fpath"] = out
         return out
 
@@ -4085,6 +4299,17 @@ class PDFDocument:
             # bottom reading high vs the render). A run with a tall ascender/descender keeps
             # the NATURAL font render (correct descenders + spacing) via the uniform sf above
             # -- re-cutting those by class distorts descenders/spacing, so it is left alone.
+            # A no-cap/no-digit LOWERCASE run's dense body is the x-HEIGHT, not the cap line, so
+            # seating it to fill the cap band renders it cap-tall (verified against tight glyph
+            # lines: 'typing' filled the whole cap band). Size such a run's body to the x-HEIGHT
+            # target band*(_xcr) where _xcr = font x-height/cap-height; ascenders then reach ~the
+            # cap line, descenders drop below the baseline. _xcr==1 for any run with a cap/digit.
+            _lc = (any(c.islower() for c in (run_text or ""))
+                   and not any((c.isupper() or c.isdigit()) for c in (run_text or "")))
+            _xcr = 1.0
+            if _lc:
+                _cr = self._font_cap_ratio(synth_fpath)
+                _xcr = float(min(1.0, self._font_x_ratio(synth_fpath) / max(0.1, _cr)))
             band = ctx.get("_seat_band") or ctx.get("_scan_band")
             if band is None:
                 band = (-1, -1)
@@ -4105,11 +4330,25 @@ class PDFDocument:
                             # the band top to row 0, which made the seat scale the digit UP and
                             # mis-place it (a '5' ballooned and read as a 'b').
                             _r0 = max(0, _y0 - 3); _r1 = min(_cF.shape[0], _y1 + 4)
-                            _ext = self._contig_extent(
-                                (_cF[_r0:_r1, _x0:_x1] > 0.30).any(1))
-                            if _ext:
-                                _tops.append(_r0 + _ext[0])
-                                _bots.append(_r0 + _ext[1])
+                            # DENSE rows only (>=25% of this glyph's peak column-coverage): the
+                            # .any(1) extent catches degradation speckle a few px above/below and
+                            # puts the band on the LINE, not the TEXT -- so pure-x-height runs (which
+                            # fall back to THIS band) rode a couple px off. Speckle rows are sparse.
+                            _gp = (_cF[_r0:_r1, _x0:_x1] > 0.30).mean(1)
+                            if _gp.size and _gp.max() > 0:
+                                _gd = np.where(_gp >= 0.25 * _gp.max())[0]
+                                if _gd.size:
+                                    # LARGEST CONTIGUOUS run only. A too-tall glyph box (a
+                                    # PARAGRAPH line whose crop swallowed the next line's top)
+                                    # puts the neighbour's ink in a SECOND dense run across the
+                                    # inter-line whitespace; plain min/max jumps that gap and
+                                    # doubles the band (a date rendered ~1.6x tall). Splitting on
+                                    # gaps >1 row and keeping the longest run pins the band to this
+                                    # glyph's own body. Single-line boxes are one run -> unchanged.
+                                    _rn = np.split(_gd, np.where(np.diff(_gd) > 1)[0] + 1)
+                                    _bg = max(_rn, key=len)
+                                    _tops.append(_r0 + int(_bg.min()))
+                                    _bots.append(_r0 + int(_bg.max()))
                     if _tops:
                         # Anchor BOTH edges to the digits' robust extent: the cap line at the
                         # MEDIAN top, the baseline at the 80th-PERCENTILE bottom. The fuller
@@ -4134,7 +4373,8 @@ class PDFDocument:
                         # here scaled the synth 1px taller and dropped it below the line, so it
                         # read as "too tall" / hanging below the scanned digits.
                         _th = _bbot - band[0] + 1
-                        if _th > 1 and (_sh <= 1.15 * _th or _run_num):  # same class, or a numeric run -> seat to band
+                        # caps/digits -> branch 1 (fill band); LOWERCASE -> branch 2 (x-height body)
+                        if _th > 1 and (_sh <= 1.15 * _th or _run_num) and not _lc:  # same class, or a numeric run -> seat to band
                             _scl = _th / float(_sh)
                             _g = strip[_st:_sb + 1]
                             _nh = max(1, int(round(_g.shape[0] * _scl)))
@@ -4151,17 +4391,70 @@ class PDFDocument:
                             # MIXED-HEIGHT run (typed words with ascenders/descenders): the seat
                             # above squashes the whole extent into the cap band. Instead pin the
                             # CAP-line-to-baseline to the band and let ascenders/descenders run
-                            # past it. Cap-line = ink top (_st); baseline = bottom of the DENSE
-                            # body (the x-height/cap mass, above any descender). Without this a
+                            # past it. Cap-line + baseline are read from the DENSE body cluster
+                            # (the x-height/cap mass, above any descender). Without this a
                             # word fell to the coarse size_factor and rendered oversized + clean
                             # next to the scan (the "fell back to shit" on multi-letter typing).
                             _dens = (_sc > 0.30).mean(1)
                             _mx = float(_dens.max())
-                            _body = np.where(_dens >= 0.5 * _mx)[0] if _mx > 0 else np.array([])
-                            _base = int(_body.max()) if _body.size else _sb
-                            _caph = _base - _st + 1
+                            _dmask = ((_dens >= 0.5 * _mx) if _mx > 0
+                                      else np.zeros(len(_dens), bool))
+                            _rows = np.where(_dmask)[0]
+                            # baseline is KNOWN -- _synth_strip rendered the glyph with its baseline
+                            # at base_y / local_by (off = em*2*ppi - base_y). Do NOT re-measure it
+                            # from the degraded ink: _rows.max() lands on a descender TAIL (g/j/p/q/y)
+                            # or wanders with dropout, so _caph spanned the whole glyph and scaling
+                            # that into the x-height band COMPRESSED the 'y' into the line with no
+                            # descent -- non-deterministically, because the dropout is random. Anchor
+                            # on the known baseline; the descender below it then renders full length
+                            # every time. (No-descender runs have _rows.max() == baseline already, so
+                            # this is a no-op for them.)
+                            _base = (int(round(local_by)) if local_by is not None
+                                     else (int(_rows.max()) if _rows.size else _sb))
+                            _base = max(1, min(_base, strip.shape[0] - 1))
+                            # Cap-line anchor = TOP of the dense cluster that CONTAINS the baseline
+                            # (the x-height line on a lowercase line, the cap-line on a caps line) --
+                            # NOT the ink top _st and NOT the global _dmask.min(). A row of 'i'/'j'
+                            # dots, or a lone ascender/cap tip, forms a SEPARATE dense band floating
+                            # ABOVE the body across a paper gap; _dmask.min() snapped onto it and
+                            # over-measured the height, so the seat scaled the whole run ~27% too
+                            # small (it read as tiny + sitting low). Walk UP from the baseline and
+                            # stop once a real gap (>2 blank rows) is cleared, dropping that floating
+                            # band; gap<=2 tolerates the body's own 1px holes. An all-tall run
+                            # (caps/digits) has no gap above the body, so _top stays at the ink top
+                            # -- a no-op.
+                            _top = _base; _g = 0
+                            for _r in range(_base - 1, -1, -1):
+                                if _dmask[_r]:
+                                    _top = _r; _g = 0
+                                else:
+                                    _g += 1
+                                    if _g > 2:
+                                        break
+                            _caph = _base - _top + 1
+                            # MIXED run (has a cap or digit): its cap line is reached by SPARSE
+                            # verticals (H, F, l) that the density walk-up misses -- it stops at the
+                            # x-height, then _th/_caph scales the whole run UP and the caps punch
+                            # ABOVE the band. The strip is a clean synth (no speckle), so its real
+                            # ink top ``_st`` IS the cap line; anchor _caph there so caps land ON the
+                            # band. Lowercase runs keep the x-height body walk-up (+ _xcr) as-is.
+                            if any(c.isupper() or c.isdigit() for c in (run_text or "")):
+                                _top = min(_top, _st)
+                                _caph = _base - _top + 1
+                            # After the uniform size_factor the strip's x-height is already ~ _th,
+                            # so this fine re-scale should be NEAR 1. If the dense-mask walk-up
+                            # FRAGMENTED -- fax/degradation pixel-dropout splits the bowl across a
+                            # >2px gap, so the walk-up stops early -- _caph comes out far too small
+                            # and _th/_caph EXPLODES the glyph (a 'y' stretched ~2x, its bowl pushed
+                            # above the paste band and clipped to a bare '/'; non-deterministic
+                            # because the dropout is random per render). Trust the size_factor (no
+                            # re-scale) when _caph is implausibly small, and clamp so a noisy
+                            # measurement can never blow the glyph up or crush it.
+                            # _xcr<1 for a lowercase run: seat its x-height BODY to the x-height
+                            # target (band * font x/cap), so it is not stretched to cap height.
+                            _scl = (_th * _xcr / float(_caph)) if _caph > 0.6 * _th else 1.0
+                            _scl = max(0.6, min(_scl, 1.5))
                             if _caph > 1:
-                                _scl = _th / float(_caph)
                                 _nh = max(1, int(round(strip.shape[0] * _scl)))
                                 _gr = cv2.resize(
                                     strip, (strip.shape[1], _nh),
@@ -4174,6 +4467,17 @@ class PDFDocument:
                                     strip = np.ascontiguousarray(_o)
                 except Exception:
                     pass
+        if strip is not None and run_text.strip():     # TRACE synth-piece sizing (crushed-glyph bug)
+            _dsc = (255.0 - strip.mean(2)) / 255.0
+            _diy = np.where((_dsc > 0.30).any(1))[0]
+            _dib = ctx.get("_seat_band") or ctx.get("_scan_band")
+            dlog("RENDER", "run_seat", run=run_text[:10],
+                 sf=round(float(ctx.get("_size_factor") or -1), 3),
+                 band=str(tuple(int(v) for v in _dib) if _dib else None),
+                 seat=(ctx.get("_seat_band") is not None),
+                 inkH=int(_diy.max() - _diy.min() + 1) if _diy.size else 0,
+                 stripH=int(strip.shape[0]), stripW=int(strip.shape[1]),
+                 fill=round(float((_dsc > 0.30).mean()), 2))
         rbear = 0.0
         if strip is not None:
             scov = (255.0 - strip.mean(2)) / 255.0
@@ -4189,6 +4493,74 @@ class PDFDocument:
                 nw = max(1, int(round(strip.shape[1] * condense)))
                 strip = np.ascontiguousarray(cv2.resize(
                     strip, (nw, strip.shape[0]), interpolation=cv2.INTER_AREA))
+            # WEIGHT MATCH: the per-word matched font can be LIGHTER than the scanned ink (a bold
+            # condensed scan matched to a regular/thin bank face), so the synth run reads thin next
+            # to the scan (measured 0.4-0.7x stroke on this card). Measure the scan line's own
+            # stroke width (60th-pct distance transform x2) and this strip's, and THICKEN the synth
+            # by grayscale erosion (dark spreads) to match -- font-agnostic, works for any face.
+            # Fractional via a blended extra erode so the step is not a coarse 2px. Only thickens,
+            # never thins, capped so a mis-match can't blob. Scan stroke cached per ctx.
+            _ssw = ctx.get("_scan_sw")
+            if _ssw is None:
+                _ssw = 0.0
+                if region is not None:
+                    _rm = ((255.0 - region.mean(2)) / 255.0 > 0.4).astype(np.uint8)
+                    if int(_rm.sum()) >= 20:
+                        _rdt = cv2.distanceTransform(_rm, cv2.DIST_L2, 3)
+                        _ssw = float(np.percentile(_rdt[_rm > 0], 60)) * 2.0
+                ctx["_scan_sw"] = _ssw
+            if _ssw > 0 and strip is not None:
+                _tm = ((255.0 - strip.mean(2)) / 255.0 > 0.4).astype(np.uint8)
+                if int(_tm.sum()) >= 10:
+                    _tdt = cv2.distanceTransform(_tm, cv2.DIST_L2, 3)
+                    _tsw = float(np.percentile(_tdt[_tm > 0], 60)) * 2.0
+                    _f = float(np.clip((_ssw - _tsw) / 2.0, 0.0, 2.5))
+                    if _f > 0.05:
+                        _k = np.ones((3, 3), np.uint8)
+                        _e = cv2.erode(strip, _k, iterations=int(_f))
+                        _fr = _f - int(_f)
+                        if _fr > 0.05:
+                            _e2 = cv2.erode(_e, _k)
+                            _e = _e.astype(np.float32) * (1 - _fr) + _e2.astype(np.float32) * _fr
+                        strip = np.ascontiguousarray(np.clip(_e, 0, 255).astype(np.uint8))
+            # ITALIC MATCH: the OCR has NO slant detection, so an italic scanned line (the card's
+            # body text) gets an upright box and the synth run comes out upright while the scan
+            # leans. Measure the scan line's slant -- the horizontal shear that best verticalises
+            # its strokes (peaks the column-sum energy) -- and SHEAR the synth to match, so inserted
+            # text leans with the line. Only applied for a clearly-italic line (>0.08); upright
+            # lines measure ~0 and are untouched. Cached per ctx. (Oblique of the matched face, not
+            # a true italic file -- matching the LEAN is the goal here; a true italic FILE is the
+            # separate font-family pass.)
+            _sl = ctx.get("_scan_slant")
+            if _sl is None:
+                _sl = 0.0
+                if region is not None:
+                    _im = ((255.0 - region.mean(2)) / 255.0 > 0.4).astype(np.uint8)
+                    if int(_im.sum()) >= 50:
+                        _Hh, _Ww = _im.shape; _md = _Hh / 2.0; _bv = -1.0; _bs = 0.0
+                        for _sv in np.arange(0.0, 0.45, 0.03):
+                            _M = np.float32([[1, _sv, -_sv * _md], [0, 1, 0]])
+                            _shd = cv2.warpAffine(_im, _M, (_Ww, _Hh), flags=cv2.INTER_NEAREST)
+                            _cs = _shd.sum(0).astype(np.float64); _vv = float((_cs ** 2).mean())
+                            if _vv > _bv:
+                                _bv, _bs = _vv, float(_sv)
+                        _sl = _bs
+                ctx["_scan_slant"] = _sl
+            if _sl > 0.08 and strip is not None:
+                _H2, _W2 = strip.shape[:2]; _md2 = _H2 / 2.0
+                _pad = int(np.ceil(_sl * _H2))
+                _cv = np.empty((_H2, _W2 + 2 * _pad, 3), np.uint8); _cv[:] = paper_u8
+                _cv[:, _pad:_pad + _W2] = strip
+                _Mi = np.float32([[1, -_sl, _sl * _md2], [0, 1, 0]])
+                strip = cv2.warpAffine(
+                    _cv, _Mi, (_W2 + 2 * _pad, _H2), flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(int(v) for v in paper_u8))
+                # re-crop to the sheared ink so the added _pad columns do not become GAPS around
+                # the leaned run (they read as extra spaces).
+                _isc = (255.0 - strip.mean(2)) / 255.0
+                _icc = np.where(_isc.max(0) > 0.20)[0]
+                strip = np.ascontiguousarray(
+                    strip[:, _icc.min():_icc.max() + 1] if _icc.size else strip)
             # PRESERVE typed leading/trailing SPACES: the ink-crop above drops them (no ink),
             # which would butt a newly typed word against the kept suffix and make the caret
             # over-run the glyphs. Pad their advance back as paper so the gap (and the caret)
@@ -4202,6 +4574,108 @@ class PDFDocument:
                 padded[:, lpad:lpad + strip.shape[1]] = strip
                 strip = padded
         return strip, rbear
+
+    def _font_median_gap(self, font, em, ppi):
+        """The MEDIAN inter-letter gap of ONE font at ``em``, in render px (before condense).
+        A per-FONT-TYPE spacing value: an inserted glyph is then spaced the way THAT font
+        naturally sets letters, instead of the line-wide scan span (a mean/odd-wide pair, or a
+        mix of fonts, skews that). MEDIAN, not average, so a single fat pair can't drag it.
+        Measured once per (font, em) from a representative lowercase string and cached."""
+        import numpy as np
+        try:
+            key = ((getattr(font, "name", "") or "?"),
+                   round(float(em), 1), round(float(ppi), 2))
+        except Exception:
+            key = None
+        cache = getattr(self, "_font_gap_cache", None)
+        if cache is None:
+            cache = self._font_gap_cache = {}
+        if key is not None and key in cache:
+            return cache[key]
+        gap = 0.12 * float(em) * float(ppi)            # fallback: ~12% of em
+        try:
+            s = "etaoinshrdlcumwfgvy"                  # common lowercase, varied widths
+            runw = float(font.text_length(s, em))
+            d = fitz.open(); pg = d.new_page(width=runw + 2 * em, height=em * 3)
+            tw = fitz.TextWriter(pg.rect)
+            tw.append((em, em * 2.0), s, font=font, fontsize=em)
+            tw.write_text(pg)
+            pm = pg.get_pixmap(matrix=fitz.Matrix(ppi, ppi), alpha=False)
+            a = np.frombuffer(pm.samples, np.uint8).reshape(
+                pm.height, pm.width, pm.n)[..., :3]
+            col = ((255.0 - a.mean(2)) / 255.0 > 0.30).any(0)
+            runs, i, N = [], 0, len(col)
+            while i < N:
+                if col[i]:
+                    j = i
+                    while j < N and col[j]:
+                        j += 1
+                    runs.append((i, j)); i = j
+                else:
+                    i += 1
+            gaps = [runs[k + 1][0] - runs[k][1] for k in range(len(runs) - 1)]
+            gaps = [g for g in gaps if g > 0]
+            if gaps:
+                gap = float(np.median(gaps))
+        except Exception:
+            pass
+        if key is not None:
+            cache[key] = gap
+        return gap
+
+    def _clone_glyphs(self, region, ctx, Hr, Wr, paper_u8, xof, src_idx,
+                      count, lead_pad, geom, gapm, cb=None):
+        """Lay COUNT copies of the well-segmented scanned glyph ``src_idx`` at that glyph's OWN
+        caret advance (bowl-to-bowl gap = advance - bowl width; a rightward descender overhangs
+        and interleaves under the next glyph via a min-blend). Used to make a typed char that
+        duplicates a scanned neighbour (a 'y' next to the 'y' in 'by') out of the neighbour's
+        REAL pixels -- a synth copy never matches the scan exactly, so it reads wrong. ``lead_pad``
+        paper columns precede the first copy (None => the source glyph's own ink-left bearing, so
+        the strip's left edge lands on the source's caret cell and butts onto a trimmed scan crop).
+        Returns (strip, gap, ybl, blw, bloff, inkoff) or None when the source is not croppable."""
+        import numpy as np
+        cx0 = max(0, min(int(round(xof(src_idx))), Wr))
+        cx1 = max(cx0, min(int(round(xof(src_idx + 1))), Wr))
+        # TIGHTEN to the glyph's OWN char box: a loose caret cell can reach past the glyph and
+        # drag in a faint sliver of the NEXT glyph's ink, which inflates the measured width -> a
+        # degenerate advance gap AND the clone shoved a whole letter-width off its neighbour. Only
+        # trims (never extends past the caret cell), so a tight box is a no-op.
+        if cb is not None and 0 <= src_idx < len(cb) and cb[src_idx]:
+            cx1 = max(cx0 + 1, min(cx1, int(round(cb[src_idx][2])) + 1))
+            cx0 = max(cx0, min(int(round(cb[src_idx][0])), cx1 - 1))
+        if cx1 <= cx0:
+            return None
+        cs = np.array(region[0:Hr, cx0:cx1])
+        cov = (255.0 - cs.mean(2)) / 255.0
+        rc = (cov > 0.30).mean(1)
+        if (rc > 0.85).any():                     # drop a full-width table rule the column caught
+            cs[rc > 0.85] = paper_u8
+            cov = (255.0 - cs.mean(2)) / 255.0
+        cols = np.where(cov.max(0) > 0.20)[0]
+        if not cols.size:
+            return None
+        gl = np.ascontiguousarray(cs[:, int(cols.min()):int(cols.max()) + 1])
+        by = int(round(float(ctx.get("base_y") or Hr)))
+        bm = ((255.0 - gl[:max(1, by)].mean(2)) / 255.0) > 0.30
+        bc = np.where(bm.any(0))[0]
+        blw = int(bc.max() - bc.min() + 1) if bc.size else gl.shape[1]
+        bloff = int(bc.min()) if bc.size else 0
+        inkoff = int(cols.min())
+        ybl = cx0 + inkoff + bloff                 # source bowl left in tile cols
+        adv = int(round(xof(src_idx + 1) - xof(src_idx)))
+        gap = adv - blw                            # natural bowl-to-bowl gap for THIS glyph
+        if gap < 1:                                # degenerate advance -> fall back
+            gap = max(1, int(round(float((geom or {}).get("inter_px") or gapm))))
+        pitch = blw + gap
+        lead = inkoff if lead_pad is None else lead_pad
+        cw = lead + (count - 1) * pitch + gl.shape[1]
+        canvas = np.empty((gl.shape[0], cw, 3), np.uint8)
+        canvas[:] = paper_u8
+        for k in range(count):
+            sx = lead + k * pitch
+            sl = canvas[:, sx:sx + gl.shape[1]]
+            np.minimum(sl, gl, out=sl)             # descenders interleave, keep darker
+        return (np.ascontiguousarray(canvas), gap, ybl, blw, bloff, inkoff)
 
     def inplace_compose(self, ctx: dict, new_text: str, runs=None,
                         force_synth=None):
@@ -4289,13 +4763,28 @@ class PDFDocument:
         # the scan base -- a restyled-but-same-text char falls into the changed middle.
         def cs(i):
             return nstyles[i] if 0 <= i < len(nstyles) else base
+        # CAP the common prefix/suffix at difflib's leading/trailing MATCHED-BLOCK sizes, so a
+        # COINCIDENTAL repeated char can't extend them past the real unchanged run. Typing
+        # 'today' before the ':' of 'by:' made the RAW common suffix grab 'y:' (both strings end
+        # 'y:'), which kept the ORIGINAL 'by' y as scan but placed it at the END (under the
+        # 'today' y) and synthesized a fake y into 'by'. difflib aligns by longest contiguous
+        # block, so it keeps 'red by' (the real y in place) and leaves only ':' as the suffix.
+        import difflib as _dl
+        _mb = _dl.SequenceMatcher(None, ot, nt, autojunk=False).get_matching_blocks()
+        _pcap = _mb[0].size if (_mb and _mb[0].a == 0 and _mb[0].b == 0) else 0
+        _rb = [b for b in _mb if b.size > 0]
+        _scap = (_rb[-1].size if (_rb and _rb[-1].a + _rb[-1].size == len(ot)
+                                  and _rb[-1].b + _rb[-1].size == len(nt)) else 0)
         p = 0
-        while p < len(ot) and p < len(nt) and ot[p] == nt[p] and cs(p) == base:
+        while p < _pcap and ot[p] == nt[p] and cs(p) == base:
             p += 1
         s = 0
-        while s < len(ot) - p and s < len(nt) - p \
+        while s < _scap and s < len(ot) - p and s < len(nt) - p \
                 and ot[-1 - s] == nt[-1 - s] and cs(len(nt) - 1 - s) == base:
             s += 1
+        # The edit's character span (prefix end .. suffix start in ot), so _synth_strip can
+        # measure the degradation from the IMMEDIATE NEIGHBOUR glyphs of this exact edit.
+        ctx["_edit_pos"] = (p, len(ot) - s)
         # FORCE a range to re-synthesize even when its text is UNCHANGED (a glyph a
         # table rule crossed on a moved box: re-render it clean from the matched font
         # instead of carrying the scarred scan). Shrinks the kept prefix/suffix to
@@ -4366,8 +4855,46 @@ class PDFDocument:
                 # is this glyph's true cap/x-to-baseline height.
                 _nrows = np.where((_cfn[_nr0:_nr1, _nx0:_nx1] > 0.30).any(1))[0]
                 if _nrows.size:
-                    ctx["_seat_band"] = (_nr0 + int(_nrows.min()),
-                                         _nr0 + int(_nrows.max()))
+                    _bt, _bb = _nr0 + int(_nrows.min()), _nr0 + int(_nrows.max())
+                    # The OCR char box is unreliable for sizing: it can be too SMALL (a 48px box on
+                    # a 66px digit -> synth too short) OR too BIG (a box spilling onto the next line
+                    # -> synth too tall / an ascender clipped). Prefer the contiguous ink BLOB that
+                    # CONTAINS the box centre over the FULL line column -- one glyph's real cap-to-
+                    # baseline run, split by white from other lines. Bridge <=4px faint fax dropouts.
+                    # Fall back to the box+pad reading only when the centre lands in an ink gap (a
+                    # faint-middle degraded glyph) or the blob is implausibly tall (merged with a
+                    # neighbouring line in very tight leading).
+                    _fm = (_cfn[:, _nx0:_nx1] > 0.30).any(1)
+                    _ctr = max(0, min((_ny0 + _ny1) // 2, len(_fm) - 1))
+                    _rw = np.where(_fm)[0]
+                    _seg = None
+                    if _rw.size:
+                        _cs2 = _ce2 = int(_rw[0])
+                        for _rv in _rw[1:]:
+                            _rv = int(_rv)
+                            if _rv - _ce2 <= 4:
+                                _ce2 = _rv
+                            else:
+                                if _cs2 <= _ctr <= _ce2:
+                                    _seg = (_cs2, _ce2); break
+                                _cs2 = _ce2 = _rv
+                        if _seg is None and _cs2 <= _ctr <= _ce2:
+                            _seg = (_cs2, _ce2)
+                    if _seg is not None and (_seg[1] - _seg[0] + 1) <= 0.85 * _cfn.shape[0]:
+                        _bt, _bb = _seg
+                    # TIGHTEN to the DENSE glyph rows: the extent above uses .any(1), so a few
+                    # degradation-speckle pixels a couple px ABOVE/BELOW the real glyph pull the
+                    # band onto the LINE, not the TEXT -- the seated synth then renders a couple px
+                    # too tall and rides a hair high (verified against tight glyph lines). Trim to
+                    # the rows that carry >=25% of the glyph's PEAK column-coverage; a faint-middle
+                    # row is still bracketed by the dense top/bottom so this never shrinks a real
+                    # glyph, it only sheds the sparse speckle.
+                    _dp = (_cfn[_bt:_bb + 1, _nx0:_nx1] > 0.30).mean(1)
+                    if _dp.size and _dp.max() > 0:
+                        _dr = np.where(_dp >= 0.25 * _dp.max())[0]
+                        if _dr.size:
+                            _bt, _bb = _bt + int(_dr.min()), _bt + int(_dr.max())
+                    ctx["_seat_band"] = (_bt, _bb)
         # COVER / erase BY CHARACTER INDEX, never by fuzzy x-overlap -- that fuzzy lookup
         # was the root of the 'HH' double-erase: two identical adjacent glyphs got re-
         # discovered by position and conflated, wiping both. The diff gives p / s as
@@ -4382,7 +4909,13 @@ class PDFDocument:
         cb = (geom or {}).get("char_boxes")
         have_geom = bool(cb) and len(cb) == len(ot)
         xh = float((geom or {}).get("xheight") or (em * ppi))
-        gapm = float((geom or {}).get("inter_px") or 0.15 * xh)
+        # NORMAL inter-letter span = the MATCHED FONT's own median letter gap (per font type),
+        # scaled by the box condense, NOT the line-wide scan span -- the scan median mixes fonts
+        # and gets dragged by the odd wide pair (an inserted glyph then sat too far from the
+        # prefix). Falls back to the scan value if the font can't be measured.
+        gapm = (self._font_median_gap(synth_font, sem, ppi) * condense
+                if synth_font is not None
+                else float((geom or {}).get("inter_px") or 0.15 * xh))
         pre_x1, suf_x0, cx1 = xp, xs_orig, xs_orig
         old_left = xp
         if have_geom:
@@ -4454,20 +4987,105 @@ class PDFDocument:
         keep_scan = ops is not None and any(
             t == "equal" and _run_reliable(mid_lo + i1, mid_lo + i2)
             for t, i1, i2, j1, j2 in ops)
-        if keep_scan:
+        # COPY-NOT-SYNTH for a DUPLICATED glyph: inserting a char IDENTICAL to an immediate
+        # scanned neighbour (a 'y' typed next to the 'y' in 'by') -- a synthesized copy never
+        # matches the scan exactly so it reads wrong, AND because the string is the same whether
+        # the new glyph was typed before or after the original, the diff can place the synth in
+        # the "wrong" slot. Cloning the neighbour's REAL scan pixels fixes both: the two glyphs
+        # are now pixel-identical, so the slot no longer matters and there is no weight mismatch.
+        # ONLY for a pure single-char insert whose char equals a well-segmented scanned neighbour;
+        # the cloned strip then flows through the SAME erase/place/paste path as a synth glyph.
+        copy_strip = None
+        _copy_gap = None
+        _copy_lead = None
+        if (have_geom and not styled and force_synth is None
+                and changed_new and len(set(changed_new)) == 1
+                and p == len(ot) - s):                   # insert of ONE repeated char
+            _cch = changed_new[0]
+            _ci = None
+            if 0 <= p - 1 < len(ot) and ot[p - 1] == _cch and _run_reliable(p - 1, p):
+                _ci = p - 1
+            elif (len(ot) - s) < len(ot) and ot[len(ot) - s] == _cch \
+                    and _run_reliable(len(ot) - s, len(ot) - s + 1):
+                _ci = len(ot) - s
+            if _ci is not None:
+                _res = self._clone_glyphs(region, ctx, Hr, Wr, paper_u8, xof, _ci,
+                                          len(changed_new), 0, geom, gapm, cb=cb)
+                if _res is not None:
+                    copy_strip, _copy_gap, _ybl, _blw, _bloff, _inkoff = _res
+                    if _ci == p - 1:        # first clone bowl one gap past the source bowl right
+                        _copy_lead = _ybl + _blw + _copy_gap - _bloff
+                    dlog("RENDER", "copy_glyph", ch=changed_new, src=int(_ci),
+                         n=len(changed_new))
+        # mid_rel: EXACT per-character x-edges WITHIN the changed strip (tile px, one per
+        # changed_new char + the trailing edge). The live caret reads these (via _live_edges)
+        # so it sits on the real glyph boundaries -- kept-scan pieces carry their scanned edges,
+        # clones the clone pitch, synth the font advances. None => caret falls back to the synth
+        # arithmetic (only right when the whole middle is one plain synth render).
+        mid_rel = None
+        _tail_gap = gapm      # gap opened before the kept suffix (tightened for a trailing clone)
+        if copy_strip is not None:
+            strip, rbear = copy_strip, 0.0
+            _pit = float(_blw + _copy_gap)
+            _pw = float(strip.shape[1])
+            mid_rel = [min(float(_k) * _pit, _pw)
+                       for _k in range(len(changed_new))] + [_pw]
+        elif keep_scan:
             dlog("RENDER", "cascade_mixed", nt=nt)
             pieces = []
-            for tag, i1, i2, j1, j2 in ops:
+            _erel = [0.0]                              # char boundaries within the mixed strip
+            _ex = 0.0
+            _oi = 0
+            while _oi < len(ops):
+                tag, i1, i2, j1, j2 = ops[_oi]
                 if tag == "equal" and _run_reliable(mid_lo + i1, mid_lo + i2):
                     # KEEP real scan pixels. Crop on the MONOTONIC caret edges (not cb[i]
                     # boxes, which can overlap): edge[a]..edge[b] spans the glyphs WITH their
                     # inter-letter gaps and can never duplicate a neighbour.
                     a, b = mid_lo + i1, mid_lo + i2
+                    # CLONE-AFTER: the very next op is an INSERT of the char this run ENDS with
+                    # (a repeated-char insert typed against an identical scanned glyph, e.g. more
+                    # y's after the 'y' in 'by'). Drop that last glyph from the scan crop and
+                    # rebuild it + the inserted copies from its REAL pixels -- so a SECOND edit
+                    # elsewhere in the box no longer forces the whole run to synthesize.
+                    _cn = 0
+                    if (b - 1 >= a and _oi + 1 < len(ops)
+                            and ops[_oi + 1][0] == "insert"):
+                        _run = nt_mid[ops[_oi + 1][3]:ops[_oi + 1][4]]
+                        if (_run and len(set(_run)) == 1 and _run[0] == ot[b - 1]
+                                and _run_reliable(b - 1, b)):
+                            _cn = len(_run)
+                    _res = (self._clone_glyphs(region, ctx, Hr, Wr, paper_u8, xof,
+                                               b - 1, _cn + 1, None, geom, gapm, cb=cb)
+                            if _cn else None)
+                    if _res is not None:
+                        x0 = max(0, min(int(round(xof(a))), Wr))
+                        x1 = max(x0, min(int(round(xof(b - 1))), Wr))  # exclude the cloned glyph
+                        if x1 > x0:
+                            pieces.append(np.ascontiguousarray(region[0:Hr, x0:x1]))
+                        for _c in range(a + 1, b):     # kept chars a..b-2 at scanned edges
+                            _erel.append(_ex + float(xof(_c) - xof(a)))
+                        _ex += float(x1 - x0)
+                        _cst = _res[0]
+                        _pit = float(_res[3] + _res[1])           # blw + gap = clone pitch
+                        for _c in range(1, _cn + 2):  # source + clones at the clone pitch
+                            _erel.append(_ex + float(_c) * _pit)
+                        _ex += float(_cst.shape[1])
+                        _erel[-1] = _ex               # snap last boundary to the piece end
+                        pieces.append(_cst)
+                        dlog("RENDER", "copy_glyph", ch=_run, src=int(b - 1), n=_cn)
+                        _oi += 2                       # consumed the equal run AND the insert
+                        continue
                     x0 = max(0, min(int(round(xof(a))), Wr))
                     x1 = max(x0, min(int(round(xof(b))), Wr))
                     if x1 > x0:
                         pieces.append(np.ascontiguousarray(region[0:Hr, x0:x1]))
+                    for _c in range(a + 1, b + 1):    # kept chars at their scanned edges
+                        _erel.append(_ex + float(xof(_c) - xof(a)))
+                    _ex += float(x1 - x0)
+                    _oi += 1
                     continue
+                _oi += 1
                 if tag == "delete":
                     continue
                 sa, sb = mid_lo + j1, mid_lo + j2      # changed/added OR degenerate-equal -> synth
@@ -4485,14 +5103,114 @@ class PDFDocument:
                         fit[:rows] = rstr[:rows]
                         rstr = fit
                     pieces.append(np.ascontiguousarray(rstr))
+                    _rw = float(rstr.shape[1])
+                    _nc = sb - sa
+                    if synth_font is not None and _nc > 0:
+                        _tot = float(synth_font.text_length(nt[sa:sb], sem)) or 1.0
+                        for _c in range(1, _nc + 1):
+                            _erel.append(_ex + _rw * (float(
+                                synth_font.text_length(nt[sa:sa + _c], sem)) / _tot))
+                    else:
+                        for _c in range(1, _nc + 1):
+                            _erel.append(_ex + _rw * float(_c) / float(max(1, _nc)))
+                    _ex += _rw
             mixed = (np.ascontiguousarray(np.hstack(pieces))
                      if pieces else None)
             strip, rbear = mixed, 0.0
+            if mixed is not None and len(_erel) == len(changed_new) + 1:
+                _erel[-1] = float(mixed.shape[1])
+                mid_rel = _erel
         else:
-            strip, rbear = self._render_run_strip(
-                ctx, changed_new, changed_styles, base, sem, lfb, synth_fpath,
-                condense, local_by, synth_font, ppi, region, cb, ot, paper_u8,
-                have_geom, Hr, Wr)
+            # BOUNDARY CLONE: a typed run duplicating the scanned glyph right BEFORE (prefix's
+            # last) or AFTER (suffix's first) the change is cloned from THAT glyph's REAL pixels;
+            # only genuinely new glyphs synthesize. This is the pure-insert path (no unchanged
+            # middle glyph for the cascade to anchor on), so the neighbour lives in the kept
+            # prefix/suffix -- e.g. inserting 'niucs' before the scanned 's' of 'stered' clones
+            # that trailing 's'. changed_new = [lead == ot[p-1]] + [synth] + [trail == ot[ns]];
+            # a one-gap paper pad separates a synth part from a clone part.
+            _ns = len(ot) - s
+            _ld = _tr = 0
+            if have_geom and not styled and force_synth is None and changed_new:
+                if p - 1 >= 0 and _run_reliable(p - 1, p):
+                    _lc = ot[p - 1]
+                    while _ld < len(changed_new) and changed_new[_ld] == _lc:
+                        _ld += 1
+                if _ns < len(ot) and _run_reliable(_ns, _ns + 1):
+                    _tc = ot[_ns]
+                    while _tr < len(changed_new) - _ld and changed_new[-1 - _tr] == _tc:
+                        _tr += 1
+            _smid = changed_new[_ld:len(changed_new) - _tr]
+            _parts, _drel, _dx = [], [0.0], 0.0
+            _ok = bool(_ld or _tr)
+            _gpad = max(1, int(round(gapm)))
+            if _ok and _ld:
+                _r = self._clone_glyphs(region, ctx, Hr, Wr, paper_u8, xof,
+                                        p - 1, _ld, 0, geom, gapm, cb=cb)
+                if _r is not None:
+                    _pit = float(_r[3] + _r[1])
+                    for _k in range(1, _ld + 1):
+                        _drel.append(_dx + float(_k) * _pit)
+                    _dx += float(_r[0].shape[1]); _drel[-1] = _dx
+                    _parts.append(_r[0])
+                    _copy_gap = _r[1]
+                    _copy_lead = _r[2] + _r[3] + _r[1] - _r[4]   # snap lead to source rhythm
+                else:
+                    _ok = False
+            if _ok and _smid:
+                if _parts:
+                    _pd = np.empty((Hr, _gpad, 3), np.uint8); _pd[:] = paper_u8
+                    _parts.append(_pd); _dx += _gpad
+                _rstr, _ = self._render_run_strip(
+                    ctx, _smid, changed_styles[_ld:len(changed_new) - _tr], base, sem, lfb,
+                    synth_fpath, condense, local_by, synth_font, ppi, region, cb, ot,
+                    paper_u8, have_geom, Hr, Wr)
+                if _rstr is None:
+                    _ok = False
+                else:
+                    if _rstr.shape[0] != Hr:
+                        _fit = np.empty((Hr, _rstr.shape[1], 3), np.uint8); _fit[:] = paper_u8
+                        _rr = min(Hr, _rstr.shape[0]); _fit[:_rr] = _rstr[:_rr]; _rstr = _fit
+                    _rw = float(_rstr.shape[1]); _nc = len(_smid)
+                    if synth_font is not None and _nc:
+                        _tot = float(synth_font.text_length(_smid, sem)) or 1.0
+                        for _k in range(1, _nc + 1):
+                            _drel.append(_dx + _rw * (float(
+                                synth_font.text_length(_smid[:_k], sem)) / _tot))
+                    else:
+                        for _k in range(1, _nc + 1):
+                            _drel.append(_dx + _rw * float(_k) / float(max(1, _nc)))
+                    _dx += _rw
+                    _parts.append(np.ascontiguousarray(_rstr))
+            if _ok and _tr:
+                _r = self._clone_glyphs(region, ctx, Hr, Wr, paper_u8, xof,
+                                        _ns, _tr, 0, geom, gapm, cb=cb)
+                if _r is not None:
+                    # space the clone (and the gap before the kept suffix) by the source glyph's
+                    # OWN advance gap, not the wide font-median gapm -- so it sits as tight as the
+                    # scan sets that letter (the cloned 's' snug against the scanned 's', not adrift).
+                    _tail_gap = float(_r[1])
+                    _tpad = max(1, int(round(_r[1])))
+                    if _parts:
+                        _pd = np.empty((Hr, _tpad, 3), np.uint8); _pd[:] = paper_u8
+                        _parts.append(_pd); _dx += _tpad
+                    _pit = float(_r[3] + _r[1])
+                    for _k in range(1, _tr + 1):
+                        _drel.append(_dx + float(_k) * _pit)
+                    _dx += float(_r[0].shape[1]); _drel[-1] = _dx
+                    _parts.append(_r[0])
+                else:
+                    _ok = False
+            if _ok and _parts and len(_drel) == len(changed_new) + 1:
+                strip = np.ascontiguousarray(np.hstack(_parts))
+                rbear = 0.0
+                mid_rel = _drel
+                dlog("RENDER", "boundary_clone", ch=changed_new,
+                     lead=int(_ld), trail=int(_tr))
+            else:
+                strip, rbear = self._render_run_strip(
+                    ctx, changed_new, changed_styles, base, sem, lfb, synth_fpath,
+                    condense, local_by, synth_font, ppi, region, cb, ot, paper_u8,
+                    have_geom, Hr, Wr)
         synth_w = (float(strip.shape[1]) if strip is not None
                    else (float(synth_font.text_length(changed_new, sem)) * ppi * condense
                          if changed_new else 0.0))
@@ -4518,7 +5236,13 @@ class PDFDocument:
                     gband = band.mean(2) if band.ndim == 3 else band
                     colink = (255.0 - gband.astype(np.float32)).sum(0)
                     so0 = lo + int(np.argmin(colink))   # thinnest column = the real gap
-            so0 = max(0, min(so0, Wr))
+            # NEVER start the suffix crop RIGHT of the first kept glyph's own left edge: on a
+            # pure INSERT cx1==suf_x0, so the thinnest-column search above scans INSIDE the
+            # first suffix glyph's ink ([suf_x0, suf_x0+4]) and lands past its stem, clipping
+            # it (the inserted 'y' left the following 'r' with its left stem cut off). Clamp so
+            # the crop begins at-or-before that glyph; for a real REPLACE the gap column is
+            # already left of suf_x0, so this is a no-op there.
+            so0 = max(0, min(so0, int(round(suf_x0)), Wr))
             if synth_w > 0 and p < len(ot) - s:
                 # REPLACE (a glyph was actually replaced -- changed_old is non-empty, i.e.
                 # p < len(ot)-s): the new glyph fills the OLD glyph's ink slot, so its
@@ -4530,11 +5254,14 @@ class PDFDocument:
                 xink = old_left
                 shift = synth_w - max(0.0, cx1 - old_left)
             elif synth_w > 0:
-                # INSERT / append: a brand-new glyph needs its own inter-letter gap, so the
-                # suffix opens up by the glyph width PLUS the last glyph's right bearing (so a
-                # narrow last glyph like 'j' keeps real space before the suffix) plus one gap.
+                # INSERT: a brand-new glyph needs ONE inter-letter gap before the kept suffix.
+                # Open the suffix by the glyph's INK width + one gap (_tail_gap = the scan's OWN
+                # inter-letter spacing -- gapm normally, or a trailing CLONE's tighter advance gap
+                # so the cloned glyph sits snug against the scanned one it duplicates). Do NOT also
+                # add the run's right side-bearing (rbear): the gap already IS the full visible
+                # ink-to-ink gap, so adding rbear on top DOUBLED the space after a single glyph.
                 xink = old_left
-                shift = synth_w + rbear + gapm - max(0.0, suf_x0 - old_left)
+                shift = synth_w + _tail_gap - max(0.0, suf_x0 - old_left)
             else:
                 # DELETE: close the hole to ONE natural gap (0 beside a space) so the
                 # survivors keep normal spacing, not a double-width hole.
@@ -4543,6 +5270,27 @@ class PDFDocument:
                 xink = pre_x1
                 shift = (pre_x1 + gj) - suf_x0
             xs_new = so0 + shift
+            # INSERT LEADING GAP: an inserted glyph is anchored at old_left = the NEXT glyph's
+            # slot, so it inherits THAT glyph's leading gap -- which can be far wider than a
+            # normal letter gap (the 'e   y' over-wide space before an inserted 'y', because the
+            # scanned 'e r' pair happened to sit ~6px apart). When the change LEADS with an
+            # insert (a pure insert, OR a cascade whose first op is 'insert'), pull the whole
+            # placed run left so the inserted glyph sits ONE normal gap (gapm) past the prefix;
+            # xs_new moves with it, so the inter-piece spacing is untouched and only the leading
+            # gap tightens. A true REPLACE keeps old_left (the new glyph fills the old slot).
+            _lead_ins = ((p == len(ot) - s) or
+                         (keep_scan and ops and ops[0][0] == "insert"))
+            if _lead_ins and synth_w > 0:
+                # a CLONE snaps EXACTLY onto its source glyph's caret rhythm (push OR pull), so
+                # original->first-clone matches clone->clone; a synth insert only pulls left to one
+                # normal inter-letter gap past the prefix (never pushed right past its slot).
+                if _copy_lead is not None:
+                    _delta = xink - _copy_lead
+                else:
+                    _delta = max(0.0, xink - (pre_x1 + gapm))
+                if _delta:
+                    xink -= _delta
+                    xs_new -= _delta
         else:
             xink = xp
             erase_start = xp
@@ -4586,6 +5334,15 @@ class PDFDocument:
         if have_geom:
             ly0 = max(0, min(int(b[1]) for b in cb) - 1)
             ly1 = min(Hr, max(int(b[3]) for b in cb) + 1)
+            # The char boxes can UNDER-measure a tall glyph's real ink (a 48px box on a 66px
+            # digit), so this box-derived paste band would RE-CLIP a correctly-seated synth back
+            # to the short box height (the "synth digit too small" bug). Widen to the seat band --
+            # the scanned neighbour's true cap-to-baseline ink on THIS line -- so the synth keeps
+            # the height it was seated to. Still this line's own band, so no next-line bleed.
+            _sb = ctx.get("_seat_band")
+            if _sb and int(_sb[1]) > int(_sb[0]):
+                ly0 = max(0, min(ly0, int(_sb[0])))
+                ly1 = min(Hr, max(ly1, int(_sb[1]) + 1))
         else:
             bpad = max(1, int(0.12 * (ctx["ink_bot"] - ctx["ink_top"])))
             ly0, ly1 = max(0, ctx["ink_top"] - bpad), min(Hr, ctx["ink_bot"] + bpad)
@@ -4622,6 +5379,13 @@ class PDFDocument:
                     sub[flat] = pg[np.random.RandomState(98765).randint(0, len(pg), nf)]
         except Exception:
             pass
+        # TABLE-LINE PRESERVE: the erase + grain above clear the whole edited band, which
+        # wipes (and speckles) any table rule that sits in it -- a digit's OCR box can absorb
+        # the rule above the line (box top -> the rule row), dragging the erase band up onto
+        # it. The MOVE path keeps borders (_fill_cover_preserving_borders); the in-place path
+        # did not. Restore the detected rule pixels straight from the original scan so an edit
+        # never breaks or degrades a table line.
+        self._restore_borders_in_tile(tile, region, ctx, Hr, Wr)
         # LIVE CARET EDGES: emit the EXACT per-character x-edges (display pts) of THIS
         # composite -- prefix at its scanned positions, the synth middle laid across its
         # real rendered width ``synth_w`` (SPACES included, so the caret advances on a
@@ -4635,7 +5399,12 @@ class PDFDocument:
             _oe = oedges
             _comp = [_D(_oe[i]) for i in range(min(p + 1, len(_oe)))]
             _mid = changed_new
-            if _mid and synth_font is not None:
+            if _mid and mid_rel is not None and len(mid_rel) == len(_mid) + 1:
+                # EXACT edges from the composed pieces (kept-scan/clone/synth widths), so the
+                # caret lands on the real glyphs even for a cloned or multi-edit middle.
+                for _k in range(1, len(_mid) + 1):
+                    _comp.append(_D(xink + mid_rel[_k]))
+            elif _mid and synth_font is not None:
                 _at = float(synth_font.text_length(_mid, sem)) or 1.0
                 for _k in range(1, len(_mid) + 1):
                     _comp.append(_D(xink + synth_w
@@ -4648,6 +5417,61 @@ class PDFDocument:
         except Exception:
             ctx["_live_edges"] = None
         return tile, disp_for(Wg, tile.shape[0])
+
+    def _restore_borders_in_tile(self, tile, region, ctx, Hr, Wr):
+        """Copy any detected HORIZONTAL table-rule pixels back from the ORIGINAL scan
+        ``region`` into the composed ``tile``, so the in-place edit's erase/grain never
+        breaks or degrades a table line above/below the text. The page's display-space
+        border lines map into this line's crop via the ctx ``disp_rect`` (move-adjusted
+        display origin) + ``ppi``. No detected rule in this line -> no-op.
+
+        ponytail: horizontal-only and restores just the original [:Wr] span. A VERTICAL
+        rule that crosses an edited glyph is the separate force_synth/_strip_borders case
+        -- blanket-restoring its column here would revert the fresh synth glyph -- and a
+        widening insert does not re-extend a rule into the grown columns. Add those if a
+        real case needs them; this fixes the reported horizontal-rule-above-the-line wipe."""
+        try:
+            h, _v = self._cached_border_lines(int(ctx["page_index"]))
+        except Exception:
+            return
+        if not h:
+            return
+        ppi = float(ctx["ppi"])
+        dy0 = float(ctx["disp_rect"][1])
+        rH, rW = region.shape[:2]
+        w = min(Wr, rW)
+        import numpy as np
+
+        def _inkfrac(a, b):                                    # ink coverage of region rows [a:b)
+            a = max(0, a); b = min(rH, b)
+            if b <= a or w <= 0:
+                return 0.0
+            return float(((255.0 - region[a:b, :w].mean(2)) / 255.0 > 0.35).mean())
+
+        for (bx0, by0, bx1, by1) in h:                         # horizontal rule -> row band
+            r0 = max(0, int(round((min(by0, by1) - dy0) * ppi)) - 1)
+            r1 = min(Hr, rH, int(round((max(by0, by1) - dy0) * ppi)) + 2)
+            if not (r1 > r0 and w > 0):
+                continue
+            # A genuine rule is an ISOLATED thin line -- paper on at least one side (a table grid
+            # line, or an underline with text only above it). Heavy dense scanned TEXT (a near-black
+            # VIN) trips the border detector as one long horizontal run; restoring that band copies
+            # the ORIGINAL un-shifted glyphs back over a delete/insert edit and the whole line
+            # smears (the "backspace breaks the rest of the line" bug). Ink on BOTH sides means the
+            # band sits inside a text mass, not a rule -> skip it.
+            if min(_inkfrac(r0 - 4, r0), _inkfrac(r1, r1 + 4)) > 0.25:
+                continue
+            tile[r0:r1, :w] = region[r0:r1, :w]
+            # WIDENING insert: the line grew past the original scan width, so the rule would
+            # stop short under the inserted text (it overflowed past the cell border). Extend
+            # the rule into the grown columns by repeating its OWN rightmost pixels -- if there
+            # is no rule at that right edge (region slice is paper) this tiles paper, a no-op.
+            tw = tile.shape[1]
+            if tw > w:
+                _rep = region[r0:r1, max(0, w - 6):w]
+                if _rep.shape[1] > 0:
+                    _reps = int(np.ceil((tw - w) / _rep.shape[1]))
+                    tile[r0:r1, w:] = np.tile(_rep, (1, _reps, 1))[:, :tw - w]
 
     def _scanned_inplace_raster(self, box: "NewBox", new_text: str,
                                 orig_text: str = "", runs: tuple | None = None,
@@ -4747,8 +5571,21 @@ class PDFDocument:
             base = (bool(getattr(box, "bold", False)),
                     bool(getattr(box, "italic", False)), None)
             per_line = self._slice_runs_per_line(runs, new_lines, base) if runs else None
+            # TOP edge (page px) of every line cover. A paragraph line's cover can extend DOWN
+            # into the next line's top (the OCR covers overlap); the changed line's tile then
+            # carries erased/degraded PAPER in its lower rows, which -- pasted over the canvas --
+            # would clip the top of the line below (Edward: "12/31 is cutting the line below").
+            # Clamp each tile's paste bottom to the next line's cover top so only the real scan
+            # of the line below ever shows there. The changed line's own text sits in the tile
+            # TOP, well above this, so it is never cut.
+            line_top_px = []
+            for _lc in line_covers:
+                _lx0, _ly0, _lx1, _ly1 = (float(c) for c in _lc[:4])
+                _lp = [fitz.Point(px, py) * rot for px, py in
+                       ((_lx0, _ly0), (_lx1, _ly0), (_lx1, _ly1), (_lx0, _ly1))]
+                line_top_px.append(min(p.y for p in _lp) * ppi)
             # Compose only the CHANGED lines; unchanged lines stay the base scan crop.
-            composed = []                              # (px_left, px_top, tile)
+            composed = []                              # (px_left, px_top, tile, line_index)
             max_right_px = bx1
             for i, lc in enumerate(line_covers):
                 o = (orig_lines[i] or "").strip()
@@ -4772,7 +5609,7 @@ class PDFDocument:
                     continue
                 pl = int(round(disp[0] * ppi))         # line tile left/top in page px
                 pt = int(round(disp[1] * ppi))
-                composed.append((pl, pt, tile))
+                composed.append((pl, pt, tile, i))
                 max_right_px = max(max_right_px, pl + tile.shape[1])
             crop = np.ascontiguousarray(page_rgb[by0:by1, bx0:bx1])
             Hc = crop.shape[0]
@@ -4783,11 +5620,15 @@ class PDFDocument:
             canvas = np.empty((Hc, Wc, 3), np.uint8)
             canvas[:] = paper_u8                       # right-extension fill (if grown)
             canvas[:, :crop.shape[1]] = crop           # real scan incl. inter-line gaps
-            for pl, pt, tile in composed:              # paste each changed line in place
+            for pl, pt, tile, li in composed:          # paste each changed line in place
                 ox, oy = pl - bx0, pt - by0
                 th, tw = tile.shape[:2]
                 sx0, sy0 = max(0, ox), max(0, oy)
                 sx1, sy1 = min(Wc, ox + tw), min(Hc, oy + th)
+                # never paste DOWN over the line below: clamp to the next line's cover top so
+                # this tile's overhanging paper rows don't clip it (the line's own text is higher).
+                if li + 1 < len(line_top_px):
+                    sy1 = min(sy1, int(round(line_top_px[li + 1])) - by0)
                 if sx1 <= sx0 or sy1 <= sy0:
                     continue
                 canvas[sy0:sy1, sx0:sx1] = tile[sy0 - oy:sy1 - oy, sx0 - ox:sx1 - ox]
@@ -5156,6 +5997,22 @@ class PDFDocument:
                             page_index=page_index,
                         )
                     )
+        # ALIGNMENT RECOGNITION: mark GENUINE centered single lines (a title/subtitle
+        # alone on its baseline row, near the page's horizontal centre) so
+        # ``_maybe_recenter`` re-centers only those. A line that SHARES its baseline
+        # with another span is a table/form row -> its cell stays left-anchored, so a
+        # resize or a different-size edit leaves the first letter where it was.
+        pw = float((page.rect * page.derotation_matrix).width)
+
+        def _is_centered(sp: "Span") -> bool:
+            if not sp.is_horizontal or pw <= 0:
+                return False
+            cx = (sp.bbox[0] + sp.bbox[2]) / 2.0
+            if abs(cx - pw / 2.0) > pw * 0.06:
+                return False
+            return not any(o is not sp and abs(o.origin[1] - sp.origin[1]) <= 2.0
+                           for o in out)
+        out = [replace(sp, centered_line=_is_centered(sp)) for sp in out]
         merged = self._merge_overlapping(out)
         boxes = self._group_paragraphs(merged)
         return self._apply_manual_grouping(page_index, boxes, merged)
@@ -7185,7 +8042,7 @@ class PDFDocument:
         # inside the editor) are the truth for B/I -- report them so the
         # inspector buttons and the editor's base font match the staged ink.
         if edit is not None and edit.runs:
-            run_styles = {(b, i) for _, b, i in edit.runs}
+            run_styles = {(r[1], r[2]) for r in edit.runs}   # index: runs may carry a 4th RunStyle
             if len(run_styles) == 1:
                 bold, italic = next(iter(run_styles))
         if style.font_family is not None:
@@ -8167,15 +9024,16 @@ class PDFDocument:
             # the callers read.
             fonts: dict[tuple, object] = {}
             by_style: dict[tuple, list] = {}
-            for t, b, i in edit.runs:
+            for run in edit.runs:                # underline (opt. 4th elem) doesn't
+                t, b, i = run[0], run[1], run[2]  # change width -> key on (bold, italic)
                 by_style.setdefault((b, i), []).append(t)
             for style_key, parts in by_style.items():
                 rf_k = PDFDocument._resolve_run(engine, page_index, box, edit,
                                                 "".join(parts), *style_key)
                 fonts[style_key] = engine.fitz_font_for(rf_k)
             return wrap_rich(
-                [(t, (b, i)) for t, b, i in edit.runs], fonts, size, left,
-                first_y, width, alignment=align, leading=leading,
+                [(run[0], (run[1], run[2])) for run in edit.runs], fonts, size,
+                left, first_y, width, alignment=align, leading=leading,
                 line_spacing=spacing,
             )
         rf = PDFDocument._resolve_for_edit(engine, page_index, box, edit, text)
@@ -8217,21 +9075,28 @@ class PDFDocument:
             # the runs sequentially, advancing x by each run's measured width.
             drawn: list[tuple] = []
             total_w = 0.0
-            for t, b, i in edit.runs:
+            for run in edit.runs:
+                t, b, i = run[0], run[1], run[2]
+                rs = run[3] if len(run) > 3 else None
+                ul = bool(rs.underline) if rs is not None else False
                 rf_run = PDFDocument._resolve_run(engine, page_index, span,
                                                   edit, t, b, i)
                 fname = PDFDocument._register_resolved(engine, page, rf_run,
                                                        registered)
                 w = engine.fitz_font_for(rf_run).text_length(t, fontsize=size)
-                drawn.append((t, fname, w))
+                drawn.append((t, fname, w, ul))
                 total_w += w
             origin = PDFDocument._maybe_recenter(page, span, edit, origin,
                                                  total_w)
             x, y = origin
-            for t, fname, w in drawn:
+            uls: list = []
+            for t, fname, w, ul in drawn:
                 PDFDocument._insert_run(shape, (x, y), t, size, fname, color,
                                         span.dir)
+                if ul:
+                    uls.append(((x, y), w, span.dir))
                 x += w
+            PDFDocument._stroke_underlines(shape, uls, size, color)
             return
         rf = PDFDocument._resolve_for_edit(engine, page_index, span, edit, text)
         fontname = PDFDocument._register_resolved(engine, page, rf, registered)
@@ -8256,13 +9121,19 @@ class PDFDocument:
         meant the test could NEVER pass and a swapped certificate name saved
         anchored to the old left edge. Mapping the rect through
         ``derotation_matrix`` is identity on unrotated pages."""
-        if not span.is_horizontal or edit.move is not None:
+        # Re-center ONLY a genuine centered single line (set at extraction: near the
+        # page centre AND alone on its baseline row). A table/form cell is NOT flagged,
+        # so it keeps its left edge -> a resize or different-size edit leaves the first
+        # letter put instead of sliding (Edward's "the first letter jumps").
+        if not span.is_horizontal or not getattr(span, "centered_line", False):
             return origin
-        pw = float((page.rect * page.derotation_matrix).width)
         cx = (span.bbox[0] + span.bbox[2]) / 2.0
-        if pw > 0 and abs(cx - pw / 2.0) <= pw * 0.06:
-            return (cx - new_width / 2.0, origin[1])
-        return origin
+        # Re-center the BASE on the page, then ADD the move so the two stay CONSISTENT.
+        # Dropping re-center the instant a move existed made a centered line snap by the
+        # centering offset on the FIRST drag (it landed left of the drop point); adding
+        # the move keeps it grabbable AND jump-free.
+        mvx = edit.move[0] if edit.move is not None else 0.0
+        return (cx - new_width / 2.0 + mvx, origin[1])
 
     @staticmethod
     def _resolve_run(engine: "FontEngine", page_index: int, span,
@@ -8322,30 +9193,44 @@ class PDFDocument:
 
         if edit.runs:
             reg = registered if registered is not None else set()
+
+            def _fields(run):                    # (text, bold, italic, underline)
+                rs = run[3] if len(run) > 3 else None
+                return (run[0], run[1], run[2],
+                        bool(rs.underline) if rs is not None else False)
             # One resolve/register per distinct style key, with ALL of that
-            # style's text so glyph-coverage checks see every character.
+            # style's text so glyph-coverage checks see every character. The key
+            # includes underline so a seg carries it to the stroke pass; the face
+            # itself resolves off (bold, italic) only (underline is drawn, not a face).
             by_style: dict[tuple, list] = {}
-            for t, b, i in edit.runs:
-                by_style.setdefault((b, i), []).append(t)
+            for run in edit.runs:
+                t, b, i, ul = _fields(run)
+                by_style.setdefault((b, i, ul), []).append(t)
             fonts: dict[tuple, object] = {}
             fnames: dict[tuple, str] = {}
             for style_key, parts in by_style.items():
+                b, i, _ul = style_key
                 rf_k = PDFDocument._resolve_run(engine, page_index, box, edit,
-                                                "".join(parts), *style_key)
+                                                "".join(parts), b, i)
                 fnames[style_key] = PDFDocument._register_resolved(
                     engine, page, rf_k, reg)
                 fonts[style_key] = engine.fitz_font_for(rf_k)
             result = wrap_rich(
-                [(t, (b, i)) for t, b, i in edit.runs], fonts, size, left,
-                first_y, width, alignment=align, leading=leading,
-                line_spacing=spacing,
+                [(t, (b, i, ul)) for t, b, i, ul in map(_fields, edit.runs)],
+                fonts, size, left, first_y, width, alignment=align,
+                leading=leading, line_spacing=spacing,
             )
+            uls: list = []
             for ln in result.lines:
                 for seg in ln.segments:
                     PDFDocument._insert_run(
                         shape, (seg.x, ln.origin[1]), seg.text, size,
                         fnames[seg.style], color, (1.0, 0.0),
                     )
+                    if seg.style[2]:             # underline flag in the style key
+                        w = fonts[seg.style].text_length(seg.text, fontsize=size)
+                        uls.append(((seg.x, ln.origin[1]), w, (1.0, 0.0)))
+            PDFDocument._stroke_underlines(shape, uls, size, color)
             return
 
         font = engine.fitz_font_for(rf)
@@ -8509,9 +9394,10 @@ class PDFDocument:
         if edit.runs:
             width = sum(
                 engine.fitz_font_for(
-                    self._resolve_run(engine, page, box, edit, t, b, i)
-                ).text_length(t, fontsize=size)
-                for t, b, i in edit.runs
+                    self._resolve_run(engine, page, box, edit,
+                                      run[0], run[1], run[2])
+                ).text_length(run[0], fontsize=size)
+                for run in edit.runs
             )
         else:
             text = edit.effective_text(box)
@@ -8964,6 +9850,24 @@ class PDFDocument:
             point, text, fontsize=fontsize, fontname=fontname,
             color=color, morph=morph, render_mode=render_mode,
         )
+
+    @staticmethod
+    def _stroke_underlines(shape: "fitz.Shape", segs: list, size: float,
+                           color: tuple) -> None:
+        """Stroke an underline under each run in ``segs`` = [(baseline_origin,
+        width, direction), ...] on the page's batch ``shape``. The line sits
+        ~0.11*size below the baseline, PERPENDICULAR to the writing direction (so
+        rotated runs underline along their own line), thickness ~0.055*size. One
+        ``finish`` per call: every run of a single edit shares that edit's ink
+        colour, so a single stroke pass is exact. No-op on an empty list."""
+        if not segs:
+            return
+        off = 0.11 * size
+        for (ox, oy), w, (dx, dy) in segs:
+            px, py = -dy * off, dx * off        # down-perpendicular (PDF y-down)
+            shape.draw_line(fitz.Point(ox + px, oy + py),
+                            fitz.Point(ox + w * dx + px, oy + w * dy + py))
+        shape.finish(color=color, width=max(0.4, 0.055 * size))
 
     @staticmethod
     def _face_name(prefix: str, buffer: bytes) -> str:

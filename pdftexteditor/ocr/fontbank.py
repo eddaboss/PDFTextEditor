@@ -847,7 +847,15 @@ def match_edge(scan_tiles: dict, topk: int = 6) -> "dict | None":
         return None
     ms = np.full(F, -1.0, np.float32)
     ms[valid] = score[valid] / wsum[valid]
-    order = np.argsort(-ms)[:topk]
     paths = fb["paths"]
+    # DROP explicitly-BLOCKED fonts from the RESULT, not just the coarse candidate set: the edge
+    # bank still carries their fingerprints (Workbench 02771 wrongly sits in text_fonts.txt), so
+    # without this the best edge score could be a font Edward pulled from the bank. Only the
+    # blocklist here -- the edge bank is already the text-only bank, so re-applying the full
+    # decorative/text-keys gate would wrongly drop legit faces that just are not in text_fonts.txt.
+    order = [int(i) for i in np.argsort(-ms)
+             if ms[i] >= 0 and os.path.basename(str(paths[i])) not in BLOCKED_FONTS][:topk]
+    if not order:
+        return None
     return {"best": str(paths[order[0]]),
             "topk": [(str(paths[i]), float(ms[i])) for i in order]}

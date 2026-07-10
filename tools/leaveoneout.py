@@ -178,19 +178,29 @@ def run(path, pi, tag, max_glyphs=120, emit=True):
             if realc.shape[0] < 8 or realc.shape[1] < 5:
                 continue
             try:
-                sm = doc._synth_metrics(ctx)               # REAL pipeline sizing: scan-calibrated sem + condense
-                sem = sm[4] if sm else None
-                cond = float(sm[5]) if sm else 1.0
-                fb, _fem = doc._local_font(ctx, float(g.x0) + bw / 2.0)   # per-caret font match
-                strip, _ = doc._synth_strip(ctx, c, em=sem, font_bytes=fb)   # degradation ON
-                saved = ctx["dmg"]; ctx["dmg"] = None
-                cstrip, _ = doc._synth_strip(ctx, c, em=sem, font_bytes=fb)  # crisp control
-                ctx["dmg"] = saved
-                if abs(cond - 1.0) > 0.02:                  # horizontal condense (aspect)
-                    strip = cv2.resize(strip, (max(1, int(round(strip.shape[1] * cond))), strip.shape[0]))
-                    cstrip = cv2.resize(cstrip, (max(1, int(round(cstrip.shape[1] * cond))), cstrip.shape[0]))
+                sm = doc._synth_metrics(ctx)               # scan-calibrated sizing (sem + condense)
+                if not sm:
+                    continue
+                synth_font, lfb, synth_fpath, em, sem, cond = sm
+                base = (False, False, None)
+                cb2 = (ctx.get("geom") or {}).get("char_boxes")
+                paper_u8 = np.clip(ctx["paper"], 0, 255).astype(np.uint8)
+                Hr, Wr, ppi = ctx["Hr"], ctx["Wr"], ctx["ppi"]
+                cbase = ctx.get("char_baseline")
+                lby = float(np.median(cbase)) if cbase else None
+                hg = bool(cb2) and len(cb2) == len(b.text)
+                # THE APP'S PATH: _render_run_strip renders the synth AND seats it to the line's
+                # scanned glyphs (band-seat) + condenses -- the exact sizing the app ships. Calling
+                # _synth_strip directly, as before, skipped that and came out oversized.
+                args = (c, [base], base, sem, lfb, synth_fpath, cond, lby, synth_font, ppi,
+                        region, cb2, b.text, paper_u8, hg, Hr, Wr)
+                strip, _ = doc._render_run_strip(ctx, *args)
+                saved = ctx.get("dmg"); ctx["dmg"] = None; ctx.pop("_lr:" + c, None)
+                cstrip, _ = doc._render_run_strip(ctx, *args)               # crisp control
+                ctx["dmg"] = saved; ctx.pop("_lr:" + c, None)
             except Exception:
-                ctx["dmg"] = ctx.get("dmg")
+                continue
+            if strip is None or cstrip is None:
                 continue
             sc, cc = tight(strip), tight(cstrip)
             if sc is None or cc is None:
@@ -202,7 +212,7 @@ def run(path, pi, tag, max_glyphs=120, emit=True):
             m["char"] = c
             rows.append(m); crows.append(mc)
             if len(pairs) < 24:
-                pairs.append((realc, sc[0], c))
+                pairs.append((realc, sc[0], c))            # already seated by _render_run_strip
     doc.close()
     if emit:
         summarize(rows, tag)
@@ -268,12 +278,16 @@ def montage(pairs, tag):
     cells = []
     for realc, synthc, c in pairs:
         H = 70
-        def up(im):
-            s = H / im.shape[0]
-            return cv2.resize(im, (int(im.shape[1] * s), H), interpolation=cv2.INTER_NEAREST)
+        sc = H / realc.shape[0]              # ONE scale per pair, from the REAL glyph, so the
+        def up(im):                          # synth shows at its TRUE size relative to the real
+            return cv2.resize(im, (max(1, int(round(im.shape[1] * sc))),
+                                   max(1, int(round(im.shape[0] * sc)))),
+                              interpolation=cv2.INTER_NEAREST)
         r, s = up(realc), up(synthc)
         w = max(r.shape[1], s.shape[1], 24)
-        pad = lambda x: np.pad(x, ((0, 0), (0, w - x.shape[1]), (0, 0)), constant_values=255)
+        h = max(r.shape[0], s.shape[0])
+        pad = lambda x: np.pad(x, ((0, h - x.shape[0]), (0, w - x.shape[1]), (0, 0)),
+                               constant_values=255)
         gap = np.full((4, w, 3), 200, np.uint8)
         cells.append(np.vstack([pad(r), gap, pad(s)]))
     H = max(c.shape[0] for c in cells)
