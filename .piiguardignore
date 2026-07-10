@@ -23,3 +23,4 @@ e2d422fdc65e89d9  person-name  # tests/test_forms.py:214 -- synthetic test perso
 98d2e3523ed23832  person-name  # tests/test_images.py:456 -- synthetic test persona (not a real person)
 ca0f8a958b7a5163  person-name  # tests/test_perf_foundation.py:310 -- synthetic test persona (not a real person)
 cec1c6eda957a769  person-name  # tests/test_perf_foundation.py:859 -- synthetic test persona (not a real person)
+4a2e0f331c327d66  person-name  # pdftexteditor/font_engine.py:666 -- a docstring example of a typeface family+weight, not a person
