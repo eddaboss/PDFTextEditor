@@ -1262,8 +1262,20 @@ class PDFDocument:
         if getattr(self, "_oriented", False):
             return
         self._oriented = True
+        # Content-detect orientation ONLY for SCANNED pages (a raster covering
+        # >=half the page) -- the stored /Rotate on a scan is unreliable. A digital
+        # page's /Rotate + text direction are authoritative, and OCR-detecting one
+        # can WRONGLY flip an already-upright page (a Comic Sans body page read as
+        # 180), which then edits/saves at the rotated position. Gate on
+        # scanned_pages(), NOT page_has_text_layer: a sideways scan often carries a
+        # little digital text -- a Bates stamp, page number, or fax header -- and a
+        # text-presence test would wrongly treat it as an upright digital page and
+        # leave it sideways. Image-coverage catches the scan through the stray text.
+        scanned = set(self.scanned_pages())
         for i in range(self.working.page_count):
             try:
+                if i not in scanned:
+                    continue
                 r = self.detect_upright_rotation(i)
                 if self.working[i].rotation != r:
                     self.working[i].set_rotation(r)
