@@ -26,12 +26,17 @@ from pdftexteditor.document import PDFDocument  # noqa: E402
 
 
 def _synthetic_pdf(path: str) -> None:
-    """A one-page PDF with a solid gray field, so there is real content that an
-    overlay must leave byte-for-byte intact."""
+    """A one-page PDF standing in for a SCAN: a white sheet with one black word
+    ("WORD"). The overlay's edit path sizes replacement glyphs to the covered
+    scan's cap-height and degrades them, so the fixture must carry REAL glyphs
+    to measure -- a blank field has none and the sizing reads the whole covered
+    region as one giant character. The invisible overlay must leave this word
+    byte-for-byte intact."""
     doc = fitz.open()
     page = doc.new_page(width=300, height=200)
-    page.draw_rect(fitz.Rect(0, 0, 300, 200), color=(0.6, 0.6, 0.6),
-                   fill=(0.6, 0.6, 0.6), width=0)
+    page.draw_rect(fitz.Rect(0, 0, 300, 200), color=(1, 1, 1),
+                   fill=(1, 1, 1), width=0)
+    page.insert_text((105, 113), "WORD", fontsize=18, color=(0, 0, 0))
     doc.save(path)
     doc.close()
 
@@ -48,9 +53,9 @@ def main():
         doc = PDFDocument(path)
         base = _px(doc.render(0, 2.0))
 
-        # Invisible OCR box with a cover over the middle of the page.
-        cover = (100.0, 80.0, 200.0, 120.0, 1.0, 1.0, 1.0)  # white paper cover
-        box = doc.add_box(0, (105.0, 110.0), "WORD", "Helvetica", 18.0,
+        # Invisible OCR box whose cover is the scanned word's region.
+        cover = (103.0, 99.0, 150.0, 114.0, 1.0, 1.0, 1.0)  # white paper cover
+        box = doc.add_box(0, (105.0, 113.0), "WORD", "Helvetica", 18.0,
                           (0.0, 0.0, 0.0), False, False,
                           cover=cover, render_mode=3)
 
@@ -62,9 +67,12 @@ def main():
             f"max pixel diff was {int(diff.max())}")
         print("  ok  invisible overlay renders pixel-identical (cover not painted)")
 
-        # Editing the word makes it visible: the cover (white) + black text now
-        # draw, so the page changes -- and only inside the cover region.
-        doc.stage_edit(0, box, "EDITED")
+        # Editing the word makes it visible: the cover (white) + the new glyphs
+        # now draw, so the page changes -- and only inside the covered word
+        # region. A SAME-LENGTH replacement stays at the scan's glyph size
+        # within the cover (a longer word would rightly extend past it, which
+        # is a separate behaviour, not the locality this guards).
+        doc.stage_edit(0, box, "MEMO")
         edited = _px(doc.render_with_edits(0, 2.0))
         edited_box = doc._new_boxes[box.edit_key]
         assert edited_box.render_mode == 0, "edit must flip the box visible"
