@@ -242,13 +242,20 @@ def _glyph_features(cov: np.ndarray) -> "np.ndarray | None":
     perim = float(sum(cv2.arcLength(k, True) for k in cs)) or 1.0
     gx = cv2.Sobel(c.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(c.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    sgx, sgy = float(np.abs(gx).sum()), float(np.abs(gy).sum())
     return np.array([
         w / h,                                       # aspect
         area / (h * w),                              # fill
         2.0 * mean_dt / h,                           # stroke (weight)
         float(dv.std()) / mean_dt,                   # contrast (modulation)
         4.0 * np.pi * area / (perim * perim),        # roundness
-        float(np.abs(gy).sum()) / max(float(np.abs(gx).sum()), 1e-3),   # v/h structure
+        # v/h structure as a BOUNDED [0,1] proportion of vertical edge energy.
+        # The raw ratio |gy|/|gx| explodes (~1e5) for a clean vertical stem like
+        # 'i'/'l'/'1' (near-zero horizontal gradient), and ONE exploded glyph
+        # poisoned a whole font's feature penalty to -999 -- silently excluding
+        # it from the match (Arimo could not even match its own render). A
+        # proportion cannot blow up and stays calibrated to _FEAT_SD[5].
+        sgy / (sgx + sgy + 1e-6),                    # v/h structure
     ], np.float32)
 
 
