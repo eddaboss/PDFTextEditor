@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 # --- Mode-independent constants -------------------------------------------
@@ -234,12 +235,51 @@ def _detect_os_mode() -> str:
 
 
 def set_mode(mode: str) -> None:
-    """Force a mode (e.g. for tests or a future in-app toggle)."""
+    """Flip the live palette WITHOUT re-applying any stylesheet (headless/tests).
+    The runtime UI switch goes through ``retheme``."""
     _apply(mode)
 
 
 def current_mode() -> str:
     return MODE
+
+
+class _ThemeEvents(QObject):
+    """Fires after the live palette changes. Widgets that own their OWN
+    stylesheet or paint with ``QColor`` (the canvas, the recent cards) connect
+    here to refresh; everything on the global app stylesheet is handled by
+    ``retheme`` re-applying it."""
+
+    changed = Signal()
+
+
+# ponytail: one module-level emitter, not a per-widget observer registry.
+events = _ThemeEvents()
+
+
+def retheme(mode: str) -> None:
+    """The ONE runtime mode switch: flip tokens, re-apply the app-level
+    stylesheet, sync Qt's native color scheme, then notify listeners. Safe
+    before a QApplication exists (then it just flips tokens + emits)."""
+    if mode == MODE:
+        return
+    _apply(mode)
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is not None:
+        app.setStyleSheet(global_stylesheet())
+        try:
+            app.styleHints().setColorScheme(
+                Qt.ColorScheme.Dark if MODE == "dark" else Qt.ColorScheme.Light)
+        except (AttributeError, TypeError):
+            pass
+    events.changed.emit()
+
+
+def detect_os_mode() -> str:
+    """Public alias for the OS appearance probe (consumed by the live OS-follow
+    listener and the 'Use system' menu choice)."""
+    return _detect_os_mode()
 
 
 # Install the OS-detected palette at import, before any widget or baked QSS

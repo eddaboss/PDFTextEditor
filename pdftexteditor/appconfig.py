@@ -33,7 +33,3 @@ TARGET_BASE_URL = _UPDATES_BASE + "/targets/"
 # tufup application id -- no whitespace, identical across channels (the channel
 # is decided by which server the build points at, above).
 TUFUP_APP_NAME = "PDFTextEditor"
-
-DISPLAY_NAME = "PDF Text Editor (Dev)" if IS_DEV else "PDF Text Editor"
-BUNDLE_ID = ("com.eddaboss.pdftexteditor.dev" if IS_DEV
-             else "com.eddaboss.pdftexteditor")

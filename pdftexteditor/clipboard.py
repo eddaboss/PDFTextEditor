@@ -75,7 +75,10 @@ def encode_runs_mime(text, runs, style) -> bytes:
     payload = {
         "v": 1,
         "text": str(text),
-        "runs": [[str(t), bool(b), bool(i)] for t, b, i in (runs or ())],
+        # Index (not unpack) so a run's optional 4th element (a RunStyle carrying
+        # per-run colour/underline) never crashes the copy. ponytail: colour/underline
+        # aren't carried across copy/paste yet; add a 4th wire field when needed.
+        "runs": [[str(r[0]), bool(r[1]), bool(r[2])] for r in (runs or ())],
         "style": {
             "family": str(style.get("family")
                           or style.get("font_family") or "Helvetica"),

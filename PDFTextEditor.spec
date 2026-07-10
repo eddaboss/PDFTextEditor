@@ -22,7 +22,9 @@ stamps 0.0.0 and Finder "Get Info" shows 0.0.0.
 import os
 import sys
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_submodules, collect_data_files, collect_dynamic_libs,
+)
 
 # SPEC is injected by PyInstaller; make the package importable for __version__.
 sys.path.insert(0, os.path.dirname(os.path.abspath(SPEC)))
@@ -49,10 +51,26 @@ _ICON = "assets/AppIcon.icns" if _IS_MAC else "assets/AppIcon.ico"
 
 _USAGE = "PDF Text Editor needs access so you can open and save your PDF files."
 
+# OCR runtime data: RapidOCR ships its PP-OCR detection/recognition/cls models as
+# .onnx PACKAGE DATA (~14 MB) and onnxruntime ships native provider libraries.
+# PyInstaller does NOT auto-collect either, so a frozen build imports the modules
+# but crashes at RapidOCR() with the models missing -- and Windows runs RapidOCR
+# EXCLUSIVELY (Apple Vision is macOS-only), so without this OCR is dead on Windows.
+# Guarded: collect_* returns [] when the OCR deps aren't installed (the lean base
+# build), so that build stays byte-for-byte unchanged.
+_ocr_datas, _ocr_bins, _ocr_hidden = [], [], []
+for _pkg in ("rapidocr_onnxruntime", "onnxruntime"):
+    try:
+        _ocr_datas += collect_data_files(_pkg)
+        _ocr_bins += collect_dynamic_libs(_pkg)
+        _ocr_hidden += collect_submodules(_pkg)
+    except Exception:
+        pass
+
 a = Analysis(
     ['launch.py'],
     pathex=[],
-    binaries=[],
+    binaries=_ocr_bins,
     # Ship the bundled DejaVu faces so a PDF set in them (mPDF / matplotlib /
     # many web-to-PDF tools) stays editable + saveable in the real face on a
     # machine that does not have them installed. Destination mirrors the package
@@ -61,8 +79,8 @@ a = Analysis(
         ('pdftexteditor/assets/fonts', 'pdftexteditor/assets/fonts'),
         # tufup trust anchor: the updater verifies every update against this.
         ('pdftexteditor/assets/root.json', 'pdftexteditor/assets'),
-    ],
-    hiddenimports=collect_submodules('pdftexteditor'),
+    ] + _ocr_datas,
+    hiddenimports=collect_submodules('pdftexteditor') + _ocr_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
