@@ -83,6 +83,11 @@ class CommentsPanel(QWidget):
         self._refreshing = False
 
         self._build()
+        theme.events.changed.connect(self._restyle)
+
+    def _restyle(self) -> None:
+        """Re-read live tokens after a light/dark switch (count_label color)."""
+        self.count_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
 
     # --- construction ----------------------------------------------------
     def _build(self) -> None:

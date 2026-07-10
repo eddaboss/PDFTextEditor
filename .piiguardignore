@@ -1,0 +1,26 @@
+# .piiguardignore -- suppressed findings (hashes only, no plaintext).
+# Each line: <fingerprint>  <rule>  # reason. Replace the placeholder
+# reason with why the finding is a false positive before committing.
+3b6faa7002a210e5  person-name  # pdftexteditor/assets/fonts/LICENSE_DEJAVU.txt:54 -- font license copyright attribution (public, intentional)
+e4f45a5b3c57adff  person-name  # release/windows_installer.iss:3 -- Inno Setup build-time variable name, not a person
+6b8a11160f9872a8  person-name  # release/windows_installer.iss:7 -- Inno Setup build-time variable name, not a person
+86d0a5b1cecd4e46  person-name  # tests/fixtures/build_annot_fixture.py:8 -- synthetic test persona (not a real person)
+d7e12648bfd004ec  person-name  # tests/fixtures/build_annot_fixture.py:59 -- synthetic test persona (not a real person)
+060386169458a14a  person-name  # tests/fixtures/build_annot_fixture.py:69 -- synthetic test persona (not a real person)
+25c09899507d897a  person-name  # tests/fixtures/build_doctools_fixture.py:50 -- synthetic test persona (not a real person)
+7c0ceb9b878b54af  person-name  # tests/fixtures/build_doctools_fixture.py:97 -- synthetic test persona (not a real person)
+84637d0da568b274  person-name  # tests/fixtures/build_image_fixtures.py:120 -- synthetic test persona (not a real person)
+7d4cbebd77b88b52  person-name  # tests/fixtures/build_image_fixtures.py:134 -- synthetic test persona (not a real person)
+317d18ef3b3377a3  person-name  # tests/fixtures/build_nav_fixture.py:76 -- synthetic test persona (not a real person)
+bf014dffa2745218  person-name  # tests/fixtures/manifest.md:411 -- synthetic test persona (not a real person)
+f2d1bd646053cfb3  person-name  # tests/fixtures/manifest.md:458 -- synthetic test persona (not a real person)
+e356d100e90acecc  person-name  # tests/test_annotations.py:980 -- synthetic test persona (not a real person)
+3cb2da5d3fab2aeb  person-name  # tests/test_annotations.py:1064 -- synthetic test persona (not a real person)
+5a25704eac242f38  person-name  # tests/test_doctools.py:153 -- synthetic test persona (not a real person)
+8579f41e1ca54190  person-name  # tests/test_doctools.py:535 -- synthetic test persona (not a real person)
+16ebc1136e6dbebf  person-name  # tests/test_editor_model.py:628 -- synthetic test persona (not a real person)
+e2d422fdc65e89d9  person-name  # tests/test_forms.py:214 -- synthetic test persona (not a real person)
+98d2e3523ed23832  person-name  # tests/test_images.py:456 -- synthetic test persona (not a real person)
+ca0f8a958b7a5163  person-name  # tests/test_perf_foundation.py:310 -- synthetic test persona (not a real person)
+cec1c6eda957a769  person-name  # tests/test_perf_foundation.py:859 -- synthetic test persona (not a real person)
+4a2e0f331c327d66  person-name  # pdftexteditor/font_engine.py:666 -- a docstring example of a typeface family+weight, not a person

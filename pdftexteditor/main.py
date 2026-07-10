@@ -107,7 +107,42 @@ def _prompt_update(window, meta) -> None:
             "The update is ready. Quit and reopen to finish updating.")
 
 
+def _maybe_onboard(window) -> None:
+    """First launch only: offer to redeem a website sign-in code, or sign in /
+    create an account. Optional and skippable; shown once, never if already
+    signed in. Uses a short timer so the main window paints first."""
+    from PySide6.QtCore import QSettings
+    s = QSettings("eddaboss", "PDF Text Editor")
+    if s.value("account/token", "") or s.value("account/onboarded", False,
+                                                type=bool):
+        return
+    s.setValue("account/onboarded", True)  # show it at most once
+
+    def _show():
+        from .ui.onboarding_dialog import OnboardingDialog
+        OnboardingDialog(window).exec()
+    QTimer.singleShot(600, _show)
+
+
+def _update_check_due() -> bool:
+    """Throttle the on-launch update check to once a day so we are not hitting the
+    update server on every single launch. The manual check in Settings is
+    unaffected. Returns True (and records 'now') when a check is due."""
+    from PySide6.QtCore import QDateTime, QSettings
+    s = QSettings("eddaboss", "PDF Text Editor")
+    now = QDateTime.currentMSecsSinceEpoch()
+    last = int(s.value("update/last_check_ms", 0) or 0)
+    if now - last < 24 * 60 * 60 * 1000:
+        return False
+    s.setValue("update/last_check_ms", now)
+    return True
+
+
 def main() -> int:
+    # Fresh action debug log for this session (see debuglog.py): every significant
+    # action appends to /tmp/pdfte_debug.log so a bug can be read straight off the trace.
+    from . import debuglog
+    debuglog.new_session()
     # Must run before any window renders text so Core Graphics picks it up.
     _disable_macos_font_smoothing()
     app = QApplication(sys.argv)
@@ -137,6 +172,14 @@ def main() -> int:
     window = MainWindow()
     window._restore_window_geometry()   # reopen at the last size + position
     window._enable_persistence()        # flush geometry+session on crash/quit
+    window._apply_saved_appearance()    # honor a saved Light/Dark choice
+    # Follow the OS live: when macOS/Windows flips appearance while we run, the
+    # window re-themes (only under the 'Use system' preference). Qt 6.5+ signal.
+    try:
+        app.styleHints().colorSchemeChanged.connect(
+            lambda _scheme: window.on_os_appearance_changed())
+    except (AttributeError, TypeError):
+        pass
     window.show()
     app.installEventFilter(_FileOpenFilter(window))
     cli_paths = [p for p in sys.argv[1:]
@@ -149,10 +192,13 @@ def main() -> int:
     recovered = window._offer_recovery()
     if not cli_paths and not recovered:
         window._restore_session()
+    # First-run account onboarding (optional, skippable): redeem a website
+    # sign-in code, or sign in / create an account. Shown once.
+    _maybe_onboard(window)
     # On-launch update check (installed builds only): non-blocking; offers a
     # one-click install when a newer signed release exists on this channel.
     from . import __version__, updater
-    if updater.updates_supported():
+    if updater.updates_supported() and _update_check_due():
         window._update_checker = updater.UpdateChecker()
         window._update_checker.available.connect(
             lambda meta: _prompt_update(window, meta))

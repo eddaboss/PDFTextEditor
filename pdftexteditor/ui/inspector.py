@@ -54,15 +54,13 @@ from ..font_engine import (
 )
 from . import theme
 
-# Common point sizes offered as type-ahead completions on the size spin.
-_SIZE_PRESETS = (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 64, 72)
-
 # Style for the family completer popup so type-to-filter matches the combo's own
 # dropdown view (rounded card, 4px pad, accent selection) rather than a raw
 # native QListView (BUILD_SPEC §4.3 / PAGES_SPEC §5.6). The combo's own view is
 # styled in theme.global_stylesheet(); the completer popup is a SEPARATE widget,
 # so it carries its own matching QSS here.
-_COMPLETER_POPUP_QSS = f"""
+def _completer_popup_qss() -> str:
+    return f"""
 QListView#FamilyCompleterPopup {{
     background: {theme.CHROME_BG};
     border: 1px solid {theme.CHROME_BORDER};
@@ -87,11 +85,6 @@ QListView#FamilyCompleterPopup::item:selected {{
 # returns SYSTEM or BASE14 -- but the dict covers all three defensively. Each
 # line states what will land in the SAVED PDF, so the chip teaches the
 # consequence (the product's core trust signal), not just a tier name.
-_FIDELITY_LABEL = {
-    TIER_EMBEDDED: "Original font",
-    TIER_SYSTEM: "System font, embedded on save",
-    TIER_BASE14: "Standard substitute",
-}
 
 # Per-tier status block: (status word, plain-language consequence, ink color,
 # tinted card background). The product's core trust signal -- how faithfully the
@@ -120,6 +113,8 @@ class _FidelityCard(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("InspectorFidelity")
+        self._last_state = None
+        theme.events.changed.connect(self._restyle)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(13, 13, 13, 13)
         lay.setSpacing(10)
@@ -205,6 +200,7 @@ class _FidelityCard(QFrame):
     }
 
     def set_state(self, tier: int, family: str) -> None:
+        self._last_state = (tier, family)   # re-applied on a live theme switch
         word, _line, color, bg = _FIDELITY_BLOCK.get(
             tier, _FIDELITY_BLOCK[TIER_BASE14])
         border = self._FIDELITY_BORDER.get(tier, self._FIDELITY_BORDER[TIER_BASE14])
@@ -240,6 +236,12 @@ class _FidelityCard(QFrame):
 
     def clear(self) -> None:
         self.setVisible(False)
+
+    def _restyle(self) -> None:
+        """Re-apply the per-tier inline colors after a live theme switch (the
+        TEXT_SECONDARY sub/desc lines are mode-dependent)."""
+        if self._last_state is not None:
+            self.set_state(*self._last_state)
 
 
 class _FamilyCombo(QComboBox):
@@ -312,6 +314,13 @@ class Inspector(QWidget):
         # combo's alphabetical first item (BUILD_SPEC §3.5 step 3).
         self._seed_defaults()
         self.set_target(None, None)
+        theme.events.changed.connect(self._restyle)
+
+    def _restyle(self) -> None:
+        """Re-read the inline token colors this panel sets outside the global
+        sheet after a live light/dark switch (the fidelity card self-restyles)."""
+        self._annot_hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        self._paint_swatch()
 
     # =====================================================================
     # Construction
@@ -394,7 +403,7 @@ class Inspector(QWidget):
             if popup is not None:
                 popup.setObjectName("FamilyCompleterPopup")
                 popup.setFont(theme.ui_font(13))
-                popup.setStyleSheet(_COMPLETER_POPUP_QSS)
+                popup.setStyleSheet(_completer_popup_qss())
         self.family_combo.currentIndexChanged.connect(self._on_family_index)
         line = self.family_combo.lineEdit()
         if line is not None:
@@ -707,8 +716,10 @@ class Inspector(QWidget):
             return
 
         with self._loaded():
+            # Show the REAL typeface name, not the opaque scan-bank alias the box
+            # stores internally (e.g. 'ScanFont-01669' -> 'Solway Medium').
             family = style.get("font_family", "")
-            self._select_family(family)
+            self._select_family(FontEngine.display_name_for(family))
             self.size_spin.setValue(float(style.get("size", 12.0) or 12.0))
             self._color = self._norm_color(style.get("color", (0.0, 0.0, 0.0)))
             self._paint_swatch()
@@ -1070,17 +1081,38 @@ class Inspector(QWidget):
             current = self.family_combo.currentText()
             self.family_combo.clear()
             self.family_combo.addItems(self._families)
+            self._apply_item_fonts()
             if current:
                 self._select_family(current)
+
+    def _apply_item_fonts(self) -> None:
+        """Render each family name in its OWN font in the dropdown -- a live type
+        specimen, so the picker reads as a preview (the user can SEE each face).
+        Per-item Qt.FontRole; falls back silently to the combo font for any family
+        that will not load."""
+        for i in range(self.family_combo.count()):
+            self._set_item_font(i, self.family_combo.itemText(i))
+
+    def _set_item_font(self, idx: int, family: str) -> None:
+        if idx < 0:
+            return
+        try:
+            f = QFont(family)
+            f.setPointSize(13)
+            self.family_combo.setItemData(idx, f, Qt.FontRole)
+        except Exception:
+            pass
 
     def _select_family(self, family: str) -> None:
         """Select ``family`` in the combo if present; otherwise add it once so
         the inspector always shows the box's real family even when it is not in
-        the scanned system index (e.g. an embedded-only original)."""
+        the scanned system index (e.g. an embedded-only original or a scan
+        typeface shown by its real name)."""
         idx = self.family_combo.findText(family, Qt.MatchFixedString)
         if idx < 0 and family:
             self.family_combo.addItem(family)
             idx = self.family_combo.findText(family, Qt.MatchFixedString)
+            self._set_item_font(idx, family)
         if idx >= 0:
             self.family_combo.setCurrentIndex(idx)
 

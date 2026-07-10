@@ -344,9 +344,57 @@ def run_scenario(scn: dict) -> list[str]:
     return failures
 
 
+def unit_checks() -> list[str]:
+    """No-fixture checks for the two matcher BUG fixes. (#3 lru_cache and #4 memoize
+    are behaviour-preserving, so the fixture round-trips above already exercise them.)"""
+    from pdftexteditor.font_engine import FontEngine, _FaceRecord
+    fails: list[str] = []
+    # #2: a bold PostScript span and its plain basefont must collapse to the SAME family
+    # key, else the bold span fails to match its embedded face and demotes Tier 1 -> 2.
+    if FontEngine._family_norm("TimesNewRomanPS-BoldMT") != \
+            FontEngine._family_norm("TimesNewRomanPSMT"):
+        fails.append("_family_norm: bold-PS span and plain basefont do not converge")
+    # #1: an unstyled request must pick the PLAIN face, not whatever sorted first on disk.
+    mk = lambda sub: _FaceRecord(path="/" + sub, face_index=0, postscript="X-" + sub,
+                                 family="X", subfamily=sub, full_name="X",
+                                 is_bold=False, is_italic=False)
+    saved = FontEngine._system_index
+    try:
+        FontEngine._system_index = [mk("Medium"), mk("Regular")]  # Medium first on "disk"
+        rec = FontEngine.system_record_for("X", False, False)
+        if not rec or rec.subfamily != "Regular":
+            fails.append(f"system_record_for: unstyled picked "
+                         f"{rec and rec.subfamily!r}, want 'Regular'")
+    finally:
+        FontEngine._system_index = saved
+    # bold-weight reconcile: a per-word font match that lands on the SAME family at a DIFFERENT
+    # weight (Courier New Bold vs Regular are shape-identical, so a weight-blind matcher flips
+    # them) must snap back to the scan run's OWN font, so a typed glyph is as bold as the text it
+    # sits in with no hand-bolding. A genuinely different family is left exactly as matched.
+    import tempfile as _tf
+    from pdftexteditor.document import PDFDocument as _Doc
+    _bd = fitz.open(); _bd.new_page(width=200, height=100)
+    _bp = os.path.join(_tf.gettempdir(), "_weight_reconcile_probe.pdf")
+    _bd.save(_bp); _bd.close()
+    _doc = _Doc(_bp)
+    _doc._ttf_style_cache = {                       # bypass file reads: seed the style cache
+        "/bold.ttf": ("Courier New", True, False),
+        "/reg.ttf": ("Courier New", False, False),
+        "/arial.ttf": ("Arial", False, False)}
+    if _doc._synth_weight_reconcile("/reg.ttf", {"fpath": "/bold.ttf"}) != "/bold.ttf":
+        fails.append("weight reconcile: same-family regular match did not snap to the scan's bold")
+    if _doc._synth_weight_reconcile("/arial.ttf", {"fpath": "/bold.ttf"}) != "/arial.ttf":
+        fails.append("weight reconcile: a different-family per-word match was wrongly overridden")
+    _doc.close()
+    return fails
+
+
 def main() -> int:
     print("Font-fidelity tests (resolve -> save -> re-render)\n")
     all_failures: list[str] = []
+    print("[unit checks: weight tie-break + family-norm convergence]")
+    all_failures.extend(unit_checks())
+    print()
     for scn in SCENARIOS:
         print(f"[{scn['fixture']}]")
         all_failures.extend(run_scenario(scn))

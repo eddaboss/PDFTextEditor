@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 # --- Mode-independent constants -------------------------------------------
@@ -234,12 +235,51 @@ def _detect_os_mode() -> str:
 
 
 def set_mode(mode: str) -> None:
-    """Force a mode (e.g. for tests or a future in-app toggle)."""
+    """Flip the live palette WITHOUT re-applying any stylesheet (headless/tests).
+    The runtime UI switch goes through ``retheme``."""
     _apply(mode)
 
 
 def current_mode() -> str:
     return MODE
+
+
+class _ThemeEvents(QObject):
+    """Fires after the live palette changes. Widgets that own their OWN
+    stylesheet or paint with ``QColor`` (the canvas, the recent cards) connect
+    here to refresh; everything on the global app stylesheet is handled by
+    ``retheme`` re-applying it."""
+
+    changed = Signal()
+
+
+# ponytail: one module-level emitter, not a per-widget observer registry.
+events = _ThemeEvents()
+
+
+def retheme(mode: str) -> None:
+    """The ONE runtime mode switch: flip tokens, re-apply the app-level
+    stylesheet, sync Qt's native color scheme, then notify listeners. Safe
+    before a QApplication exists (then it just flips tokens + emits)."""
+    if mode == MODE:
+        return
+    _apply(mode)
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is not None:
+        app.setStyleSheet(global_stylesheet())
+        try:
+            app.styleHints().setColorScheme(
+                Qt.ColorScheme.Dark if MODE == "dark" else Qt.ColorScheme.Light)
+        except (AttributeError, TypeError):
+            pass
+    events.changed.emit()
+
+
+def detect_os_mode() -> str:
+    """Public alias for the OS appearance probe (consumed by the live OS-follow
+    listener and the 'Use system' menu choice)."""
+    return _detect_os_mode()
 
 
 # Install the OS-detected palette at import, before any widget or baked QSS
@@ -521,7 +561,12 @@ def global_stylesheet() -> str:
     QFrame#ZoomBar QToolButton#ZoomStepBtn:disabled {{ color: {TEXT_TERTIARY}; }}
     QFrame#ZoomBar QToolButton#ZoomButton {{
         border: none; background: transparent;
-        min-width: 44px; padding: 0px 4px; color: {TEXT_PRIMARY};
+        min-width: 58px; padding: 0px 2px 0px 6px; color: {TEXT_PRIMARY};
+    }}
+    /* Show a small dropdown caret so the % reads as the zoom selector. */
+    QFrame#ZoomBar QToolButton#ZoomButton::menu-indicator {{
+        subcontrol-origin: padding; subcontrol-position: right center;
+        right: 3px; width: 8px; height: 8px;
     }}
     QFrame#ZoomBar QToolButton#ZoomButton:hover {{
         background: {WASH_HOVER}; border-radius: {BUTTON_RADIUS}px;
@@ -542,7 +587,7 @@ def global_stylesheet() -> str:
     }}
     QToolBar#MainToolbar QPushButton#SaveButton[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
     QToolBar#MainToolbar QPushButton#SaveButton[dirty="true"]:pressed {{ background: {ACCENT_DEEP}; }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="true"] {{
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="true"] {{
         background: {ACCENT_FILL}; border: none;
         border-left: 1px solid rgba(255,255,255,0.28);
         border-top-right-radius: {CONTROL_RADIUS}px;
@@ -550,7 +595,7 @@ def global_stylesheet() -> str:
         border-top-left-radius: 0px; border-bottom-left-radius: 0px;
         min-width: 27px;
     }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="true"]:hover {{ background: {ACCENT_PRESSED}; }}
 
     /* CLEAN -- a quiet neutral pill: BORDER_STRONG outline, control fill, no
        shadow; the caret owns the inner hairline (border-left). */
@@ -566,7 +611,7 @@ def global_stylesheet() -> str:
         background: {WASH_HOVER}; color: {TEXT_PRIMARY};
     }}
     QToolBar#MainToolbar QPushButton#SaveButton:disabled {{ color: {TOOLBAR_ICON_DISABLED}; }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="false"] {{
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="false"] {{
         background: {CONTROL_FILL};
         border: 1px solid {BORDER_STRONG}; border-left: 1px solid {BORDER_STRONG};
         border-top-right-radius: {CONTROL_RADIUS}px;
@@ -574,9 +619,9 @@ def global_stylesheet() -> str:
         border-top-left-radius: 0px; border-bottom-left-radius: 0px;
         min-width: 27px;
     }}
-    QToolBar#MainToolbar QToolButton#SaveCaret[dirty="false"]:hover {{ background: {WASH_HOVER}; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret[dirty="false"]:hover {{ background: {WASH_HOVER}; }}
     /* We draw our own chevron icon -- hide Qt's menu-indicator arrow. */
-    QToolBar#MainToolbar QToolButton#SaveCaret::menu-indicator {{ image: none; width: 0; }}
+    QToolBar#MainToolbar QPushButton#SaveCaret::menu-indicator {{ image: none; width: 0; }}
 
     /* Group dividers: a short, soft hairline that floats inside the bar
        rather than a full-height hard rule. */
@@ -822,6 +867,34 @@ def global_stylesheet() -> str:
         color: {TEXT_PRIMARY};
     }}
     QStatusBar#MainStatus::item {{ border: none; }}
+
+    /* --- Menu bar ---------------------------------------------------- */
+    /* The File/Edit/View... bar. Clay-styled for the in-window menu on Windows
+       and Linux (where the bar lives in the window); on macOS the native top
+       menu bar is used and this block is a no-op there. Hover and press match
+       the QMenu dropdowns below: a solid accent fill with white text. */
+    QMenuBar {{
+        background: {CHROME_BG};
+        border: none;
+        border-bottom: 1px solid {CHROME_BORDER};
+        padding: 2px 8px;
+        color: {TEXT_PRIMARY};
+        font-size: {UI_FONT_SIZE}px;
+    }}
+    QMenuBar::item {{
+        background: transparent;
+        padding: 5px 10px;
+        border-radius: {BUTTON_RADIUS}px;
+        color: {TEXT_PRIMARY};
+    }}
+    QMenuBar::item:selected {{
+        background: {ACCENT_FILL};
+        color: #FFFFFF;
+    }}
+    QMenuBar::item:pressed {{
+        background: {ACCENT_PRESSED};
+        color: #FFFFFF;
+    }}
 
     /* --- Menus ------------------------------------------------------- */
     QMenu {{

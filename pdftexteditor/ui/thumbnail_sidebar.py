@@ -155,7 +155,9 @@ class PageThumbnailSidebar(QListWidget):
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
         self.currentRowChanged.connect(self._on_row_changed)
-        self.setStyleSheet(_SIDEBAR_QSS)
+        self.setStyleSheet(_sidebar_qss())
+        theme.events.changed.connect(
+            lambda: self.setStyleSheet(_sidebar_qss()))
         # A delegate owns all item painting so the selected-page highlight is a
         # ring around the PAGE image, not the QSS box around the whole cell.
         self.setItemDelegate(_ThumbDelegate(self))
@@ -317,7 +319,8 @@ class PageThumbnailSidebar(QListWidget):
             self.deleteRequested.emit(row)
 
 
-_SIDEBAR_QSS = f"""
+def _sidebar_qss() -> str:
+    return f"""
 QListWidget#PageThumbnailSidebar {{
     background: {theme.CHROME_BG};
     /* The LEFT divider that separates the thumbnails from the center canvas

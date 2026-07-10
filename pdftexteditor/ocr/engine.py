@@ -18,6 +18,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import pack
+
+
+class OcrPackMissing(RuntimeError):
+    """RapidOCR is selected but its downloadable OCR component is not installed.
+    The UI catches this to offer the one-time download."""
+
 
 @dataclass
 class OcrLine:
@@ -53,20 +60,38 @@ class RapidOcrEngine(OcrEngine):
     name = "rapidocr"
     _engine = None
     _lock = threading.Lock()
+    # Inference is serialized: one RapidOCR session is shared across pages, and
+    # its ONNX Runtime sessions already saturate the CPU with intra-op threads,
+    # so running recognitions concurrently would only oversubscribe the cores
+    # (and the Python wrapper is not guaranteed reentrant). With page OCR now
+    # running on a thread pool, the CPU win comes from overlapping this step
+    # with the parallel reconstruct of OTHER pages, not from parallel inference.
+    _infer_lock = threading.Lock()
+
+    @staticmethod
+    def available() -> bool:
+        """True once the downloadable OCR component is installed + importable."""
+        return pack.ensure_on_path()
 
     @classmethod
     def _session(cls):
         if cls._engine is None:
             with cls._lock:
                 if cls._engine is None:
-                    from rapidocr_onnxruntime import RapidOCR
+                    pack.ensure_on_path()
+                    try:
+                        from rapidocr_onnxruntime import RapidOCR
+                    except ImportError as exc:
+                        raise OcrPackMissing(
+                            "The OCR component is not installed.") from exc
                     cls._engine = RapidOCR()
         return cls._engine
 
     def recognize(self, image_rgb: np.ndarray) -> "list[OcrLine]":
         ocr = self._session()
         # RapidOCR accepts an ndarray; it expects BGR/!-agnostic uint8.
-        result, _ = ocr(np.ascontiguousarray(image_rgb))
+        with self._infer_lock:
+            result, _ = ocr(np.ascontiguousarray(image_rgb))
         out: list[OcrLine] = []
         for row in result or []:
             quad, text, conf = row[0], row[1], row[2]

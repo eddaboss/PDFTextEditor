@@ -65,16 +65,34 @@ def main() -> None:
     subprocess.run(
         [sys.executable, str(_HERE / "fetch_state.py"), api, token, platform],
         check=True)
-    Repository(
+    repo = Repository(
         app_name=cfg.APP_NAME, app_version_attr=cfg.APP_VERSION_ATTR,
         repo_dir=cfg.REPO_DIR, keys_dir=cfg.KEYS_DIR, key_map=cfg.KEY_MAP,
         expiration_days=cfg.EXPIRATION_DAYS, encrypted_keys=cfg.ENCRYPTED_KEYS,
-        thresholds=cfg.THRESHOLDS).save_config()
-    # from_config() LOADS the signing roles from the restored metadata; a plain
-    # constructor leaves repo.roles None, so add_bundle would crash.
-    repo = Repository.from_config()
-    if repo.roles is None:
-        repo.initialize()  # fresh platform (the bootstrap normally seeds this)
+        thresholds=cfg.THRESHOLDS)
+    repo.save_config()
+    # An existing volume has signed metadata to load; a fresh/empty one (the very
+    # first publish, or right after a reset) must be bootstrapped. from_config()
+    # would otherwise reach tufup's interactive "create directory?" prompt and die
+    # with EOFError in CI. initialize() creates the metadata dir itself. BOTH
+    # paths sign with the SAME restored keys, so the bundled root.json keeps
+    # trusting every update across a reset.
+    if (cfg.REPO_DIR / "metadata" / "root.json").exists():
+        repo = Repository.from_config()
+    else:
+        # Fresh/empty volume bootstrap. initialize() reaches tufup's
+        # create_key_pair, which prompts "Overwrite key pair? [n]/y" because the
+        # signing keys are ALREADY restored from the secret above; that input()
+        # raises EOFError in CI (no stdin). Auto-answer the default (empty = keep
+        # the existing keys) so the bootstrap is non-interactive and signs with
+        # the restored keys.
+        import builtins
+        _real_input = builtins.input
+        builtins.input = lambda *a, **k: ""
+        try:
+            repo.initialize()
+        finally:
+            builtins.input = _real_input
     # Idempotent: if this version is already published for this platform, skip
     # add_bundle (it would error on the duplicate) and just refresh the installer.
     targets_dir = cfg.REPO_DIR / "targets"

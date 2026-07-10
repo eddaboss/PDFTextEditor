@@ -2,11 +2,10 @@
 
 A document's header text is often WHITE because it sits on a dark/colored bar.
 That white must NOT carry onto a box dropped on the white page body -- there the
-text is typed and present but unreadable (the bug Edward hit re-typing a name
-into a background-check report: the box showed empty/white though the editor
-showed black). The contrast guard (``PageView._add_color_visible_on``) keeps the
-color when it is visible (incl. a deliberate white-on-the-dark-bar add) and
-falls back to a contrasting ink when it would be invisible.
+text is typed and present but unreadable (the box shows empty/white though the
+editor shows black). The contrast guard (``PageView._add_color_visible_on``)
+keeps the color when it is visible (incl. a deliberate white-on-the-dark-bar
+add) and falls back to a contrasting ink when it would be invisible.
 
 Run:
     QT_QPA_PLATFORM=offscreen \
@@ -49,7 +48,7 @@ def check(failures, tag, cond, msg):
 
 def build_fixture(path: str) -> None:
     """One page: a dark bar with WHITE header text, black body text, and a wide
-    blank white area below -- the minimal shape of the report Edward edits."""
+    blank white area below -- the minimal shape of a form with a colored header."""
     doc = fitz.open()
     page = doc.new_page(width=612, height=792)
     bar = fitz.Rect(40, 50, 560, 74)
@@ -132,7 +131,7 @@ def run():
 
     # 1) Add on the BLANK BODY -> white default must be corrected to visible ink.
     select_white_header()
-    body = add_box_at(w, 300, 430, "Rezaei Majdi")
+    body = add_box_at(w, 300, 430, "Jordan Lee")
     check(failures, "blank-body", body is not None, "no box was added")
     if body is not None:
         check(failures, "blank-body", max(body.color) < 0.3,
@@ -149,7 +148,7 @@ def run():
 
     # 4) SELF-HEAL: an already-invisible box (created before the guard existed)
     #    recolors to visible the moment it is opened to edit and committed.
-    invisible = doc.add_box(0, (300, 430), "Rezaei Majdi", "Helvetica", 11.0,
+    invisible = doc.add_box(0, (300, 430), "Jordan Lee", "Helvetica", 11.0,
                             (1.0, 1.0, 1.0), False, False)
     v.reload()
     pump(60)

@@ -1,23 +1,31 @@
 name: Release
 
-# A push to dev publishes to the DEV channel; a push to master publishes to the
-# STABLE channel. Each platform builds, packages an installer, signs a new tufup
-# bundle for its platform, and merges it onto the channel volume.
+# Each platform builds, packages an installer, signs a new tufup bundle, and
+# merges it onto its channel volume. A push to master publishes to the STABLE
+# channel; a push to dev publishes to the DEV channel (CHANNEL is derived from
+# the ref below).
+#
+# A release fires ONLY when the version file changes, so day-to-day pushes to dev
+# do not cut a build (test those with a local ./build_app.sh; the backend
+# redeploys on every push regardless). To publish an update, bump
+# pdftexteditor/__version__ -- the build always packages whatever code is on the
+# branch at that point.
 on:
   push:
     branches: [master, dev]
     paths:
-      - 'pdftexteditor/**'
-      - 'PDFTextEditor.spec'
-      - 'requirements.txt'
-      - 'build_icon.py'
-      - 'launch.py'
-      - 'release/**'
-      - '.github/workflows/release.yml'
+      - 'pdftexteditor/__init__.py'
   workflow_dispatch:
 
 jobs:
   release:
+    # NOTE: there is deliberately NO channel "reset"/wipe step. Wiping a channel
+    # volume restarts the tufup/TUF metadata version counter at 1, which is BELOW
+    # what installed clients have already cached -- they then reject every later
+    # release as a rollback attack and are bricked until their local cache is
+    # cleared. TUF metadata versions must only ever increase per channel, forever.
+    # To prune accumulated archives, do a normal signed republish that drops old
+    # targets (still bumps the version); never wipe.
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +46,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # NON-BREAKING for now: the OCR pack deps are still installed, so OCR
+          # stays bundled and working. To SLIM the installer, drop
+          # `-r requirements-ocr.txt` here and add the pack build+upload step
+          # (build the per-platform pack, host it gate-exempt so pack.py can
+          # fetch it). See requirements-ocr.txt + pdftexteditor/ocr/pack.py.
+          pip install -r requirements.txt -r requirements-ocr.txt
           pip install pyinstaller pillow requests tufup
 
       - name: Build app

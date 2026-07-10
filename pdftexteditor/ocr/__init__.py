@@ -9,33 +9,66 @@ None when no text is recovered.
 
 from __future__ import annotations
 
-import numpy as np
+from . import pack
+from .engine import OcrLine, OcrPackMissing, get_engine
 
-from .engine import OcrLine, get_engine
-from .reconstruct import LineBox, ReconResult, reconstruct_page
+# Put an already-downloaded OCR pack on sys.path as soon as the package loads, so
+# a returning user's OCR just works. The heavy reconstruct deps (opencv, vtracer)
+# and the RapidOCR engine live in that pack, so this module imports them LAZILY
+# (inside recognize_and_reconstruct, after the pack is confirmed on the path);
+# importing pdftexteditor.ocr itself never pulls the pack in.
+pack.ensure_on_path()
 
 __all__ = [
-    "OcrLine", "LineBox", "ReconResult",
-    "get_engine", "reconstruct_page", "recognize_and_reconstruct",
+    "OcrLine", "OcrPackMissing", "pack",
+    "get_engine", "recognize_and_reconstruct",
 ]
 
 
 def recognize_and_reconstruct(
-    image_rgb: "np.ndarray", dpi: float,
+    image_rgb, dpi: float,
     base_font_serif: str, base_font_sans: str,
     engine_name: str = "auto",
     family_label: str = "Scanned Text",
-) -> "ReconResult | None":
+    progress_cb=None,
+):
     """Recognize ``image_rgb`` (page raster at ``dpi``) and rebuild it as editable
     text in a scan-built font. ``base_font_serif`` / ``base_font_sans`` are font
     file paths used to borrow glyphs the page never showed. Pure CPU; safe to run
-    on a worker thread."""
+    on a worker thread. ``progress_cb(frac)`` (optional) reports REAL 0..1 progress
+    for this page -- recognition fills the first ~30%, reconstruct the rest, per
+    text area. Raises ``OcrPackMissing`` if the OCR component is not installed."""
+    from ..debuglog import log as _dlog
+    if not pack.ensure_on_path():
+        raise OcrPackMissing("The OCR component is not installed.")
+    from .reconstruct import reconstruct_page, recover_dropped_lines  # needs the pack
     engine = get_engine(engine_name)
+    _dlog("ocr", "recognize_call", page=family_label, engine=engine_name)
     lines = engine.recognize(image_rgb)
+    _dlog("ocr", "recognize_done", page=family_label, lines=len(lines))
+    # The full-page detector silently drops faint lines (a faint address row); a focused
+    # re-OCR of the same-column gap recovers them, so the surviving lines do not weld
+    # across the hole into one wrong box. No-op (no extra OCR) on a clean page.
+    if lines:
+        recovered = recover_dropped_lines(image_rgb, lines, engine)
+        if recovered:
+            _dlog("ocr", "recovered_lines", page=family_label, n=len(recovered))
+            lines = lines + recovered
+    if progress_cb is not None:
+        progress_cb(0.30)                     # recognition complete
     if not lines:
+        if progress_cb is not None:
+            progress_cb(1.0)
         return None
-    return reconstruct_page(
+    res = reconstruct_page(
         image_rgb, dpi, lines,
         base_font_serif=base_font_serif, base_font_sans=base_font_sans,
         family_label=family_label,
+        progress_cb=(lambda f: progress_cb(0.30 + 0.68 * f))
+        if progress_cb is not None else None,
     )
+    _dlog("ocr", "reconstruct_done", page=family_label,
+          boxes=(len(res.lines) if res is not None else 0))
+    if progress_cb is not None:
+        progress_cb(1.0)
+    return res

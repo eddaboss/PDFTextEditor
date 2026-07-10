@@ -67,6 +67,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
+from shiboken6 import isValid as _qt_alive
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -103,6 +104,7 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QMenu,
     QStyle,
+    QWidget,
     QStyleOptionGraphicsItem,
     QToolTip,
 )
@@ -113,7 +115,8 @@ from ..clipboard import (
     encode_runs_mime,
     sanitize_pasted_text,
 )
-from ..document import ImageBox, NewBox, PDFDocument, Span
+from ..debuglog import log as dlog
+from ..document import ImageBox, NewBox, PDFDocument, RunStyle, Span
 from ..font_engine import ResolvedFont
 from . import theme
 from .render_cache import PageRenderCache
@@ -147,9 +150,11 @@ Z_FORM_HOTSPOT = 8      # form-field hotspots (forms §3): above the image
                         # slot (7) so a field over a background image wins
                         # the click; still below Z_HOTSPOT, so text wins
 Z_HOTSPOT = 10
+Z_DEBUG = 39            # debug map overlay (char/space boxes), below selection chrome
 Z_SELECTION = 40        # selection outline (below the editor, above hotspots)
 Z_HANDLE = 41           # individual resize handles (topmost interactive chrome)
 Z_DRAG_PREVIEW = 45     # cheap live move/resize affordance during a drag
+Z_OCR_OVERLAY = 48      # per-page frosted scrim + progress bar while OCR runs
 Z_EDITOR = 50
 
 # Zoom clamp (BUILD_SPEC §5.2 / §6.2).
@@ -310,11 +315,39 @@ class SpanHotspot(QGraphicsRectItem):
         # reads cleanly over it).
         if self._editing or self._view._is_selected(self.span):
             return
-        edited = self._view.is_edited(self.span)
-        # An ALREADY-EDITED run carries a PERSISTENT ochre mark on the white page
-        # -- a faint tint + a thin baseline underline -- so edits stay legible at
-        # rest, not only on hover (the in-place edit signature). An unedited run
-        # shows only a faint clay wash while hovered.
+        edited = self._view.is_unsaved_edit(self.span)
+        # A freshly-OCR'd overlay (a cover-marked box still at the invisible
+        # render_mode 3, never typed into) is NOT a user edit -- it is just the
+        # recognized text sitting over the scan. ``is_unsaved_edit`` flags it only
+        # because OCR pushed an "add" command, so without this guard the pending-edit
+        # mark lit up EVERY OCR box at rest (and stacked into bars where the recognized
+        # boxes overlap). It earns the mark once the user actually edits it (which
+        # flips render_mode to 0). General to any scanned page, not one document.
+        box = self.span
+        if edited and len(getattr(box, "cover", ()) or ()) == 7 \
+                and getattr(box, "render_mode", 0) == 3:
+            edited = False
+        # PERSISTENT AFFORDANCE: every editable OCR overlay carries a thin,
+        # SEE-THROUGH clay border at rest, so you can see at a glance where the
+        # editable boxes are. Half alpha makes it read as a UI hint, NOT a line
+        # that belongs to the scanned page. The edited tint + hover wash below
+        # still paint ON TOP, so an unsaved edit still stands out.
+        if len(getattr(box, "cover", ()) or ()) == 7:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            bcol = QColor(theme.color_accent())
+            bcol.setAlphaF(0.5)
+            bpen = QPen(bcol)
+            bpen.setWidthF(1.0)
+            bpen.setCosmetic(True)                # constant on-screen width at any zoom
+            painter.setPen(bpen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(self.rect(), 2.0, 2.0)
+        # An UNSAVED edit carries a PERSISTENT ochre mark on the white page -- a
+        # faint tint + a thin baseline underline -- so pending changes stay
+        # visible at rest, not only on hover (the in-place edit signature). The
+        # mark CLEARS once the edit is saved (the run then reads like untouched
+        # text). A run with no pending edit shows only a faint clay wash while
+        # hovered.
         if not edited and not self._hovered:
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -574,6 +607,9 @@ class InlineRunEditor(QGraphicsTextItem):
         # press within the platform double-click interval and <= 4 scene px
         # promotes word-selection into LINE-selection (triple-click, §2.2).
         self._last_double: tuple[float, QPointF] | None = None
+        # Scanned-OCR "keep the scan" mode: the glyphs are transparent so the scan
+        # shows through; paint() draws only the caret (see PageView.begin_edit).
+        self._scan_preserve = False
         self.setZValue(Z_EDITOR)
         self.setTextInteractionFlags(Qt.TextEditorInteraction)
         self.document().setDocumentMargin(0)
@@ -587,6 +623,14 @@ class InlineRunEditor(QGraphicsTextItem):
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
         if key in (Qt.Key_Return, Qt.Key_Enter):
+            # A SCAN box must NEVER exit on Enter -- the only exits are clicking out of it or
+            # Escape. Enter adds a newline in a paragraph, and does nothing in a single line.
+            if self._scan_preserve:
+                if getattr(self._view, "_editor_multiline", False):
+                    super().keyPressEvent(event)
+                else:
+                    event.accept()
+                return
             event.accept()
             self._view.commit_edit()
             return
@@ -621,6 +665,7 @@ class InlineRunEditor(QGraphicsTextItem):
             cursor = self.textCursor()
             cursor.select(QTextCursor.Document)
             self.setTextCursor(cursor)
+            self._view._position_caret_item()     # paint the selection band on Cmd+A
             return
         if key in (Qt.Key_B, Qt.Key_I) and (event.modifiers()
                                             & (Qt.ControlModifier
@@ -640,6 +685,7 @@ class InlineRunEditor(QGraphicsTextItem):
             event.ignore()
             return
         super().keyPressEvent(event)
+        self._view._position_caret_item()         # arrows / home / end / typing move it
 
     def _cursor_style_flag(self, prop: str) -> bool:
         """The current bold/italic state at the cursor (selection-aware): the
@@ -654,6 +700,41 @@ class InlineRunEditor(QGraphicsTextItem):
             return fmt.fontItalic()
         return self.font().italic()
 
+    def _paint_caret(self, painter) -> None:
+        if not self.hasFocus():
+            return
+        # Custom caret engine: the caret is a SEPARATE scene item the view positions +
+        # blinks (drawing it here clipped it to the editor's bounding box -- a "dot" --
+        # and left ghosts on move). So in scan-preserve mode this paints nothing.
+        v = getattr(self, "_view", None)
+        if v is not None and getattr(v, "_caret_measure", None):
+            return
+        cur = self.textCursor()
+        block = cur.block()
+        lay = block.layout()
+        if lay is None:
+            return
+        pib = cur.position() - block.position()
+        line = lay.lineForTextPosition(pib)
+        if not line.isValid():
+            if lay.lineCount() == 0:
+                return
+            line = lay.lineAt(lay.lineCount() - 1)
+        cx = line.cursorToX(pib)
+        x = cx[0] if isinstance(cx, (tuple, list)) else cx
+        try:
+            blk_top = self.document().documentLayout().blockBoundingRect(
+                block).top()
+        except Exception:
+            blk_top = 0.0
+        top = blk_top + line.y()
+        painter.save()
+        pen = QPen(QColor(25, 25, 25))
+        pen.setWidthF(1.6)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(x, top), QPointF(x, top + line.height()))
+        painter.restore()
+
     def mousePressEvent(self, event):
         # Triple-click = visual line (§2.2): a left press right after a
         # double-click (within the platform interval, <= 4 scene px) selects
@@ -667,9 +748,65 @@ class InlineRunEditor(QGraphicsTextItem):
                 self._last_double = None
                 self._select_line_at(pos)
                 event.accept()
+                self._view._position_caret_item()
                 return
         self._last_double = None
+        v = self._view
+        if (event.button() == Qt.LeftButton and self._scan_preserve
+                and getattr(v, "_caret_measure", None)):
+            # SCAN-PRESERVE click: place the caret with the CUSTOM hit-test (the
+            # measured scanned-glyph geometry), NOT Qt's hit-test on the invisible
+            # stretched text -- that layout drifts a full line down the box, so a
+            # click on line 3 landed the caret on line 2. Shift extends the selection.
+            idx = self.caret_index_at_scene_point(event.scenePos())
+            cur = self.textCursor()
+            keep = bool(event.modifiers() & Qt.ShiftModifier)
+            cur.setPosition(idx, QTextCursor.KeepAnchor if keep
+                            else QTextCursor.MoveAnchor)
+            self.setTextCursor(cur)
+            self.setFocus(Qt.MouseFocusReason)
+            event.accept()
+            v._position_caret_item()
+            return
         super().mousePressEvent(event)
+        v._position_caret_item()                  # move the scene-item caret to the click
+
+    def mouseMoveEvent(self, event):
+        v = self._view
+        if (self._scan_preserve and (event.buttons() & Qt.LeftButton)
+                and getattr(v, "_caret_measure", None)):
+            # Drag-select on the scan: extend the selection to the custom hit-test
+            # index (same accurate geometry as the press).
+            cur = self.textCursor()
+            cur.setPosition(self.caret_index_at_scene_point(event.scenePos()),
+                            QTextCursor.KeepAnchor)
+            self.setTextCursor(cur)
+            event.accept()
+            v._position_caret_item()
+            return
+        super().mouseMoveEvent(event)
+        v._position_caret_item()                  # follow the cursor while drag-selecting
+
+    def shape(self) -> QPainterPath:
+        # SCAN-PRESERVE: clamp the editor's clickable area to the scan BOX. Qt lays the
+        # invisible text out TALLER than the scan (it won't shrink a line below the font
+        # height), so the item's natural shape overhangs below the box and TRAPPED the
+        # clicks meant for the box underneath (the editor ate them). Keep the box's
+        # vertical extent; keep the width generous so typed overflow stays clickable.
+        v = getattr(self, "_view", None)
+        if self._scan_preserve and v is not None and getattr(v, "_caret_measure", None):
+            box = getattr(v, "_editor_box", None)
+            if box is not None:
+                r = v._span_scene_rect(box)
+                if r is not None and r.isValid():
+                    br = self.mapFromScene(r).boundingRect()
+                    nat = super().shape().boundingRect()
+                    rect = QRectF(min(br.left(), nat.left()), br.top(),
+                                  max(br.width(), nat.width()), br.height())
+                    path = QPainterPath()
+                    path.addRect(rect)
+                    return path
+        return super().shape()
 
     def mouseDoubleClickEvent(self, event):
         # Double-click = word (§2.2). Recorded so a third press in the same
@@ -678,6 +815,7 @@ class InlineRunEditor(QGraphicsTextItem):
             pos = event.scenePos()
             self._select_word_at(pos)
             self._last_double = (time.monotonic(), QPointF(pos))
+            self._view._position_caret_item()     # paint the band on double-click word
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
@@ -700,6 +838,15 @@ class InlineRunEditor(QGraphicsTextItem):
         self.setTextCursor(cursor)
 
     def paint(self, painter: QPainter, option, widget=None):
+        # SCAN-PRESERVE: the glyphs the user sees ARE the scanned pixels underneath,
+        # and the live composite shows the edited run. Draw ONLY the caret -- never the
+        # editor's own text, which renders in Qt's 'Courier New' (a SANS fallback on
+        # macOS) and so looked like a foreign font pasted over the scan. (This check
+        # used to live in a separate paint() that a later definition shadowed, so it
+        # silently stopped suppressing the text on multi-line/paragraph editors.)
+        if self._scan_preserve:
+            self._paint_caret(painter)
+            return
         # Themed selection (§2.3): the accent band at ~.43 alpha with the
         # glyphs kept in the editor's own ink color -- Qt's default flips
         # selected text to white, which reads as a foreign widget on the page.
@@ -726,18 +873,24 @@ class InlineRunEditor(QGraphicsTextItem):
         # highlight after applying a whole-box font/size/colour change.
         cur = self.textCursor()
         self._view._stash_editor_selection(cur.anchor(), cur.position())
+        # NB: pass the FocusReason enum straight through -- int(enum) raises
+        # TypeError on this PySide6 build, and because this runs INSIDE the
+        # focus-out (which fires during teardown/removeItem), that exception
+        # would unwind the whole commit and silently drop the edit. debuglog
+        # stringifies it safely and never raises.
+        dlog("EDITOR", "focus_out", reason=event.reason())
         super().focusOutEvent(event)
-        if self._cancelled:
-            return
-        # A click that moved focus into the Format panel (font / size / B I U S),
-        # or a modal style dialog opening from it (the colour picker), must NOT
-        # commit -- committing tears the editor down and drops the highlight
-        # before the style lands. Keep editing; the style path applies the change
-        # and restores the selection.
-        if QApplication.activeModalWidget() is not None or \
-                self._view._focus_moved_to_format_panel():
-            return
-        self._view.commit_edit(from_focus_out=True)
+        # A mouse MOVE / hover steals the editor's focus (Qt gives MouseFocusReason), which
+        # stops the caret and kills typing even though the box never closed. That is NOT an
+        # exit -- only Escape or a click outside the box exits. Re-assert focus on the next
+        # tick; the deferred re-grab no-ops if the editor genuinely closed (commit/cancel) or
+        # the user moved to another window, so a real exit is never fought.
+        self._view._reassert_editor_focus(self)
+        # IMPORTANT: focus-out NEVER exits the box. A box is left ONLY by an explicit click
+        # OUTSIDE it (detected in PageView.mousePressEvent) or by Escape. Every other way the
+        # editor could lose focus -- a page re-render, a timer, a popup/dropdown, the format
+        # panel, a viewport mouse event, the window deactivating -- is a focus STEAL, not an
+        # intent to leave, and used to kick the user out mid-edit. Do not commit/cancel here.
 
     def caret_index_at_scene_x(self, scene_x: float) -> int:
         """Caret insertion index nearest a scene x, by cumulative advance.
@@ -762,16 +915,19 @@ class InlineRunEditor(QGraphicsTextItem):
         return best_idx
 
     def caret_index_at_scene_point(self, scene_pt: QPointF) -> int:
-        """Caret insertion index nearest a scene POINT, via Qt's native document
-        layout hit-test (REFLOW_SPEC §R3.7). THE caret-placement path for every
-        editor (text-editing UX §2.1) -- exact on a single line and on any
-        wrapped line of a ParagraphBox. ``mapFromScene`` (not a bare pos()
-        subtraction) folds the item rotation in, so the hit-test is also right
-        on a rotated page's editor. Falls back to 0 on an empty document and to
-        the cumulative-advance walk on a failed hit-test."""
+        """Caret insertion index nearest a scene POINT. For a scan-preserve box the
+        CUSTOM caret engine maps the click against the measured scanned-glyph positions
+        (so the caret lands where the ink actually is, not where Qt's text layout put
+        it). Otherwise Qt's native document hit-test (exact for vector text / wrapped
+        ParagraphBox). Falls back to 0 / the cumulative-advance walk."""
         text = self.toPlainText()
         if not text:
             return 0
+        v = getattr(self, "_view", None)
+        if v is not None and getattr(v, "_caret_measure", None):
+            gi = v._scan_caret_index(scene_pt, text)
+            if gi is not None:
+                return min(gi, len(text))
         try:
             local = self.mapFromScene(scene_pt)
             layout = self.document().documentLayout()
@@ -1015,6 +1171,14 @@ _BUFFER_PAGES = 1
 # Extra eviction slack: a page stays materialized until it is this many pages
 # outside the visible band, so a small scroll jitter does not thrash re-renders.
 _EVICT_MARGIN_PAGES = 2
+# Above this zoom the floating-page drop shadow is dropped. ``QGraphicsDropShadow
+# Effect`` re-Gaussian-blurs the WHOLE page-sized rect on every paint (and its
+# bounding rect spans the page, so even a tiny dirty strip triggers a full-page
+# re-blur). That cost grows with zoom^2 -- it was the entire reason a high-zoom
+# pan ran at ~1 fps (measured: 61 ms/paint at 5x WITH the effect, 0.2 ms WITHOUT;
+# the pixmap blit itself is free). Once the page is larger than the viewport its
+# edges (where the halo lives) are off-screen anyway, so the shadow buys nothing.
+_SHADOW_MAX_ZOOM = 1.5
 
 
 class _PageLayer:
@@ -1067,6 +1231,214 @@ class _PageLayer:
         return [it for it in self.extra_items if isinstance(it, FieldHotspot)]
 
 
+class OcrProgressOverlay(QWidget):
+    """OCR progress overlay on TOP of the page view. Each page gets its OWN
+    frosted pixmap (the page render with a white veil baked in), and every paint
+    blits each page's pixmap at that page's LIVE viewport rect. So the frost is
+    pinned to the page content and follows scroll / zoom exactly, and every page
+    in the document stays covered -- there is no single viewport snapshot to
+    misalign, tear, or leave new-scrolled-in pages uncovered.
+
+    The widget is OPAQUE (it fills every pixel: page frosts + a plain frost base
+    in the gutters), so repainting it -- for the animated bar, or on scroll --
+    only blits cached pixmaps and NEVER makes the QGraphicsView re-render the
+    scene underneath. A *translucent* overlay instead forced Qt to re-render the
+    whole scene (every text hotspot) on every frame: ~18s of the OCR worker's
+    time on a dense page, measured. The per-page pixmaps are built lazily (only
+    for pages that are actually visible) and cached for the run."""
+
+    def __init__(self, view: "PageView"):
+        super().__init__(view.viewport())
+        self._view = view
+        self._state: dict[int, dict] = {}
+        # One frosted pixmap PER PAGE (page render + baked white veil), blitted at
+        # that page's LIVE viewport rect every paint -- so it follows scroll exactly
+        # and covers every page, with no viewport snapshot to misalign or tear.
+        self._page_frost: dict[int, QPixmap] = {}
+        # Opaque: a repaint blits cached pixmaps, it does NOT re-render the scene.
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        for _sb in (view.verticalScrollBar(), view.horizontalScrollBar()):
+            if _sb is not None:
+                _sb.valueChanged.connect(self._on_scroll)
+        self.hide()
+
+    def mousePressEvent(self, ev):
+        ev.accept()              # swallow page interaction while OCR runs
+
+    def mouseDoubleClickEvent(self, ev):
+        ev.accept()
+
+    def fit(self) -> None:
+        self.setGeometry(self._view.viewport().rect())
+
+    def resizeEvent(self, _ev) -> None:
+        self.update()                            # re-blit at the new viewport size
+
+    def _page_frost_for(self, page_index: int):
+        """The frosted pixmap for one page: that page's render with a white veil
+        baked in, cached for the OCR run. Returns None until the page has been
+        rendered at least once (off-screen pages that have never materialized);
+        paintEvent then draws a plain frost fill for them instead, so they are
+        still covered. Built lazily so opening the doc doesn't render every page
+        up front."""
+        pm = self._page_frost.get(page_index)
+        if pm is not None:
+            return pm
+        layers = getattr(self._view, "_layers", None)
+        if layers is None or not (0 <= page_index < len(layers)):
+            return None
+        img = getattr(layers[page_index], "image", None)
+        if img is None or img.isNull():
+            return None
+        pm = QPixmap.fromImage(img).copy()
+        pp = QPainter(pm)
+        pp.fillRect(pm.rect(), QColor(255, 255, 255, 180))   # frost veil baked in
+        pp.end()
+        self._page_frost[page_index] = pm
+        return pm
+
+    def start(self, page_index: int, est_secs: float = 0.0) -> None:
+        # ``value`` is the displayed bar; ``target`` is the REAL OCR progress the
+        # worker reports (set_progress). _tick eases value -> target, so the bar
+        # tracks actual progress smoothly. ``est_secs`` is no longer used.
+        st = self._state.get(page_index)
+        if st is None:
+            self._state[page_index] = dict(target=0.06, value=0.0, done=False)
+        else:
+            st["done"] = False
+        self.fit()
+        self.show()
+        self.raise_()
+        if not self._timer.isActive():
+            self._timer.start(50)              # 20 fps; only the bar band repaints
+        self.update()
+
+    def set_progress(self, page_index: int, frac: float) -> None:
+        """Set this page's REAL progress (0..1). Monotonic; the bar eases to it."""
+        st = self._state.get(page_index)
+        if st is not None and not st.get("settled"):
+            st["target"] = max(st["target"], min(1.0, float(frac)))
+            if not self._timer.isActive():
+                self._timer.start(50)
+
+    def complete(self, page_index: int) -> None:
+        # Snap this page to 100% immediately (don't wait for the ease) -- the
+        # finishing apply blocks the GUI thread, so the bar must already read 100
+        # before that, or it freezes mid-ease and looks stuck.
+        st = self._state.get(page_index)
+        if st is not None:
+            st["done"] = True
+            st["target"] = 1.0
+            st["value"] = 1.0
+            st["settled"] = True
+            vr = self._view.ocr_page_viewport_rect(page_index)
+            if vr is not None:
+                self.update(self._band_rect(vr).toRect())
+
+    def clear(self) -> None:
+        self._state.clear()
+        self._page_frost.clear()
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self) -> None:
+        # Ease each bar's displayed value toward its REAL target (set_progress).
+        # Every page stays FROSTED for the whole OCR run -- a finished page holds
+        # 100% but its cover only lifts on clear() (the whole OCR done).
+        active = False
+        for pi, st in self._state.items():
+            if st.get("settled"):
+                continue
+            active = True
+            diff = st["target"] - st["value"]
+            if abs(diff) > 0.0015:
+                st["value"] += diff * 0.35      # ease toward the real progress
+            elif st["done"]:
+                st["value"] = 1.0
+                st["settled"] = True            # done; bar holds 100%, cover stays
+            else:
+                continue                        # at target, awaiting more -> no repaint
+            vr = self._view.ocr_page_viewport_rect(pi)
+            if vr is not None:                  # repaint ONLY this bar band
+                self.update(self._band_rect(vr).toRect())
+        if not active:
+            self._timer.stop()
+
+    @staticmethod
+    def _band_rect(r: QRectF) -> QRectF:
+        bw = r.width() * 0.54
+        bh = max(r.height() * 0.0115, 6.0)
+        label_h = max(r.height() * 0.022, 12.0)
+        gap = label_h * 0.55
+        pad = bh * 2.2
+        cx, cy = r.center().x(), r.center().y()
+        top = (cy - bh / 2.0 + (label_h + gap) / 2.0) - (label_h + gap) - pad
+        h = (label_h + gap) + bh + 2 * pad
+        m = 4.0
+        return QRectF(cx - bw / 2.0 - pad - m, top - m,
+                      bw + 2 * pad + 2 * m, h + 2 * m)
+
+    def _on_scroll(self) -> None:
+        # Each page's pixmap is blitted at its LIVE rect in paintEvent, so a plain
+        # repaint re-pins every cover to its page. No snapshot, no offset, no grab.
+        if self._state:
+            self.update()
+
+    def paintEvent(self, _ev) -> None:
+        p = QPainter(self)
+        # Opaque widget: every pixel painted. Frost base covers the gutters and any
+        # page that hasn't rendered yet; each page's own frosted pixmap goes on top
+        # at its current viewport rect, so the cover tracks scroll exactly.
+        p.fillRect(self.rect(), QColor(247, 247, 247))
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        widget_rect = QRectF(self.rect())
+        for pi, st in self._state.items():
+            vr = self._view.ocr_page_viewport_rect(pi)
+            if vr is None or not vr.intersects(widget_rect):
+                continue
+            pm = self._page_frost_for(pi)
+            if pm is not None and not pm.isNull():
+                p.drawPixmap(vr, pm, QRectF(pm.rect()))   # follows scroll + zoom
+            else:
+                p.fillRect(vr, QColor(255, 255, 255, 235))   # not rendered yet
+            self._paint_bar(p, vr, st["value"])
+
+    def _paint_bar(self, p: QPainter, r: QRectF, value: float) -> None:
+        # The veil is BAKED into _frost; here we draw only the panel + bar + %.
+        bw = r.width() * 0.54
+        bh = max(r.height() * 0.0115, 6.0)
+        cx, cy = r.center().x(), r.center().y()
+        label_h = max(r.height() * 0.022, 12.0)
+        gap = label_h * 0.55
+        track = QRectF(cx - bw / 2.0, cy - bh / 2.0 + (label_h + gap) / 2.0, bw, bh)
+        pad = bh * 2.2
+        panel = QRectF(track.left() - pad, track.top() - (label_h + gap) - pad,
+                       track.width() + 2 * pad,
+                       (label_h + gap) + track.height() + 2 * pad)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        p.drawRoundedRect(panel, pad, pad)
+        f = QFont()
+        f.setPixelSize(int(label_h))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QPen(QColor(theme.TEXT_PRIMARY)))
+        lr = QRectF(panel.left(), panel.top() + pad * 0.6, panel.width(), label_h * 1.3)
+        p.drawText(lr, Qt.AlignHCenter | Qt.AlignVCenter,
+                   f"Recognizing text  ·  {int(round(value * 100))}%")
+        rad = bh / 2.0
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(QColor(0, 0, 0, 30)))
+        p.drawRoundedRect(track, rad, rad)
+        if value > 0.0:
+            p.setBrush(QBrush(theme.color_accent()))
+            p.drawRoundedRect(QRectF(track.left(), track.top(),
+                                     max(bh, bw * value), bh), rad, rad)
+
+
 class PageView(QGraphicsView):
     """The editable page canvas. See module docstring + BUILD_SPEC §5 +
     EDITOR_SPEC §3.
@@ -1089,6 +1461,7 @@ class PageView(QGraphicsView):
     editCancelled = Signal()
     editStarted = Signal(object, object)        # (box, ResolvedFont)
     editFinished = Signal()
+    caretStyleChanged = Signal(object, object)  # (box, caret-local style dict) -> inspector
     pageChanged = Signal(int)                    # new page_index (0-based)
     zoomChanged = Signal(float)                  # new zoom factor
 
@@ -1152,7 +1525,16 @@ class PageView(QGraphicsView):
             | QPainter.SmoothPixmapTransform
             | QPainter.TextAntialiasing
         )
+        # Scroll/pan smoothness: skip the per-item painter-state save/restore and
+        # the antialias-bleed adjustment (the page pixmaps render at the zoom level
+        # and display 1:1, so they need neither), and repaint only the regions that
+        # actually changed during a pan instead of the whole viewport.
+        self.setOptimizationFlags(
+            QGraphicsView.DontSavePainterState
+            | QGraphicsView.DontAdjustForAntialiasing)
+        self.setViewportUpdateMode(QGraphicsView.MinimalViewportUpdate)
         self.setBackgroundBrush(QBrush(theme.color_canvas_bg()))
+        theme.events.changed.connect(self._on_theme_changed)
         self.setAlignment(Qt.AlignCenter)
         # The vertical scrollbar is pinned ON (not AsNeeded) so the viewport
         # width is STABLE: under fit-width, an AsNeeded bar flickers on/off as
@@ -1171,7 +1553,10 @@ class PageView(QGraphicsView):
         # the centre of the viewing area).
         self._recentering_h = False
         hb = self.horizontalScrollBar()
-        hb.setFixedHeight(0)
+        # The bar shows (AsNeeded) only when the page is zoomed wider than the
+        # viewport, so the user can pan to the sides; a fit page has no range and
+        # stays centered + bar-free. (It used to be pinned to height 0, which hid
+        # the only way to reach the sides.)
         hb.valueChanged.connect(self._recenter_h)
         hb.rangeChanged.connect(self._recenter_h)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -1206,11 +1591,15 @@ class PageView(QGraphicsView):
         # The widest page in scene px (set in reload), used to center each page.
         self._max_w_scene = 0.0
         self._page_gap = float(getattr(theme, "PAGE_GAP", 18))
-        # Coalesce scroll storms: a 0-timer recomputes lazy render + current page
-        # once per event loop turn instead of on every scrollbar tick.
+        # Defer the lazy-render/evict pass until the pan SETTLES. A 0-timer fired in
+        # the gaps between scroll ticks, re-running materialize/evict mid-pan and
+        # re-rendering the same in-view pages dozens of times (profiled: ~80 page
+        # re-renders + 180ms full repaints in one 10s pan at high zoom). Restarting
+        # this on every scroll tick means it only fires once the user pauses ~110ms,
+        # so an active pan is pure cheap blitting with no re-rendering.
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
-        self._scroll_timer.setInterval(0)
+        self._scroll_timer.setInterval(110)
         self._scroll_timer.timeout.connect(self._on_scroll_settled)
         vbar = self.verticalScrollBar()
         if vbar is not None:
@@ -1225,9 +1614,14 @@ class PageView(QGraphicsView):
         # a full reload, so a 120 ms single-shot applies only the LATEST
         # target instead of relayouting on every gesture tick.
         self._gesture_target: float | None = None
+        # While a zoom gesture is live we SCALE the view (cheap, GPU, no re-render)
+        # and only re-rasterize once it settles -- a scanned page gains no detail
+        # from a mid-zoom re-render. This tracks the live view scale vs the rendered
+        # zoom so successive ticks compose instead of jumping.
+        self._gesture_view_scale = 1.0
         self._gesture_timer = QTimer(self)
         self._gesture_timer.setSingleShot(True)
-        self._gesture_timer.setInterval(120)
+        self._gesture_timer.setInterval(140)
         self._gesture_timer.timeout.connect(self._flush_gesture_zoom)
         # Window-resize re-fit THROTTLE (same pain point as gesture zoom): a
         # live window drag fires resizeEvent many times a second, and re-fitting
@@ -1257,6 +1651,40 @@ class PageView(QGraphicsView):
         self._editor: InlineRunEditor | None = None
         self._editor_box = None                 # Span or NewBox under the editor
         self._editor_cover = None
+        # Scanned-OCR editing: keep the scan pixels on screen and re-render ONLY
+        # the words the user changes. The editor glyphs are invisible (the scan
+        # shows through); this pixmap is the live composite of the current text.
+        self._editor_preview: QGraphicsPixmapItem | None = None
+        # DEBUG console overlays: the char/space MAP (per-character + space boxes the
+        # caret/erase actually use) and an INVERTED binary view (what _scan_geometry
+        # picks up as ink). Toggled from the top bar; rebuilt on reload/zoom.
+        self._debug_map = False
+        self._debug_invert = False
+        self._debug_items: list = []            # transient map-overlay QGraphicsItems
+        self._debug_cache = None                # measured-once geometry (display pts)
+        self._debug_edit_id = None              # id() of the box being live-remapped
+        self._debug_live: list = []             # live map of the edited box (per keystroke)
+        self._debug_borders = False             # the TABLE/PAGE border (rule-line) overlay
+        self._border_cache: dict = {}           # {page: (h_lines, v_lines)} in display pts
+        self._editor_scan_preserve = False
+        self._scan_typing_style = None          # armed (bold,italic) for NEXT typed text
+        self._styling_guard = False             # re-entrancy guard for the typing hook
+        self._editor_style_changed = False      # a whole-box font/size/color was applied live
+        self._editor_scan_ctx = None            # cached scan-edit context (1 page render)
+        self._editor_page_rgb = None            # cached page raster for a paragraph edit
+        self._caret_measure = None              # custom caret engine: measured glyph edges
+        self._caret_fpath = None                # font for typed-char widths in the engine
+        self._caret_item = None                 # the blinking caret -- a SEPARATE scene item
+        self._sel_item = None                   # translucent selection band (scan editor)
+        self._caret_on = True                   # blink phase
+        self._caret_blink = QTimer(self)        # toggles the caret like a real one
+        self._caret_blink.setInterval(530)
+        self._caret_blink.timeout.connect(self._blink_caret)
+        self._editor_orig_text = ""
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(70)     # debounce the live re-render
+        self._preview_timer.timeout.connect(self._update_ocr_preview)
         self._editor_hotspot: SpanHotspot | None = None
         self._editor_multiline = False          # True for a ParagraphBox editor
         self._committing = False
@@ -1372,6 +1800,11 @@ class PageView(QGraphicsView):
         # ``layer.extra_items``. On a form-free document the factory
         # contributes zero items, so the default scene census is unchanged.
         self.register_page_item_factory(self._field_hotspot_factory)
+        # OCR progress overlay: a single translucent widget ON TOP of the
+        # viewport (NOT a scene item) that frosts each page being recognized and
+        # animates its bar. Kept out of the scene so its animation never repaints
+        # the page's text hotspots (which would starve the GIL-bound workers).
+        self._ocr_overlay = OcrProgressOverlay(self)
         self._overlay: SelectionOverlay | None = None
         # An add we just made + opened the editor on, so an empty commit can be
         # rolled back (empty-add cleanup, §3.5).
@@ -1472,6 +1905,13 @@ class PageView(QGraphicsView):
         self._image_place_rubber: QGraphicsRectItem | None = None
         self._drag_image_preview: QGraphicsPixmapItem | None = None
 
+    def _on_theme_changed(self) -> None:
+        """Live mode switch: re-fill the gutter and repaint. The page pixmaps are
+        the user's white PDF (mode-independent); selection/edit overlays read
+        live theme QColors at paint time, so a viewport repaint is enough."""
+        self.setBackgroundBrush(QBrush(theme.color_canvas_bg()))
+        self.viewport().update()
+
     # =====================================================================
     # Construction / document
     # =====================================================================
@@ -1486,6 +1926,15 @@ class PageView(QGraphicsView):
         # encode the document, and two pristine docs share a signature).
         self._render_cache.clear()
         self.document = document
+        # UPRIGHT-FIRST: the stored /Rotate on scanned pages is unreliable, so normalize
+        # every page to its content-detected upright orientation BEFORE the layers build --
+        # the scene, OCR, and the border map then all run on an upright page. Run-once per
+        # document; best-effort so a detector hiccup never blocks opening the file.
+        if document is not None:
+            try:
+                document.normalize_orientations()
+            except Exception:
+                pass
         self._page_index = 0
         self._selection = None
         self._text_sel = None              # word indices are per-document
@@ -1576,6 +2025,48 @@ class PageView(QGraphicsView):
         overlapping clicks)."""
         self._page_item_factories.append(factory)
 
+    # ---- OCR progress overlay (frosted per-page bar; a viewport widget) ----
+    def _page_scene_rect(self, layer) -> QRectF:
+        """The page's rect in SCENE coords (materialized pages only -- uses the
+        sheet item, which is exact and zoom-correct)."""
+        sheet = getattr(layer, "sheet_item", None)
+        if sheet is not None and _qt_alive(sheet):
+            return sheet.sceneBoundingRect()
+        return QRectF()
+
+    def ocr_page_viewport_rect(self, page_index: int):
+        """The page's rect in VIEWPORT (overlay-widget) coords. Uses the laid-out
+        per-page geometry (``_layer_scene_rect``), so the cover fits EACH page's
+        own dimensions and works for every page -- materialized or not -- not
+        just the visible first one."""
+        if not (0 <= page_index < len(self._layers)):
+            return None
+        layer = self._layers[page_index]
+        if not getattr(layer, "pt_size", None):
+            return None
+        sr = self._layer_scene_rect(layer)
+        if sr.isNull() or sr.isEmpty():
+            return None
+        return QRectF(self.mapFromScene(sr).boundingRect())
+
+    def start_ocr_overlay(self, page_index: int, est_secs: float = 0.0) -> None:
+        """Frost ``page_index`` and begin its progress bar at 0. Delegated to the
+        on-top widget -- no scene items."""
+        self._ocr_overlay.start(page_index)
+        dlog("ocr", "overlay_start", page=page_index + 1)
+
+    def set_ocr_progress(self, page_index: int, frac: float) -> None:
+        """Drive ``page_index``'s bar to its REAL OCR progress (0..1)."""
+        self._ocr_overlay.set_progress(page_index, frac)
+
+    def complete_ocr_overlay(self, page_index: int) -> None:
+        """The page landed: bar holds at 100% (cover stays until the run ends)."""
+        self._ocr_overlay.complete(page_index)
+
+    def clear_ocr_overlays(self) -> None:
+        """Tear down every OCR overlay at once (cancel / finish)."""
+        self._ocr_overlay.clear()
+
     def register_mode_handlers(self, mode: str, *, press=None,
                                key=None) -> None:
         """Register tool-mode event handlers for ``mode`` (the value
@@ -1630,13 +2121,22 @@ class PageView(QGraphicsView):
     def page_index(self) -> int:
         return self._page_index
 
-    def set_zoom(self, zoom: float) -> None:
+    def set_zoom(self, zoom: float, _anchor: "tuple | None" = None) -> None:
         clamped = max(ZOOM_MIN, min(zoom, ZOOM_MAX))
         self._zoom_mode = "fixed"
         if abs(clamped - self._zoom) < 1e-6 and self._layers:
+            self.resetTransform()          # drop any lingering live gesture scale
+            self._gesture_view_scale = 1.0
             return
         self._flush_editor()
-        anchor = self._current_page_anchor()
+        # Capture the zoom focus BEFORE dropping the live gesture transform: while the
+        # gesture scale is still applied, the viewport centre maps to the scene point
+        # the user is actually looking at. Resetting first (the old order) snapped the
+        # anchor back to the un-zoomed centre -- that is why a settled zoom jumped to
+        # the page's left edge. _flush_gesture_zoom passes the pre-captured anchor in.
+        anchor = _anchor if _anchor is not None else self._current_page_anchor()
+        self.resetTransform()              # clear the live gesture-zoom view scale
+        self._gesture_view_scale = 1.0
         self._zoom = clamped
         # Suspend lazy materialization across the reload: its scroll-to-top
         # plus the scrollbar churn used to bake OFF-SCREEN pages at stale
@@ -1671,6 +2171,12 @@ class PageView(QGraphicsView):
         page to the viewport (fit_page) (REFLOW_SPEC §R3.3). Re-fits + re-lays the
         whole stack on resize so no page overflows horizontally."""
         if not self.document or not self._layers:
+            return
+        # NEVER re-fit (a full reload that would FLUSH/commit the editor) while a box is
+        # being edited -- a resize / scrollbar toggle mid-edit must not kick the user out
+        # (the only allowed exits are Escape and a click outside the box). The fit re-applies
+        # once editing ends.
+        if self._editor is not None:
             return
         vp = self.viewport().size()
         avail_w = max(1, vp.width() - 2 * theme.SHEET_MARGIN)
@@ -1710,19 +2216,36 @@ class PageView(QGraphicsView):
         through the existing ``set_zoom`` (which already commits any open
         editor and restores the page+fraction scroll anchor)."""
         self._gesture_target = max(ZOOM_MIN, min(float(target), ZOOM_MAX))
-        if not self._gesture_timer.isActive():
-            self._gesture_timer.start()
+        # An explicit zoom leaves fit mode NOW, so the live view-scale below cannot
+        # trip the resize-driven re-fit (scrollbars appearing under the scale would
+        # otherwise fire a second, spurious reload mid-gesture).
+        self._zoom_mode = "fixed"
+        # LIVE: scale the view to the target instantly (GPU, anchored at the viewport
+        # centre) -- no re-render. Successive ticks compose via the tracked scale.
+        if self._zoom > 1e-6:
+            want = self._gesture_target / self._zoom
+            cur = self._gesture_view_scale or 1.0
+            if cur > 1e-6 and abs(want - cur) > 1e-9:
+                f = want / cur
+                self.scale(f, f)
+                self._gesture_view_scale = want
+        # Restart on every tick: the crisp re-render fires once the gesture settles.
+        self._gesture_timer.start()
 
     def _flush_gesture_zoom(self) -> None:
-        """Apply the pending throttled target NOW (the timer tick, or an
-        EndNativeGesture forcing the final apply without the 120 ms wait)."""
+        """Gesture settled: drop the live view scale and re-rasterize ONCE at the
+        final zoom (crisp). The displayed zoom is unchanged across the swap (the
+        scene was scaled to the same factor), so it just sharpens in place."""
         self._gesture_timer.stop()
         target, self._gesture_target = self._gesture_target, None
-        if target is None or self.document is None:
+        if target is None or self.document is None or abs(target - self._zoom) < 1e-6:
+            self._gesture_view_scale = 1.0
+            self.resetTransform()          # nothing to re-render; just drop the scale
             return
-        if abs(target - self._zoom) < 1e-6:
-            return
-        self.set_zoom(target)
+        # Capture the focus WHILE the live gesture scale is still applied, then hand it
+        # to set_zoom (which drops the scale, re-rasterizes, and restores this focus).
+        anchor = self._current_page_anchor()
+        self.set_zoom(target, _anchor=anchor)
 
     def _gesture_base_zoom(self) -> float:
         """The zoom a new gesture step composes on: the PENDING throttled
@@ -1776,12 +2299,16 @@ class PageView(QGraphicsView):
         super().wheelEvent(ev)
 
     def _recenter_h(self, *args) -> None:
-        """Keep the page horizontally CENTERED: snap the (hidden) horizontal
-        scroll back to its midpoint so the page never drifts off-centre and a
-        zoom-in trims both sides equally."""
+        """Keep the page horizontally CENTERED *only while it fits* the viewport,
+        so a fit page never drifts off-centre. Once the page is zoomed wider than
+        the viewport there is a real horizontal scroll range -- leave it alone so
+        the user can PAN to the page's sides instead of being snapped to the middle
+        (the snap-on-every-scroll was why zoom felt locked to centre)."""
         if self._recentering_h:
             return
         hb = self.horizontalScrollBar()
+        if hb.maximum() - hb.minimum() > 1:      # zoomed in: real pan range -> keep it
+            return
         mid = (hb.minimum() + hb.maximum()) // 2
         if hb.value() != mid:
             self._recentering_h = True
@@ -1790,8 +2317,22 @@ class PageView(QGraphicsView):
             finally:
                 self._recentering_h = False
 
+    def scrollContentsBy(self, dx, dy):
+        # MinimalViewportUpdate scrolls the viewport with viewport()->scroll(),
+        # which DRAGS viewport child widgets (our OCR overlay) along with the
+        # content -- sliding the cover off and exposing raw page. After the
+        # scroll, snap the overlay back over the full viewport and repaint it so
+        # each page's frost re-pins to its (now moved) page rect.
+        super().scrollContentsBy(dx, dy)
+        ov = getattr(self, "_ocr_overlay", None)
+        if ov is not None and ov.isVisible():
+            ov.fit()
+            ov.raise_()
+            ov.repaint()        # immediate, no deferred frame where it looks torn
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._ocr_overlay.fit()                  # keep the OCR overlay viewport-sized
         if self._zoom_mode in ("fit_page", "fit_width"):
             # Defer the re-fit (a full reload()) to the settle timer so a live
             # window drag does not re-rasterize the page on every frame. The
@@ -1815,25 +2356,37 @@ class PageView(QGraphicsView):
 
     # --- scroll-anchor preservation across a re-layout -------------------
     def _current_page_anchor(self) -> tuple:
-        """Capture (page_index, fraction-down-that-page) under the viewport center
-        so a zoom/relayout can restore the same reading position."""
+        """Capture (page_index, fraction-down-that-page, fraction-across-that-page)
+        under the viewport center so a zoom/relayout can restore the same reading
+        position -- including the horizontal one, so a zoom that grew a real pan
+        range keeps the user where they were instead of snapping to the left edge."""
         if not self._layers:
-            return (0, 0.0)
-        center_y = self.mapToScene(self.viewport().rect().center()).y()
+            return (0, 0.0, 0.5)
+        c = self.mapToScene(self.viewport().rect().center())
+        center_y, center_x = c.y(), c.x()
         for ly in self._layers:
             h = max(ly.pt_size[1] * self._zoom, 1.0)
             if ly.y_top <= center_y <= ly.y_top + h:
-                return (ly.page_index, (center_y - ly.y_top) / h)
-        return (self._page_index, 0.0)
+                w = max(ly.pt_size[0] * self._zoom, 1.0)
+                return (ly.page_index, (center_y - ly.y_top) / h,
+                        (center_x - ly.x_left) / w)
+        return (self._page_index, 0.0, 0.5)
 
     def _restore_page_anchor(self, anchor: tuple) -> None:
-        page, frac = anchor
+        page, frac = anchor[0], anchor[1]
+        frac_x = anchor[2] if len(anchor) > 2 else None
         if not self._layers:
             return
         page = max(0, min(page, len(self._layers) - 1))
         ly = self._layers[page]
         target_center = ly.y_top + frac * ly.pt_size[1] * self._zoom
         self._scroll_scene_y_to_center(target_center)
+        # Restore the horizontal focus too. When the page fits (no pan range) this is
+        # a no-op the scrollbar clamps out, and _recenter_h re-centres it; when the
+        # page is wider than the viewport it keeps the zoomed-to column in view.
+        if frac_x is not None:
+            target_center_x = ly.x_left + frac_x * max(ly.pt_size[0] * self._zoom, 1.0)
+            self._scroll_scene_x_to_center(target_center_x)
         self._update_lazy_render()
         self._update_current_page(emit=True)
 
@@ -1853,6 +2406,16 @@ class PageView(QGraphicsView):
         center_now = self.mapToScene(self.viewport().rect().center()).y()
         delta = scene_y - center_now
         vbar.setValue(int(round(vbar.value() + delta)))
+
+    def _scroll_scene_x_to_center(self, scene_x: float) -> None:
+        """Scroll so scene-x ``scene_x`` lands under the viewport CENTER (the
+        horizontal twin of ``_scroll_scene_y_to_center``; clamped by the bar)."""
+        hbar = self.horizontalScrollBar()
+        if hbar is None:
+            return
+        center_now = self.mapToScene(self.viewport().rect().center()).x()
+        delta = scene_x - center_now
+        hbar.setValue(int(round(hbar.value() + delta)))
 
     # =====================================================================
     # Rendering (continuous scroll: build all layers, lazy-render visible)
@@ -1925,11 +2488,16 @@ class PageView(QGraphicsView):
             layer.rotation = self.document.page_rotation(pi)
             layer.rotation_matrix = self.document.rotation_matrix(pi)
             rect = self.document.doc[pi].rect
-            # Display-space size is the rotated rect: a 90/270 page swaps w/h.
-            if layer.rotation % 180 == 90:
-                pw, ph = rect.height, rect.width
-            else:
-                pw, ph = rect.width, rect.height
+            # ``page.rect`` ALREADY reflects the page's /Rotate -- a portrait page
+            # rotated 90 reports a 792x612 (landscape) rect. The materialize pass
+            # sizes the slot from get_pixmap, which is ALSO rotated, so pass 1 must
+            # use ``rect`` AS-IS. The old "90/270 swaps w/h" branch DOUBLE-counted
+            # rotation: a rotated page got a wrongly-shaped slot, and where the
+            # real (rotated) height exceeded the allocated height the page overran
+            # into the next one -- the "pages clipping into each other" seen on
+            # scanned/rotated image-only pages (which carry /Rotate far more often
+            # than born-digital text PDFs, hence the "only image pages clip").
+            pw, ph = rect.width, rect.height
             layer.pt_size = (pw, ph)
             layer.y_top = y
             page_h = ph * z
@@ -1962,6 +2530,15 @@ class PageView(QGraphicsView):
         # mirror so the geometry helpers + tests have a valid current page.
         self._update_lazy_render(force_current=True)
         self._sync_current_page_mirror()
+
+        if self._debug_invert:                  # re-apply the binary view across the rebuild
+            self._apply_debug_invert()
+        if self._debug_map:                     # boxes may have changed (re-OCR / structural
+            self._debug_edit_id = None          # edit) -> re-measure so the map isn't stale.
+            self._debug_live = []               # reload is structural, not per zoom/scroll, so
+            self._debug_cache = self._compute_debug_cache()    # this recompute is infrequent.
+        if self._debug_borders:                 # rule lines are page pixels, not boxes, so a
+            self._border_cache = self._compute_border_cache()  # reload just re-detects them.
 
         # Re-establish the selection overlay for the still-present box.
         if sel_identity is not None:
@@ -2076,6 +2653,51 @@ class PageView(QGraphicsView):
             self._render_cache.put(page_index, scale, signature, image)
         return image
 
+    def _edit_exclude_for(self, page_index: int):
+        """The SCAN box whose committed bake must be HIDDEN while it is being
+        edited, so the live editor + preview float over the bare scan instead of
+        the box's own stale committed raster (the "re-edit shows the old bake until
+        commit" bug). None unless a scan box on this page is open for editing."""
+        box = self._editor_box
+        if (box is not None and self._editor_scan_preserve
+                and getattr(box, "page_index", None) == page_index):
+            # A MOVED/lifted box has NO scan under its new spot -- its text lives in the
+            # lifted raster (edit_image). Hiding that there would leave the editor over
+            # blank paper, so the text "goes white" in edit mode. Keep its raster visible
+            # (don't exclude); the live preview composes on top while typing. Only an
+            # IN-PLACE box is excluded, to reveal the real scan under the editor.
+            # "Moved" measured in DISPLAY space (the upright frame the editor renders in)
+            # so a width-grow -- which extends the display right edge but keeps the origin
+            # -- is NOT mistaken for a move on a /Rotate page (that left the committed bake
+            # visible under the live preview = the doubled "QR CrQR Crea..."). Same source
+            # of truth as the render offset + cover-vacate, so they never disagree.
+            mv = self.document._box_display_move(box)
+            moved = mv is not None and (abs(mv[0]) > 2.0 or abs(mv[1]) > 2.0)
+            return None if moved else box
+        return None
+
+    def _refresh_edit_pixmap(self, box) -> None:
+        """Re-render JUST the layer pixmap of ``box``'s page (no hotspot/shadow
+        churn) at the current edit-exclude state -- opening the editor hides the
+        box's committed bake, closing it restores the committed result."""
+        if box is None:
+            return
+        pg = getattr(box, "page_index", None)
+        if pg is None or not (0 <= pg < len(self._layers)):
+            return
+        layer = self._layers[pg]
+        if not layer.rendered or layer.pixmap_item is None:
+            return
+        image = self._baked_page_image(pg, self._edit_exclude_for(pg))
+        layer.image = image
+        # Respect the inverted debug view -- otherwise opening/closing an editor
+        # on this page would silently revert it to the normal render while every
+        # other page stays inverted.
+        if self._debug_invert:
+            layer.pixmap_item.setPixmap(self._debug_pixmap_for(layer))
+        else:
+            layer.pixmap_item.setPixmap(QPixmap.fromImage(image))
+
     def _materialize_page(self, layer: "_PageLayer") -> None:
         """Render ``layer``'s pixmap (baked, cache-served on a signature hit) +
         build its sheet/shadow/hotspots and add them to the scene at
@@ -2085,7 +2707,10 @@ class PageView(QGraphicsView):
         z = self._zoom
         dpr = self.devicePixelRatioF() or 1.0
         m = theme.SHEET_MARGIN
-        image = self._baked_page_image(layer.page_index)
+        # Hide the edited scan box's committed bake so a re-edit floats over the
+        # bare scan, not the stale raster.
+        image = self._baked_page_image(layer.page_index,
+                                       self._edit_exclude_for(layer.page_index))
         layer.image = image
         pixmap = QPixmap.fromImage(image)
         page_w = image.width() / dpr
@@ -2117,13 +2742,22 @@ class PageView(QGraphicsView):
             it.setGraphicsEffect(eff)
             scene.addItem(it)
             return it
-        a_blur, a_off, a_color = theme.page_shadow_ambient()
-        c_blur, c_off, c_color = theme.page_shadow_contact()
-        layer.shadow_item = _mk_shadow(a_blur, a_off, a_color)   # ambient layer
-        # The contact layer gets its OWN tracked slot (NOT extra_items, which is
-        # reset before the factory loop below, which would orphan it -> a shadow
-        # that accumulates on every scroll/remat). _dematerialize_page frees it.
-        layer.shadow_item2 = _mk_shadow(c_blur, c_off, c_color)
+        # The blurred page shadow is a fit/overview aesthetic only; above
+        # _SHADOW_MAX_ZOOM its per-paint re-blur (see the constant) is what made a
+        # high-zoom pan crawl, and the halo is off-screen anyway. Skip it then; the
+        # white sheet + pixmap below still read as a page. _dematerialize_page and
+        # the geometry helpers already tolerate shadow_item/shadow_item2 == None.
+        if z <= _SHADOW_MAX_ZOOM:
+            a_blur, a_off, a_color = theme.page_shadow_ambient()
+            c_blur, c_off, c_color = theme.page_shadow_contact()
+            layer.shadow_item = _mk_shadow(a_blur, a_off, a_color)   # ambient layer
+            # The contact layer gets its OWN tracked slot (NOT extra_items, which is
+            # reset before the factory loop below, which would orphan it -> a shadow
+            # that accumulates on every scroll/remat). _dematerialize_page frees it.
+            layer.shadow_item2 = _mk_shadow(c_blur, c_off, c_color)
+        else:
+            layer.shadow_item = None
+            layer.shadow_item2 = None
 
         sheet = QGraphicsRectItem(QRectF(x, layer.y_top, page_w, page_h))
         sheet.setBrush(QBrush(theme.color_sheet_white()))
@@ -2136,6 +2770,8 @@ class PageView(QGraphicsView):
         pixmap_item.setOffset(x, layer.y_top)
         pixmap_item.setZValue(Z_PIXMAP)
         layer.pixmap_item = pixmap_item
+        if self._debug_invert and layer.image is not None:   # binary view, if armed
+            pixmap_item.setPixmap(self._debug_pixmap_for(layer))
 
         # Hide the placeholder while the real sheet/pixmap are present.
         if layer.placeholder_item is not None:
@@ -2155,8 +2791,12 @@ class PageView(QGraphicsView):
         # undo (the repaint re-materializes through here).
         staged_gone = {x.identity
                        for x in self.document.xim_deletes(layer.page_index)}
+        # The scanned PAGE itself (a full-page existing image) gets NO hotspot: the
+        # user edits the OCR text on the page, not the page. A smaller embedded image
+        # (a logo / signature) keeps its hotspot and stays selectable.
         xims = [x for x in self.document.existing_images(layer.page_index)
-                if x.identity not in staged_gone]
+                if x.identity not in staged_gone
+                and not self._is_full_page_image(x)]
         layer.boxes = list(spans) + list(news) + list(images) + xims
         layer.hotspots = []
         for box in layer.boxes:
@@ -3730,22 +4370,23 @@ class PageView(QGraphicsView):
         uniform style). The styled runs are staged when the edit commits."""
         if self._editor is None or self._editor_box is None:
             return False
-        if not overrides or not set(overrides) <= {
-                "bold", "italic", "underline", "strike"}:
+        # A scanned box also accepts per-run COLOUR / family on a selection (the
+        # synth bake recolours / re-faces just that run); the vector path keeps the
+        # weight/slant set only.
+        scan = self._editor_scan_preserve
+        allowed = {"bold", "italic", "underline", "strike"}
+        if scan:
+            allowed = allowed | {"color", "font_family"}   # per-run colour + font (size stays whole-box)
+        if not overrides or not set(overrides) <= allowed:
             return False
         # Underline / strikethrough are EDITOR-selection styles applied via the
         # char format (the glyph-run bake persists bold/italic; u/s show while
         # editing). They only apply with an open editor, handled here.
         if getattr(self._editor_box, "box_id", None) is not None \
-                and set(overrides) <= {"bold", "italic"}:
-            return False              # NewBox: uniform bold/italic only
+                and set(overrides) <= {"bold", "italic"} and not scan:
+            return False              # plain NewBox: uniform bold/italic only
         cursor = self._editor.textCursor()
         had_selection = cursor.hasSelection()
-        if not had_selection:
-            # No selection while editing: style the WHOLE text in place. This
-            # keeps the editor open instead of the whole-box route, whose
-            # reload would commit the edit out from under the user.
-            cursor.select(QTextCursor.Document)
         fmt = QTextCharFormat()
         if "bold" in overrides:
             fmt.setFontWeight(QFont.Bold if overrides["bold"] else QFont.Normal)
@@ -3755,9 +4396,40 @@ class PageView(QGraphicsView):
             fmt.setFontUnderline(bool(overrides["underline"]))
         if "strike" in overrides:
             fmt.setFontStrikeOut(bool(overrides["strike"]))
+        if overrides.get("color") is not None:
+            fmt.setForeground(QColor.fromRgbF(*overrides["color"]))
+        if scan and overrides.get("font_family"):
+            # Re-face just the selected run; the synth bakes that run in the picked
+            # family (the commit reads it back as the run's RunStyle.font_family).
+            fmt.setFontFamilies([overrides["font_family"]])
+        only_bi = set(overrides) <= {"bold", "italic"}
+        if not had_selection:
+            if scan and only_bi:
+                # Remember the weight/slant as the typing style so text typed NEXT keeps it.
+                b0, i0 = (self._scan_typing_style if self._scan_typing_style
+                          else (self._editor.font().bold(),
+                                self._editor.font().italic()))
+                if "bold" in overrides:
+                    b0 = bool(overrides["bold"])
+                if "italic" in overrides:
+                    i0 = bool(overrides["italic"])
+                self._scan_typing_style = (b0, i0)
+            # No selection: apply to the WHOLE existing text so the format shows on the
+            # text you are looking at (scanned text is redrawn in the new format per run;
+            # the synth re-bakes any char whose style now differs from the scan base).
+            cursor.select(QTextCursor.Document)
         cursor.mergeCharFormat(fmt)
         if had_selection:
             self._editor.setTextCursor(cursor)   # keep the user's selection
+            if scan:
+                self._scan_typing_style = None    # an explicit selection clears typing arm
+        dlog("STYLE", "apply_selection", box=id(self._editor_box),
+             overrides=list(overrides.keys()), had_selection=had_selection, scan=scan)
+        if scan:
+            self._update_ocr_preview()           # re-bake the styled run live
+            # Style (bold/italic/font) changes character WIDTHS, so the map must re-run too --
+            # the render and the map always move together (every change runs through the map).
+            self._remap_edited_box()
         return True
 
     def set_format_panel(self, widget) -> None:
@@ -3783,6 +4455,45 @@ class PageView(QGraphicsView):
         (which re-opens the editor) can put the highlight back."""
         self._editor_saved_selection = (int(anchor), int(pos))
 
+    def _apply_scan_box_style_live(self, overrides: dict) -> bool:
+        """Apply whole-box font/size/color to the OPEN scanned editor LIVE: update
+        the box model, refresh the cached context(s), and re-bake the preview in
+        place. The box stays open (no commit, no reopen); the change persists at
+        commit. Bold/italic never reach here (they go per-run via the selection
+        path), so this is the font/size/color path only."""
+        box = self._editor_box
+        if box is None:
+            return True
+        o = {k: v for k, v in overrides.items()
+             if k in ("font_family", "size", "color")}
+        if not o:
+            return True
+        import numpy as _np
+        updated = self.document.update_scan_edit_style(box, o)
+        self._editor_box = updated
+        ctxs = ([self._editor_scan_ctx] if self._editor_scan_ctx else [])
+        ctxs += [ln["ctx"] for ln in ((self._caret_measure or {}).get("lines") or [])
+                 if ln and ln.get("ctx")]
+        for ctx in ctxs:
+            if "size" in o:
+                ctx["em"] = float(_np.clip(float(updated.size), 5.0, 200.0))
+            if "font_family" in o:
+                # Picked family overrides the edge-match: repoint the base file the
+                # synth resolves from, mark it picked, and force a full re-resolve.
+                ctx["font_picked"] = True
+                ctx["fpath"] = self.document._edit_font_file(
+                    updated.font_family, bool(updated.bold), bool(updated.italic))
+                ctx.pop("_synth_fpath", None)
+            ctx.pop("_synth_metrics", None)          # re-resolve size/variant next bake
+        if "font_family" in o and not self._editor_multiline \
+                and self._editor_scan_ctx:
+            self._caret_fpath = self._editor_scan_ctx.get("fpath")
+        self._editor_style_changed = True            # force a preview even if text unchanged
+        dlog("STYLE", "apply_whole_box", box=id(box), overrides=list(o.keys()))
+        self._update_ocr_preview()
+        self._remap_edited_box()                     # size/font moves characters -> re-map
+        return True
+
     def apply_style_to_editor_box(self, overrides: dict) -> bool:
         """Apply a WHOLE-BOX style (font family / size / colour, or bold/italic
         with no per-run path) to the box being inline-edited WITHOUT dropping the
@@ -3798,6 +4509,11 @@ class PageView(QGraphicsView):
         if not set(overrides) <= {"font_family", "size", "color",
                                   "bold", "italic"}:
             return False
+        # SCANNED box: never commit+reopen (that is the "format kicks me out" path).
+        # Bold/italic already went through apply_style_to_selection (per run); only
+        # font/size/color reach here -- apply them to the whole box LIVE, box stays open.
+        if self._editor_scan_preserve:
+            return self._apply_scan_box_style_live(overrides)
         box = self._editor_box
         identity = getattr(box, "identity", None)
         # Selection to restore: the focus-out stash (set when the panel was
@@ -3866,7 +4582,7 @@ class PageView(QGraphicsView):
         if ed is None or self._committing or self._closing_editor:
             return
         if self._editor_multiline or self._reresolving \
-                or self._editor_box is None:
+                or self._editor_box is None or self._editor_scan_preserve:
             return
         text = ed.toPlainText() or " "
         try:
@@ -3896,46 +4612,834 @@ class PageView(QGraphicsView):
         finally:
             self._reresolving = False
 
+    def _caret_disp_to_scene_xy(self, page, dx: float, dy: float):
+        o = self._sheet_origin_for(page)
+        z = self._zoom
+        return (o.x() + dx * z, o.y() + dy * z)
+
+    def _scan_caret_index(self, scene_pt, text: str):
+        """CUSTOM caret engine: scene click -> caret index, from the measured scanned
+        glyph edges. Picks the line whose measured y-band holds the click (else the
+        nearest), recomputes that line's live edges for the current text, and snaps to
+        the nearest character boundary. Returns a global index into ``text`` or None."""
+        m = self._caret_measure
+        if not m or not m.get("lines"):
+            return None
+        page = getattr(self, "_editor_page", self._page_index)
+        o = self._sheet_origin_for(page)
+        z = max(self._zoom, 1e-6)
+        dx = (scene_pt.x() - o.x()) / z
+        dy = (scene_pt.y() - o.y()) / z
+        cur = text.split("\n")
+        lines = m["lines"]
+        bi, bd = None, None
+        for i, ml in enumerate(lines):
+            if ml is None or i >= len(cur):
+                continue
+            if ml["top"] <= dy <= ml["bottom"]:
+                bi = i
+                break
+            dist = min(abs(dy - ml["top"]), abs(dy - ml["bottom"]))
+            if bd is None or dist < bd:
+                bi, bd = i, dist
+        if bi is None:
+            return None
+        edges = self.document.caret_line_edges(lines[bi], cur[bi], self._caret_fpath)
+        ch = min(range(len(edges)), key=lambda k: abs(edges[k] - dx))
+        return sum(len(cur[j]) + 1 for j in range(bi)) + min(ch, len(cur[bi]))
+
+    def _scan_caret_scene(self, index: int, text: str):
+        """The caret's scene segment (x, y_top, y_bottom) for a cursor ``index``, from
+        the measured geometry -- so the caret draws on the real scanned line."""
+        m = self._caret_measure
+        if not m or not m.get("lines"):
+            return None
+        cur = text.split("\n")
+        gi, li = index, 0
+        for i, ln in enumerate(cur):
+            if gi <= len(ln):
+                li = i
+                break
+            gi -= len(ln) + 1
+            li = i
+        if li >= len(m["lines"]) or m["lines"][li] is None:
+            return None
+        ml = m["lines"][li]
+        edges = self.document.caret_line_edges(ml, cur[li], self._caret_fpath)
+        cx = edges[min(max(gi, 0), len(edges) - 1)]
+        page = getattr(self, "_editor_page", self._page_index)
+        # Caret height = the CAP-line-to-baseline text band (tight), NOT the loose OCR line
+        # cover (which spans the full leading and made the caret overshoot into the next
+        # line). baseline + cap_px come from the map; fall back to the cover band only if
+        # they are missing.
+        ppi = float(ml.get("ppi") or (300.0 / 72.0))
+        cap = (ml.get("ctx") or {}).get("cap_px")
+        bl = ml.get("baseline")
+        if cap and bl is not None:
+            top_pt = float(bl) - float(cap) / ppi
+            bot_pt = float(bl) + 0.16 * float(cap) / ppi      # a touch below for descenders
+        else:
+            top_pt, bot_pt = ml["top"], ml["bottom"]
+        sx, sy_top = self._caret_disp_to_scene_xy(page, cx, top_pt)
+        _, sy_bot = self._caret_disp_to_scene_xy(page, cx, bot_pt)
+        return (sx, sy_top, sy_bot)
+
+    def _caret_glyph_pagepx(self, index: int, text: str):
+        """Page-pixel (300 dpi) rect of the glyph just LEFT of caret ``index`` in the
+        OCR box, from the measured caret geometry -- the frame the per-glyph page font
+        map uses, so the format bar can reflect the caret glyph's real font."""
+        m = self._caret_measure
+        if not m or not m.get("lines"):
+            return None
+        cur = text.split("\n")
+        gi, li = index, 0
+        for i, ln in enumerate(cur):
+            if gi <= len(ln):
+                li = i
+                break
+            gi -= len(ln) + 1
+            li = i
+        if li >= len(m["lines"]) or m["lines"][li] is None:
+            return None
+        ml = m["lines"][li]
+        try:
+            edges = self.document.caret_line_edges(ml, cur[li], self._caret_fpath)
+        except Exception:
+            edges = None
+        if not edges or len(edges) < 2:
+            return None
+        c = min(max(gi - 1, 0), len(edges) - 2)     # the glyph the caret sits after
+        ppi = float(ml.get("ppi") or (300.0 / 72.0))
+        return (float(edges[c]) * ppi, float(ml["top"]) * ppi,
+                float(edges[c + 1]) * ppi, float(ml["bottom"]) * ppi)
+
+    def _detect_ttf_cached(self, path: str):
+        """(family, bold, italic) for a bank TTF, cached -- caret moves call this
+        often and the name-table read is not free."""
+        cache = getattr(self, "_caret_ttf_cache", None)
+        if cache is None:
+            cache = self._caret_ttf_cache = {}
+        if path not in cache:
+            try:
+                from ..font_engine import detect_ttf_style
+                cache[path] = detect_ttf_style(path)
+            except Exception:
+                cache[path] = (None, False, False)
+        return cache[path]
+
+    def _ensure_caret_item(self):
+        """The blinking caret is its OWN scene item (a thin vertical line), not drawn
+        inside the editor -- so it is never clipped to the editor's bounding box (which
+        turned it into a "dot") and a move repaints cleanly (no ghost of the old one)."""
+        if self._caret_item is None:
+            from PySide6.QtWidgets import QGraphicsLineItem
+            it = QGraphicsLineItem()
+            pen = QPen(QColor(25, 25, 25))
+            pen.setWidthF(1.6)
+            pen.setCosmetic(True)                # constant on-screen width at any zoom
+            it.setPen(pen)
+            it.setAcceptedMouseButtons(Qt.NoButton)  # never intercept a click (Z=120)
+            it.setZValue(120)                   # above the editor + live composite
+            sc = self.scene()
+            if sc is not None:
+                sc.addItem(it)
+            self._caret_item = it
+        return self._caret_item
+
+    def _position_caret_item(self) -> None:
+        """Move the caret item to the current cursor index and make it solid + restart
+        the blink (a real caret is solid right after it moves, then blinks)."""
+        ed = self._editor
+        if ed is None or not self._caret_measure:
+            return
+        seg = self._scan_caret_scene(ed.textCursor().position(), ed.toPlainText())
+        it = self._ensure_caret_item()
+        if seg is None:
+            it.setVisible(False)
+            return
+        sx, sy0, sy1 = seg
+        it.setLine(sx, sy0, sx, sy1)
+        self._caret_on = True
+        it.setVisible(ed.hasFocus())
+        self._caret_blink.start()
+        self._position_selection_item()           # keep the highlight band in sync
+        self._emit_caret_style()                  # push the caret's local style to the format bar
+
+    def _emit_caret_style(self) -> None:
+        """Schedule a format-bar update for the caret's local style. DEFERRED to the
+        next event-loop tick (QTimer.singleShot 0): _position_caret_item runs DURING
+        begin_edit / paint, and pushing the inspector (set_target) re-entrantly from
+        inside that half-built state crashed Qt. Deferring runs it after the current
+        operation completes, never re-entrant; a pending flag coalesces bursts."""
+        if getattr(self, "_caret_style_pending", False):
+            return
+        self._caret_style_pending = True
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._do_emit_caret_style)
+
+    def _do_emit_caret_style(self) -> None:
+        """Read the caret's local formatting and report it to the format bar -- per
+        character, not the one whole-box style set at edit-open. Runs deferred (see
+        _emit_caret_style); bails if the edit ended in the meantime."""
+        self._caret_style_pending = False
+        ed = self._editor
+        if ed is None or self._editor_box is None or not self._editor_scan_preserve \
+                or self._committing or self._closing_editor:
+            return
+        try:
+            cur = ed.textCursor()
+            fmt = cur.charFormat()
+            # A char with NO explicit weight/slant property INHERITS the editor's base
+            # font (which carries the box's seeded scan weight). Qt's charFormat returns
+            # the DEFAULT (Normal/upright) for those, not the base -- so fall back to the
+            # base font, exactly like _extract_editor_runs, or a fully-bold/italic scan
+            # would always read as plain. DemiBold threshold matches the commit path.
+            base = ed.font()
+            bold = (fmt.fontWeight() >= QFont.DemiBold
+                    if fmt.hasProperty(QTextFormat.FontWeight) else base.bold())
+            italic = (fmt.fontItalic()
+                      if fmt.hasProperty(QTextFormat.FontItalic) else base.italic())
+            style = {"bold": bool(bold), "italic": bool(italic)}
+            fg = fmt.foreground()
+            if fg.style() != Qt.NoBrush:
+                col = fg.color()
+                style["color"] = (col.redF(), col.greenF(), col.blueF())
+            # Per-caret FONT family via the Qt6 fontFamilies() LIST api -- NOT the
+            # deprecated fontFamily(), which segfaults in this PySide6 build (null deref
+            # in QTextCharFormat::fontFamily). Reported ONLY when the fragment carries an
+            # explicit family (a styled run); otherwise the char inherits the box base and
+            # _on_caret_style fills the whole-box family. Either way the inspector maps a
+            # scan-bank alias to its real typeface name for display.
+            if fmt.hasProperty(QTextFormat.FontFamilies):
+                fams = fmt.fontFamilies()
+                fam = (fams[0] if isinstance(fams, (list, tuple)) and fams
+                       else fams if isinstance(fams, str) else None)
+                if fam:
+                    style["font_family"] = fam
+            # PER-GLYPH font for an OCR box: the real font of the glyph at the caret
+            # lives in the page font map (super-res match), NOT the Qt char format. Look
+            # it up and reflect ITS family + weight + slant, so the format bar shows
+            # what is actually under the caret -- a bold label vs a regular number in the
+            # SAME box read differently, like a real text editor. Skips when the user has
+            # explicitly picked a family (font_picked), so their choice is not overridden.
+            if not getattr(self._editor_box, "font_picked", False):
+                try:
+                    pi = getattr(self._editor_box, "page_index", self._page_index)
+                    pfm = self.document._page_font_map(pi)
+                    if pfm is not None:
+                        rect = self._caret_glyph_pagepx(cur.position(), ed.toPlainText())
+                        fr = pfm.font_for_rect(*rect) if rect else None
+                        if fr:
+                            fam2, b2, i2 = self._detect_ttf_cached(fr[0])
+                            if fam2:
+                                style["font_family"] = fam2
+                                style["bold"] = bool(b2)
+                                style["italic"] = bool(i2)
+                except Exception:
+                    pass
+            self.caretStyleChanged.emit(self._editor_box, style)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _ensure_selection_item(self):
+        """The translucent clay band that shows the text selection while editing a
+        SCAN box (the editor glyphs are transparent, so Qt's own highlight never
+        paints). A SEPARATE scene item, like the caret, below the caret (Z 119) and
+        above the live composite, never intercepting clicks."""
+        if self._sel_item is None:
+            from PySide6.QtWidgets import QGraphicsPathItem
+            it = QGraphicsPathItem()
+            it.setBrush(theme.color_editor_selection())
+            it.setPen(Qt.NoPen)
+            it.setAcceptedMouseButtons(Qt.NoButton)
+            it.setZValue(119)
+            sc = self.scene()
+            if sc is not None:
+                sc.addItem(it)
+            self._sel_item = it
+        return self._sel_item
+
+    def _position_selection_item(self) -> None:
+        """Draw the selection band over the selected scanned glyphs: one rect per
+        covered line, built from the SAME measured caret geometry, so the band lands
+        exactly on the scan. Hidden when there is no selection."""
+        ed = self._editor
+        if ed is None or not self._caret_measure or not self._editor_scan_preserve:
+            if self._sel_item is not None:
+                self._sel_item.setVisible(False)
+            return
+        it = self._ensure_selection_item()
+        cur = ed.textCursor()
+        if not cur.hasSelection():
+            it.setVisible(False)
+            return
+        from PySide6.QtGui import QPainterPath
+        a, b = cur.selectionStart(), cur.selectionEnd()
+        text = ed.toPlainText()
+        path = QPainterPath()
+        base = 0
+        for ln in text.split("\n"):
+            ln_start, ln_end = base, base + len(ln)
+            s, e = max(a, ln_start), min(b, ln_end)
+            if e > s:
+                seg_s = self._scan_caret_scene(s, text)
+                seg_e = self._scan_caret_scene(e, text)
+                if seg_s and seg_e:
+                    x0, x1 = min(seg_s[0], seg_e[0]), max(seg_s[0], seg_e[0])
+                    y0 = min(seg_s[1], seg_e[1])
+                    y1 = max(seg_s[2], seg_e[2])
+                    if x1 - x0 > 0.5:
+                        path.addRect(x0, y0, x1 - x0, y1 - y0)
+            base = ln_end + 1
+        it.setPath(path)
+        it.setVisible(not path.isEmpty())
+
+    def _blink_caret(self) -> None:
+        if self._caret_item is None or self._editor is None:
+            return
+        self._caret_on = not self._caret_on
+        self._caret_item.setVisible(self._caret_on and self._editor.hasFocus())
+
+    def _teardown_caret_item(self) -> None:
+        self._caret_blink.stop()
+        if self._caret_item is not None:
+            sc = self._caret_item.scene()
+            if sc is not None:
+                sc.removeItem(self._caret_item)
+            self._caret_item = None
+
+    def _style_typed_chars(self, position: int, removed: int, added: int) -> None:
+        """Stamp the armed typing style (set by toggling bold/italic with NO
+        selection) onto the characters just inserted, so only the NEW text takes
+        the style -- never the rest of the box. Guarded against the re-entrant
+        contentsChange its own mergeCharFormat would emit."""
+        st = self._scan_typing_style
+        if (not st or added <= 0 or self._styling_guard
+                or not self._editor_scan_preserve or self._editor is None):
+            return
+        # No-op when the armed style already equals the editor base (nothing to add).
+        if st == (self._editor.font().bold(), self._editor.font().italic()):
+            return
+        self._styling_guard = True
+        try:
+            c = self._editor.textCursor()
+            c.setPosition(position)
+            c.setPosition(position + added, QTextCursor.KeepAnchor)
+            fmt = QTextCharFormat()
+            fmt.setFontWeight(QFont.Bold if st[0] else QFont.Normal)
+            fmt.setFontItalic(bool(st[1]))
+            c.mergeCharFormat(fmt)
+        finally:
+            self._styling_guard = False
+
+    def _update_ocr_preview(self) -> None:
+        """Re-lay the edited line live: each run of characters the user did NOT
+        change stays the ORIGINAL scan pixels, reflowed; each added run is
+        synthesized in the matched font and degraded. While the text equals the
+        original there is NO overlay, so the box shows the scan exactly as on the
+        page (clicking in changes nothing)."""
+        if not self._editor_scan_preserve or self._editor is None \
+                or self._committing or self._closing_editor \
+                or self._editor_box is None:
+            return
+        if self._editor_preview is not None:
+            if self._editor_preview.scene() is not None:
+                self.scene().removeItem(self._editor_preview)
+            self._editor_preview = None
+        text = self._editor.toPlainText()
+        box = self._editor_box
+        dlog("RENDER", "compose_preview", box=id(box), text=text,
+             multiline=self._editor_multiline)
+        # Per-run styling read from the editor (bold/italic per character). A pure
+        # STYLE change (same text, a bolded selection) must still re-bake, so detect
+        # any run whose style differs from the editor's base (== the box's scan style).
+        runs = self._extract_editor_runs(self._editor, rich=True)
+        bb, bi = self._editor.font().bold(), self._editor.font().italic()
+        styled = any((bool(r[1]), bool(r[2])) != (bb, bi)
+                     or (len(r) > 3 and r[3] is not None) for r in runs)
+        if text == self._editor_orig_text and not styled \
+                and not self._editor_style_changed:
+            return            # unchanged -> the edit-excluded scan shows underneath as-is
+        try:
+            if self._editor_multiline:
+                # Paragraph: per-line compose REUSING the per-line contexts measured at
+                # edit-open (no re-segment / re-font-match per keystroke -- that was the
+                # slowness), so a keystroke only re-renders the changed line's glyphs.
+                # ``runs`` carries the whole-block styling; compose_lines_block slices
+                # it per line so a bolded word on one line bakes per line.
+                ctxs = ([ln["ctx"] if ln else None
+                         for ln in self._caret_measure["lines"]]
+                        if self._caret_measure else None)
+                out = self.document.compose_lines_block(
+                    box, text, page_rgb=self._editor_page_rgb, ctxs=ctxs, runs=runs)
+                if out is None:
+                    return
+                tile, disp = out
+            else:
+                ctx = self._editor_scan_ctx
+                if ctx is None:
+                    return
+                tile, disp = self.document.inplace_compose(ctx, text, runs)
+        except Exception:                       # noqa: BLE001 - never break typing
+            return
+        if tile is None:
+            return
+        import numpy as np
+        tile = np.ascontiguousarray(tile)
+        h, w = tile.shape[:2]
+        img = QImage(tile.data, w, h, 3 * w, QImage.Format_RGB888).copy()
+        pm = QPixmap.fromImage(img)
+        page = getattr(box, "page_index", self._page_index)
+        # ``disp`` is the tile's rect in DISPLAY points (already widened if the line
+        # grew). The scene IS display space, so map straight through: origin + pt*zoom
+        # (no rotation re-applied -- the page render already baked the /Rotate in).
+        origin = self._sheet_origin_for(page)
+        z = self._zoom
+        item = QGraphicsPixmapItem(pm)
+        item.setTransformationMode(Qt.SmoothTransformation)
+        item.setPos(origin.x() + disp[0] * z, origin.y() + disp[1] * z)
+        item.setScale((disp[2] - disp[0]) * z / max(pm.width(), 1))
+        item.setZValue(Z_COVER)                 # above the page, below the caret
+        self.scene().addItem(item)
+        self._editor_preview = item
+
+    # ----- DEBUG console: map overlay + inverted binary view ---------------
+    def set_debug_map(self, on: bool) -> None:
+        """Toggle the per-character / per-space MAP overlay -- the exact char boundaries
+        (blue) and SPACE cells (red) the caret + erase use, so a gap that collapsed to one
+        space shows as one wide red cell. Measured ONCE (cached in zoom-independent display
+        points); zoom just redraws the cache, never re-renders/re-segments."""
+        self._debug_map = bool(on)
+        self._debug_cache = self._compute_debug_cache() if on else None
+        self._debug_live = []
+        # Turned on mid-edit: live-remap the box being edited so it tracks typing right
+        # away (else it would show its stale committed map until the next keystroke).
+        self._debug_edit_id = ((getattr(self._editor_box, "box_id", None)
+                                or id(self._editor_box))
+                               if on and self._editor is not None
+                               and self._editor_scan_preserve
+                               and getattr(self, "_editor_box", None) is not None
+                               else None)
+        if self._debug_edit_id is not None:
+            self._remap_edited_box()
+        self.viewport().update()                # repaint -> drawForeground redraws it
+
+    def set_debug_borders(self, on: bool) -> None:
+        """Toggle the TABLE / PAGE BORDER map -- the rule lines (grid, frame, section
+        dividers) detected on each page, drawn over the page in magenta. Detected once on
+        toggle-on (and on reload) and cached in display points, so zoom/scroll just redraw
+        the cache. This is the map we will intersect with the OCR boxes to split a merged
+        table row into per-cell boxes."""
+        self._debug_borders = bool(on)
+        self._border_cache = self._compute_border_cache() if on else {}
+        self.viewport().update()
+
+    def _compute_border_cache(self) -> dict:
+        """Detect rule lines on every laid-out page -> ``{page: (h_lines, v_lines)}`` in
+        display points (the same frame the page render + char map use)."""
+        cache: dict = {}
+        if self.document is None or not self._layers:
+            return cache
+        for layer in self._layers:
+            page = layer.page_index
+            try:
+                cache[page] = self.document.page_border_lines(page)
+            except Exception:
+                cache[page] = ([], [])
+        return cache
+
+    def set_debug_invert(self, on: bool) -> None:
+        """Toggle the inverted BINARY view of every page -- ink WHITE on black, exactly
+        what the scan map keys on."""
+        self._debug_invert = bool(on)
+        self._apply_debug_invert()
+
+    def drawForeground(self, painter, rect) -> None:
+        """Paint the debug MAP on EVERY repaint (zoom / scroll / reload), straight from the
+        measured-once cache -- so it can NEVER fall out of sync with the page (no scene
+        items to clear or rebuild). Positions are origin + display_pt * zoom, the SAME
+        mapping the page render uses; cosmetic pens stay 1px at any zoom; clipped to the
+        exposed ``rect`` so a zoomed-in view only paints what's visible."""
+        super().drawForeground(painter, rect)
+        z = self._zoom
+        # TABLE / PAGE BORDER overlay -- independent of the char map. Rule lines (grid,
+        # frame, dividers) in magenta, drawn from the cached display-point segments.
+        if self._debug_borders and self._border_cache:
+            bpen = QPen(QColor(190, 30, 200, 235))
+            bpen.setCosmetic(True)
+            bbrush = QBrush(QColor(190, 30, 200, 70))
+            painter.setPen(bpen)
+            painter.setBrush(bbrush)
+            for page, lines in self._border_cache.items():
+                origin = self._sheet_origin_for(page)
+                for (x0, y0, x1, y1) in (list(lines[0]) + list(lines[1])):
+                    rx, ry = origin.x() + x0 * z, origin.y() + y0 * z
+                    rw, rh = max(1.5, (x1 - x0) * z), max(1.5, (y1 - y0) * z)
+                    if rx + rw < rect.left() or rx > rect.right() \
+                            or ry + rh < rect.top() or ry > rect.bottom():
+                        continue
+                    painter.drawRect(QRectF(rx, ry, rw, rh))
+        if not self._debug_map or not self._debug_cache:
+            return
+        space_pen = QPen(QColor(220, 40, 40, 230))
+        space_pen.setCosmetic(True)
+        space_brush = QBrush(QColor(220, 40, 40, 55))
+        char_pen = QPen(QColor(40, 110, 220, 150))
+        char_pen.setCosmetic(True)
+
+        def _paint(page, edges, txt, top_d, bot_d, gboxes=None):
+            origin = self._sheet_origin_for(page)
+            top = origin.y() + top_d * z
+            bot = origin.y() + bot_d * z
+            if bot < rect.top() or top > rect.bottom():
+                return
+            h = max(1.0, bot - top)
+            painter.setPen(space_pen)
+            painter.setBrush(space_brush)
+            for i in range(min(len(txt), len(edges) - 1)):       # SPACE cells (red)
+                if txt[i] != " ":
+                    continue
+                x0 = origin.x() + edges[i] * z
+                w = max(1.0, (edges[i + 1] - edges[i]) * z)
+                if x0 + w < rect.left() or x0 > rect.right():
+                    continue
+                painter.drawRect(QRectF(x0, top, w, h))
+            painter.setPen(char_pen)
+            painter.setBrush(Qt.NoBrush)
+            if gboxes:                                           # PER-GLYPH BOXES (blue): each
+                for gb in gboxes:                                # glyph's real ink box (x AND y)
+                    if gb is None:
+                        continue
+                    gx = origin.x() + gb[0] * z
+                    gy = origin.y() + gb[1] * z
+                    gw = max(1.0, (gb[2] - gb[0]) * z)
+                    gh = max(1.0, (gb[3] - gb[1]) * z)
+                    if gx + gw < rect.left() or gx > rect.right() \
+                            or gy + gh < rect.top() or gy > rect.bottom():
+                        continue
+                    painter.drawRect(QRectF(gx, gy, gw, gh))
+            else:                                                # fallback: full-height char
+                for e in edges:                                  # boundary lines (live edited line)
+                    x = origin.x() + e * z
+                    if x < rect.left() or x > rect.right():
+                        continue
+                    painter.drawLine(QPointF(x, top), QPointF(x, bot))
+
+        # The committed cache, MINUS the box being edited (its live remap replaces it
+        # below so the map tracks every keystroke instead of going stale / vanishing).
+        eid = self._debug_edit_id
+        for entry in self._debug_cache:
+            if eid is not None and entry[5] == eid:
+                continue
+            _paint(entry[0], entry[1], entry[2], entry[3], entry[4],
+                   entry[6] if len(entry) > 6 else None)
+        for entry in self._debug_live:                           # live edited box
+            _paint(entry[0], entry[1], entry[2], entry[3], entry[4],
+                   entry[6] if len(entry) > 6 else None)
+
+    @staticmethod
+    def _glyph_boxes_disp(ln) -> "list | None":
+        """Per-glyph boxes (x0,y0,x1,y1) of a map line in DISPLAY POINTS, from the line's
+        ctx char map -- the SAME ink boxes that drive per-glyph sizing, so the map view shows
+        each glyph's real top/bottom, not one shared line band. None when the line has no
+        per-glyph segmentation (a live-edited line measured from caret edges only)."""
+        ctx = ln.get("ctx") or {}
+        cb = (ctx.get("geom") or {}).get("char_boxes")
+        dr = ctx.get("disp_rect")
+        pp = ctx.get("ppi")
+        if not cb or not dr or not pp:
+            return None
+        dx0, dy0 = float(dr[0]), float(dr[1])
+        return [None if b is None else
+                (dx0 + b[0] / pp, dy0 + b[1] / pp, dx0 + b[2] / pp, dy0 + b[3] / pp)
+                for b in cb]
+
+    def _compute_debug_cache(self, only_page: "int | None" = None) -> list:
+        """Measure scan boxes -> per line ``(page, edges, text, top, bottom, box_id)`` in
+        DISPLAY POINTS (zoom-independent). Heavy (renders + segments), so it runs on
+        toggle-on and on commit; the overlay is then drawn from this cache at any zoom for
+        free. ``only_page`` restricts the rebuild to ONE page (the full-page remap on
+        commit), leaving the other pages' cached entries untouched."""
+        cache: list = []
+        if self.document is None or not self._layers:
+            return cache
+        prior = self._debug_cache or []          # carry edited boxes' map across a full rebuild
+        for layer in self._layers:
+            page = layer.page_index
+            if only_page is not None and page != only_page:
+                continue
+            try:
+                page_rgb = self.document.render_page_image(page, 300.0)
+            except Exception:
+                page_rgb = None
+            for box in self.document.new_boxes(page):
+                rm = getattr(box, "render_mode", 0)
+                # Un-edited scan overlays (render_mode 3) are measured below. An EDITED box
+                # (render_mode 0) CANNOT be re-measured here -- measure_box_glyphs re-segments
+                # the RAW scan's ORIGINAL ocr_text, not the edited glyphs -- so CARRY FORWARD its
+                # existing per-glyph map entries (spliced by _remap_one_box on edit-close) instead
+                # of dropping it. Without this, a reload's full rebuild silently removed the edited
+                # line from the map ("the map dies after an edit"). Native (non-scan) boxes have no
+                # prior entries, so nothing is carried and they stay off the map as before.
+                if rm != 3:
+                    bid = getattr(box, "box_id", None) or id(box)
+                    carried = [e for e in prior if e[5] == bid]
+                    cache.extend(carried)
+                    if not carried:
+                        dlog("MAP", "skip_box", box=id(box), page=page, rm=rm, reason="render_mode!=3")
+                    continue
+                try:
+                    meas = self.document.measure_box_glyphs(box, page_rgb=page_rgb)
+                except Exception:
+                    meas = None
+                if not meas:
+                    dlog("MAP", "skip_box", box=id(box), page=page, rm=rm, reason="no-measure")
+                    continue
+                bid = getattr(box, "box_id", None) or id(box)   # STABLE across new_boxes() calls
+                nlines = 0
+                for ln in meas.get("lines", []):
+                    if not ln:
+                        continue
+                    edges = [float(e) for e in (ln.get("edges") or [])]
+                    if len(edges) < 2:
+                        continue
+                    cache.append((page, edges, ln.get("text", ""),
+                                  float(ln.get("top", 0.0)),
+                                  float(ln.get("bottom", ln.get("top", 0.0))),
+                                  bid, self._glyph_boxes_disp(ln)))
+                    nlines += 1
+                dlog("MAP", "measured_box", box=bid, page=page, lines=nlines)
+        dlog("MAP", "compute_cache", only_page=only_page, entries=len(cache))
+        return cache
+
+    def _remap_edited_box(self) -> None:
+        """REMAP the box being edited on every keystroke: rebuild its map lines from the
+        LIVE editor text (the same caret edges the cursor uses), so the red space cells +
+        blue char bounds follow what you type instead of freezing on the committed text.
+        Cheap -- pure edge arithmetic over the already-measured line geometry, no
+        re-render/re-segment. A no-op unless the map is on and a box is being edited."""
+        if not self._debug_map:
+            dlog("MAP", "remap_edited_skip", reason="debug_map_off")
+            return
+        ed = self._editor
+        m = self._caret_measure
+        if ed is None or not m or not m.get("lines"):
+            self._debug_live = []
+            dlog("MAP", "remap_edited_skip", reason="no_caret_measure")
+            return
+        page = getattr(self, "_editor_page", self._page_index)
+        eid = self._debug_edit_id
+        cur = ed.toPlainText().split("\n")
+        live = []
+        for i, ml in enumerate(m["lines"]):
+            if not ml:
+                continue
+            line_text = cur[i] if i < len(cur) else ""
+            try:
+                edges = [float(e) for e in self.document.caret_line_edges(
+                    ml, line_text, self._caret_fpath)]
+            except Exception:
+                continue
+            if len(edges) < 2:
+                continue
+            top_d = float(ml.get("top", 0.0))
+            bot_d = float(ml.get("bottom", top_d))
+            # LIVE per-glyph boxes: x from the caret EDGES (so the boxes follow what you type),
+            # y from each glyph's REAL ink top/bottom for every UNCHANGED prefix/suffix glyph --
+            # reuse the frozen edit-open per-glyph boxes, since a kept scan glyph's height never
+            # changes -- and the line band ONLY for the TYPED middle (new glyphs have no scan ink
+            # to measure). The old version used the line band for EVERY glyph, drawing uniform
+            # "standard-height" boxes; since _remap_one_box reuses this live entry, that flat band
+            # then persisted into the committed map. Anchoring kept glyphs to their ink y restores
+            # the per-glyph map while still tracking the caret horizontally.
+            ot_l = ml.get("text", "") or ""
+            orig = self._glyph_boxes_disp(ml)            # frozen per-glyph ink (display pts)
+            _n = min(len(ot_l), len(line_text))
+            p = 0
+            while p < _n and ot_l[p] == line_text[p]:
+                p += 1
+            s = 0
+            while s < _n - p and ot_l[-1 - s] == line_text[-1 - s]:
+                s += 1
+            gb = None
+            if len(edges) >= 2:
+                gb = []
+                for k in range(len(edges) - 1):
+                    y0, y1 = top_d, bot_d
+                    oi = (k if k < p
+                          else (len(ot_l) - (len(line_text) - k)
+                                if k >= len(line_text) - s else None))
+                    if orig and oi is not None and 0 <= oi < len(orig) and orig[oi]:
+                        y0, y1 = orig[oi][1], orig[oi][3]
+                    gb.append((edges[k], y0, edges[k + 1], y1))
+            live.append((page, edges, line_text, top_d, bot_d, eid, gb))
+        self._debug_live = live
+        dlog("MAP", "remap_edited", box=eid, lines=len(live))
+        self.viewport().update()
+
+    def _remap_full_page(self, page: int) -> None:
+        """REMAP THE FULL PAGE on commit: drop the live edited-box overlay and re-measure
+        every scan box on ``page`` from its now-committed text (other pages' cached
+        entries are kept), so the map reflects the saved edit. A no-op when the map is
+        off. Heavy (renders + segments that one page), which is why it runs on EXIT, not
+        per keystroke -- the per-keystroke path is the cheap edge-arithmetic remap above."""
+        self._debug_edit_id = None
+        self._debug_live = []
+        if not self._debug_map:
+            dlog("MAP", "remap_page_skip", page=page, reason="debug_map_off")
+            return
+        others = [e for e in (self._debug_cache or []) if e[0] != page]
+        self._debug_cache = others + self._compute_debug_cache(only_page=page)
+        dlog("MAP", "remap_page", page=page, entries=len(self._debug_cache))
+        self.viewport().update()
+
+    def _remap_one_box(self, box) -> None:
+        """Re-map ONLY ``box`` on edit close: splice its entries into the cache and drop the
+        live overlay -- NOT a whole-page re-measure (that was the ~0.5s freeze on every
+        open/close). Prefers the LIVE edited-text geometry (built per keystroke), which is
+        accurate for the edit AND keeps the edited box ON the map (the full-page path skipped
+        it on render_mode != 3); falls back to measuring just this one box when there is no
+        live map (opened-but-unchanged)."""
+        if not self._debug_map or self.document is None or box is None:
+            return
+        bid = getattr(box, "box_id", None) or id(box)   # STABLE across new_boxes() calls
+        eid = self._debug_edit_id
+        page = getattr(box, "page_index", self._page_index)
+        # Keep every OTHER box's entries; this box's stale ones (under its id or the edit id)
+        # are replaced.
+        kept = [e for e in (self._debug_cache or []) if e[5] != bid and e[5] != eid]
+        entries = []
+        live = list(self._debug_live or [])
+        if live:                                  # the edited text's own geometry -- accurate
+            entries = [(e[0], e[1], e[2], e[3], e[4], bid,
+                        e[6] if len(e) > 6 else None) for e in live]
+            src = "live"
+        else:                                     # opened-but-unchanged: measure just this box
+            try:
+                page_rgb = self.document.render_baked_image(page, 300.0)
+                meas = self.document.measure_box_glyphs(box, page_rgb=page_rgb)
+            except Exception:
+                meas = None
+            for ln in (meas or {}).get("lines", []):
+                if not ln:
+                    continue
+                edges = [float(e) for e in (ln.get("edges") or [])]
+                if len(edges) < 2:
+                    continue
+                entries.append((page, edges, ln.get("text", ""), float(ln.get("top", 0.0)),
+                                float(ln.get("bottom", ln.get("top", 0.0))), bid,
+                                self._glyph_boxes_disp(ln)))
+            src = "measure"
+        self._debug_cache = kept + entries
+        self._debug_edit_id = None
+        self._debug_live = []
+        dlog("MAP", "remap_one_box", box=bid, lines=len(entries), src=src)
+        self.viewport().update()
+
+    @staticmethod
+    def _binary_qimage(qimg: "QImage") -> "QImage":
+        """The Otsu BINARY of a QImage -- the same black/white the scan map keys on
+        (ink black on white paper), not a colour negative."""
+        import numpy as np
+        import cv2
+        g = qimg.convertToFormat(QImage.Format_Grayscale8)
+        w, h, bpl = g.width(), g.height(), g.bytesPerLine()
+        arr = np.frombuffer(bytes(g.constBits()), np.uint8)[:bpl * h].reshape(h, bpl)[:, :w]
+        _, bw = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        bw = np.ascontiguousarray(bw)
+        return QImage(bw.tobytes(), w, h, w, QImage.Format_Grayscale8).copy()
+
+    def _debug_pixmap_for(self, layer) -> "QPixmap":
+        """The page pixmap to show given the debug-invert flag. The binary is taken from
+        the RAW scan render (render_page_image), NOT the displayed ``layer.image`` -- the
+        latter is the baked composite, so its edit COVERS (paper rectangles) would
+        binarize into spurious boxes ('stacking papers'). The raw scan is exactly what the
+        map keys on."""
+        if not self._debug_invert:
+            return QPixmap.fromImage(layer.image)
+        try:
+            import numpy as np
+            import cv2
+            w_px, h_px = layer.image.width(), layer.image.height()
+            w_pt = float(layer.pt_size[0]) or 1.0
+            dpi = max(72.0, w_px / w_pt * 72.0)
+            raw = self.document.render_page_image(layer.page_index, dpi)
+            gray = (raw.mean(2) if raw.ndim == 3 else raw).astype(np.uint8)
+            _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            if bw.shape[1] != w_px or bw.shape[0] != h_px:
+                bw = cv2.resize(bw, (w_px, h_px), interpolation=cv2.INTER_NEAREST)
+            bw = np.ascontiguousarray(bw)
+            qb = QImage(bw.tobytes(), w_px, h_px, w_px, QImage.Format_Grayscale8).copy()
+            return QPixmap.fromImage(qb)
+        except Exception:
+            try:
+                return QPixmap.fromImage(self._binary_qimage(layer.image))
+            except Exception:
+                return QPixmap.fromImage(layer.image)
+
+    def _apply_debug_invert(self) -> None:
+        for layer in (self._layers or []):
+            if layer.pixmap_item is None or layer.image is None:
+                continue
+            layer.pixmap_item.setPixmap(self._debug_pixmap_for(layer))
+
     @staticmethod
     def _apply_runs_to_editor(editor, runs) -> None:
         """Install staged rich runs as char formats over the editor's text (the
-        editor text IS the joined run text, so offsets line up 1:1)."""
+        editor text IS the joined run text, so offsets line up 1:1). A run's
+        optional 4th ``RunStyle`` restores its per-run colour on re-edit."""
         cursor = QTextCursor(editor.document())
         pos = 0
-        for text, bold, italic in runs:
+        for seg in runs:
+            text, bold, italic = seg[0], seg[1], seg[2]
+            rs = seg[3] if len(seg) > 3 else None
             cursor.setPosition(pos)
             cursor.setPosition(pos + len(text), QTextCursor.KeepAnchor)
             fmt = QTextCharFormat()
             fmt.setFontWeight(QFont.Bold if bold else QFont.Normal)
             fmt.setFontItalic(bool(italic))
+            if rs is not None and getattr(rs, "color", None):
+                fmt.setForeground(QColor.fromRgbF(*rs.color))
+            if rs is not None and getattr(rs, "underline", False):
+                fmt.setFontUnderline(True)
             cursor.mergeCharFormat(fmt)
             pos += len(text)
 
     @staticmethod
     def _runs_visual_key(runs) -> tuple:
         """A comparison key for rich runs that ignores whitespace styling and
-        run boundaries: the (char, bold, italic) of each NON-SPACE character.
-        Two run-lists with the same visible glyphs in the same weights compare
-        equal even if a space is bold in one and regular in the other."""
+        run boundaries: the (char, bold, italic[, RunStyle]) of each NON-SPACE
+        character. Two run-lists with the same visible glyphs in the same weights
+        (and colour/family) compare equal even if a space differs. Tolerates the
+        optional 4th element so a pure colour/family change isn't dropped as a
+        no-op; a legacy 3-tuple yields the same key as before (rs=None)."""
         out = []
-        for t, b, i in (runs or ()):
-            for ch in t:
+        for seg in (runs or ()):
+            b, i = bool(seg[1]), bool(seg[2])
+            rs = seg[3] if len(seg) > 3 else None
+            for ch in seg[0]:
                 if not ch.isspace():
-                    out.append((ch, bool(b), bool(i)))
+                    out.append((ch, b, i, rs))
         return tuple(out)
 
     @staticmethod
     def _extract_editor_runs(editor, start: int | None = None,
-                             end: int | None = None) -> tuple:
+                             end: int | None = None, rich: bool = False) -> tuple:
         """Read the editor document back as (text, bold, italic) runs,
         optionally clipped to the character range [start, end). A fragment
         without an explicit weight/italic property inherits the editor's BASE
         font (the box's effective style), so untouched text keeps its original
         styling. The commit path reads the whole document (no bounds); the
         clipboard copy path (§4.2) clips to the selection -- ONE walk serves
-        both, so what's copied can never disagree with what a commit stages."""
+        both, so what's copied can never disagree with what a commit stages.
+
+        ``rich`` (scanned boxes): also read per-run COLOUR / family off each
+        fragment and emit a 4th ``RunStyle`` element when it differs from the
+        editor base. Off (the default / vector path) keeps plain 3-tuples."""
         base = editor.font()
         base_bold, base_italic = base.bold(), base.italic()
+        base_family = base.family()
+        base_underline = base.underline()
         runs: list = []
         block = editor.document().begin()
         while block.isValid():
@@ -3962,7 +5466,29 @@ class PageView(QGraphicsView):
                         italic = cf.fontItalic()
                     else:
                         italic = base_italic
-                    runs.append((text, bold, italic))
+                    # UNDERLINE is a per-run style on the VECTOR (text-layer) path too, so
+                    # read it regardless of ``rich`` (colour/family stay scanned-only). Qt
+                    # stores underline as TextUnderlineStyle (NOT the FontUnderline property,
+                    # whose hasProperty() is always False), so read it via fontUnderline();
+                    # an unset fragment reports False, so only user-underlined runs carry it.
+                    underline = bool(cf.fontUnderline()) or base_underline
+                    color = family = None
+                    if rich:
+                        if cf.hasProperty(QTextFormat.ForegroundBrush):
+                            col = cf.foreground().color()
+                            if col.alpha() > 0:      # transparent default == no override
+                                color = (col.redF(), col.greenF(), col.blueF())
+                        if cf.hasProperty(QTextFormat.FontFamilies):
+                            fams = cf.fontFamilies()
+                            fam = (fams[0] if isinstance(fams, (list, tuple)) and fams
+                                   else fams if isinstance(fams, str) else None)
+                            if fam and fam != base_family:
+                                family = fam
+                    rs = (RunStyle(font_family=family, color=color, underline=underline)
+                          if (underline or color is not None or family is not None)
+                          else None)
+                    runs.append((text, bold, italic, rs) if rs is not None
+                                else (text, bold, italic))
                 it += 1
             # A hard-wrapped paragraph editor holds the bake's lines as separate
             # blocks; each block boundary stands in for the SPACE the bake joined
@@ -4223,7 +5749,7 @@ class PageView(QGraphicsView):
         runs = self._extract_selection_runs(self._editor)
         if not runs:
             return False
-        text = "".join(t for t, _, _ in runs)
+        text = "".join(r[0] for r in runs)     # runs may carry a 4th RunStyle element
         md = QMimeData()
         md.setText(text)
         md.setData(RUNS_MIME, QByteArray(
@@ -4272,10 +5798,14 @@ class PageView(QGraphicsView):
                 # NewBox editor: uniform style only -> plain text.
                 cursor.insertText(decoded["text"])
             else:
-                for t, b, i in decoded["runs"]:
+                for seg in decoded["runs"]:
+                    t, b, i = seg[0], seg[1], seg[2]
+                    rs = seg[3] if len(seg) > 3 else None
                     fmt = QTextCharFormat()
                     fmt.setFontWeight(QFont.Bold if b else QFont.Normal)
                     fmt.setFontItalic(bool(i))
+                    if rs is not None and getattr(rs, "underline", False):
+                        fmt.setFontUnderline(True)
                     cursor.insertText(t, fmt)
             self._editor.setTextCursor(cursor)
             return True
@@ -5021,8 +6551,13 @@ class PageView(QGraphicsView):
         sel = self._selection
         if self._is_image_box(sel):
             self._begin_image_resize(handle_id, scene_pos)
+        elif isinstance(sel, NewBox) and len(getattr(sel, "cover", ()) or ()) == 7:
+            # OCR overlay: resize = REFLOW. Drag any single edge (free rect, one
+            # direction at a time); on release the scanned words re-wrap to the new
+            # WIDTH at constant size. Same frame-resize gesture as a vector text box.
+            self._begin_frame_resize(handle_id, scene_pos)
         elif isinstance(sel, NewBox):
-            # NewBoxes own their geometry -> keep the proportional scale resize.
+            # Plain added NewBoxes own their geometry -> proportional scale resize.
             self._begin_resize(handle_id, scene_pos)
         else:
             # Existing text boxes (Span / ParagraphBox): drag resizes the FRAME
@@ -5031,6 +6566,46 @@ class PageView(QGraphicsView):
         return True
 
     def mousePressEvent(self, event):
+        # EXIT RULE (user-mandated): an open inline editor is left ONLY by an explicit click
+        # OUTSIDE its box, or by Escape -- never by a focus steal (those are ignored in
+        # focusOutEvent). This is the SOLE "click away ends the edit" path. A LEFT press that
+        # lands outside the editing box (its widget rect OR the box's span rect) commits the
+        # edit here; the press then proceeds normally below (a press on another box opens it,
+        # a press on empty canvas deselects). A press INSIDE the box does nothing here, so
+        # caret re-positioning / re-targeting the same box keeps the edit open.
+        if (event.button() == Qt.LeftButton and self._editor is not None
+                and not self._committing and not self._closing_editor
+                and self._editor_box is not None):
+            scene_pt = self.mapToScene(event.position().toPoint())
+            # "Inside the box" = the FULL visible box, not just the tight text. Union the
+            # editor's text rect, the staged bbox, the SCAN COVER (the cell the user sees),
+            # and the live preview tile (the box as re-baked while typing), each padded -- so
+            # clicking anywhere on/in the box (e.g. to reposition the caret) keeps the edit
+            # open. Only a press clearly OUTSIDE all of them (a click on the page away from
+            # the box) commits, per the user's exit rule. Over-keeping beats wrong kick-out.
+            PAD = 8.0
+            rects = [self._editor.sceneBoundingRect().adjusted(-PAD, -PAD, PAD, PAD),
+                     self._span_scene_rect(self._editor_box).adjusted(-PAD, -PAD, PAD, PAD)]
+            cov = self._cover_scene_rect(self._editor_box)
+            if cov is not None:
+                rects.append(cov.adjusted(-PAD, -PAD, PAD, PAD))
+            if self._editor_preview is not None:
+                rects.append(self._editor_preview.sceneBoundingRect()
+                             .adjusted(-PAD, -PAD, PAD, PAD))
+            ovr = self._overlay.sceneBoundingRect() if self._overlay is not None else None
+            if ovr is not None:                          # the VISIBLE outline + handles
+                rects.append(ovr.adjusted(-PAD, -PAD, PAD, PAD))
+            # A press landing ON a box item (editor, its outline, a resize handle) is ON the
+            # box -- the handles/outline reach past every rect at the corners.
+            hit = self.items(event.position().toPoint())
+            inside = any(r.contains(scene_pt) for r in rects) \
+                or self._editor in hit \
+                or any(isinstance(it, (SelectionOverlay, _ResizeHandle)) for it in hit)
+            dlog("INPUT", "press_while_editing", x=scene_pt.x(), y=scene_pt.y(),
+                 inside=inside, items=[type(i).__name__ for i in hit])
+            if not inside:
+                dlog("EDITOR", "commit_click_outside", x=scene_pt.x(), y=scene_pt.y())
+                self.commit_edit()
         # Items (hotspots/handles) accept their own presses first; this fires
         # only for presses on EMPTY canvas (sheet/gutter). The per-mode press
         # handler from ``self._mode_handlers`` owns the deselect / add-on-empty
@@ -5253,6 +6828,20 @@ class PageView(QGraphicsView):
         return (isinstance(ident, tuple) and len(ident) >= 2
                 and ident[1] == "xim")
 
+    def _is_full_page_image(self, box) -> bool:
+        """True when an existing image covers (most of) the page -- it IS the
+        scanned page background. Such an image gets NO hotspot, so the user can
+        only edit the OCR text/boxes on the page, not select or drag the page
+        itself. A smaller embedded image (a logo) is unaffected and stays editable."""
+        try:
+            rect = box.rect
+            mb = self.document.working[box.page_index].mediabox
+            ia = abs((rect[2] - rect[0]) * (rect[3] - rect[1]))
+            pa = abs(mb.width * mb.height)
+            return pa > 0 and ia / pa >= 0.85
+        except Exception:
+            return False
+
     # =====================================================================
     # Drag: MOVE (body) + RESIZE (handle) (EDITOR_SPEC §3.6)
     # =====================================================================
@@ -5287,6 +6876,7 @@ class PageView(QGraphicsView):
         # it to PDF points for the model's resize anchor.
         page = getattr(box, "page_index", self._page_index)
         anchor_scene = self._opposite_corner_scene(rect, handle_id)
+        self._drag_anchor_scene = anchor_scene          # OCR preview scales about THIS
         self._drag_anchor_pdf = self._pdf_point(anchor_scene, page)
         self._drag_start_diag = max(
             _MIN_RESIZE_DIAG,
@@ -5506,15 +7096,25 @@ class PageView(QGraphicsView):
         elif kind == "frame_resize":
             if box is not None:
                 rect = self._frame_resize_rect_for(scene_pos)
-                page = getattr(box, "page_index", self._page_index)
-                p0 = self._pdf_point(rect.topLeft(), page)
-                p1 = self._pdf_point(rect.bottomRight(), page)
-                new_x = min(p0[0], p1[0])
-                new_w = abs(p1[0] - p0[0])
-                if rect != self._drag_start_rect and new_w > 1e-3:
-                    self.boxCommandRequested.emit(
-                        "frame_resize", box, {"x": new_x, "w": new_w})
-                    self.geometryChanged.emit(box)
+                if (isinstance(box, NewBox)
+                        and len(getattr(box, "cover", ()) or ()) == 7):
+                    # OCR overlay: the box is shown UPRIGHT, so its DISPLAY width (the
+                    # scene rect de-zoomed) is the reflow column width. Re-wrap the
+                    # scanned words to it (resize = reflow, not scale).
+                    box_w = rect.width() / max(self._zoom, 1e-6)
+                    if rect != self._drag_start_rect and box_w > 1e-3:
+                        self.boxCommandRequested.emit("reflow", box, {"box_w": box_w})
+                        self.geometryChanged.emit(box)
+                else:
+                    page = getattr(box, "page_index", self._page_index)
+                    p0 = self._pdf_point(rect.topLeft(), page)
+                    p1 = self._pdf_point(rect.bottomRight(), page)
+                    new_x = min(p0[0], p1[0])
+                    new_w = abs(p1[0] - p0[0])
+                    if rect != self._drag_start_rect and new_w > 1e-3:
+                        self.boxCommandRequested.emit(
+                            "frame_resize", box, {"x": new_x, "w": new_w})
+                        self.geometryChanged.emit(box)
         hotspot = self._press_hotspot
         self._reset_drag_state()
         if promote_edit and hotspot is not None:
@@ -5923,6 +7523,10 @@ class PageView(QGraphicsView):
         self._cancel_drag()
         box = hotspot.box
         page = getattr(box, "page_index", self._page_index)
+        dlog("EDITOR", "begin_edit", box=id(box), page=page,
+             rm=getattr(box, "render_mode", None),
+             para=bool(getattr(box, "is_paragraph", False)),
+             text=getattr(box, "ocr_text", "") or getattr(box, "text", ""))
         self._editor_box = box
         self._editor_hotspot = hotspot
         self._editor_multiline = bool(getattr(box, "is_paragraph", False))
@@ -5950,6 +7554,13 @@ class PageView(QGraphicsView):
 
         z = self._zoom
         eff_size = float(eff.get("size", box.size) or box.size)
+        # A scan-preserve OCR paragraph is an INVISIBLE overlay matched to the scan, so
+        # it uses the scan's OWN size + leading (no fit-shrink); the line height is
+        # pinned to the scan leading below WITHOUT the natural-height clamp (invisible
+        # glyphs may overlap), so the editor's lines sit exactly on the scanned lines
+        # and the caret lands where you click. A vector ParagraphBox kept 1.0 anyway.
+        _fit = 1.0
+        eff_size *= _fit
         pixel_size = max(_MIN_PIXEL_SIZE, eff_size * z)
         font = resolved.qfont(pixel_size)
 
@@ -5969,10 +7580,83 @@ class PageView(QGraphicsView):
             except (AttributeError, ValueError, ZeroDivisionError):
                 return 1.0
 
-        cover = self._make_cover(box)
-        cover.setZValue(Z_COVER)
-        self.scene().addItem(cover)
-        self._editor_cover = cover
+        # A scanned-OCR box (its cover is a 7-tuple) edits IN PLACE on the scan: no
+        # opaque cover painted over the glyphs, so the scanned pixels stay 1-for-1 on
+        # click; a live composite re-renders only the changed runs. This now covers
+        # PARAGRAPHS too -- a paragraph composes per line (compose_lines_block), the
+        # SAME engine the bake uses. Only ordinary (non-OCR) boxes keep the
+        # cover-and-repaint editor.
+        self._editor_scan_preserve = len(getattr(box, "cover", ()) or ()) == 7
+        self._editor_page_rgb = None
+        if self._editor_scan_preserve:
+            self._editor_cover = None
+            # Diff against the ORIGINAL OCR text (the scan), so re-opening a committed
+            # edit shows that edit (text != original) rather than the bare scan.
+            self._editor_orig_text = getattr(box, "ocr_text", "") or staged
+            self._editor_preview = None
+            if self._editor_multiline:
+                # Paragraph: compose_lines_block builds its own per-line contexts; the
+                # whole-line scan ctx does not apply. Cache the page render ONCE so each
+                # keystroke's live preview re-lays the lines without re-rendering it.
+                self._editor_scan_ctx = None
+                try:
+                    self._editor_page_rgb = self.document.render_page_image(page, 300.0)
+                except Exception:
+                    self._editor_page_rgb = None
+            else:
+                # Render the page + sample the line ONCE here; the live preview reuses
+                # this so each keystroke only re-lays the text, never re-renders the page.
+                self._editor_scan_ctx = self.document.scan_edit_context(box, staged)
+            # NOTE: the whole-box weight SEED + variant swap was reverted -- detecting
+            # ONE bold/italic for the whole box (from a single edge-matched face) flips
+            # mixed-weight lines to one weight and the matcher is weight-biased, so it
+            # rendered regular text bold and vice-versa. The raw per-line edge-match
+            # already reproduces the scan's own weight; real PER-GLYPH weight detection
+            # is the proper fix and is not built yet, so no seed runs here.
+            # CUSTOM CARET ENGINE: measure every scanned glyph in the box ONCE now, so
+            # the caret maps clicks (and draws) against the real ink positions instead
+            # of Qt's text layout. Typed characters fold into these on the fly.
+            try:
+                self._caret_measure = self.document.measure_box_glyphs(
+                    box, page_rgb=self._editor_page_rgb)
+            except Exception:
+                self._caret_measure = None
+            # SHARE ONE CTX (single line): the live preview composes on _editor_scan_ctx
+            # and caches the exact per-char caret edges ON it; the caret reads them from
+            # the measured line's ctx. Point them at the SAME object so the cache is shared
+            # -- otherwise the caret never sees the fresh edges and drifts.
+            if (not self._editor_multiline and self._caret_measure
+                    and self._caret_measure.get("lines")
+                    and self._caret_measure["lines"][0]
+                    and self._caret_measure["lines"][0].get("ctx")):
+                self._editor_scan_ctx = self._caret_measure["lines"][0]["ctx"]
+            self._caret_fpath = (self._editor_scan_ctx["fpath"]
+                                 if self._editor_scan_ctx
+                                 else self.document._edit_font_file(
+                                     getattr(box, "font_family", "")))
+            try:                                 # TEMP gap diagnostic (no PHI: counts only)
+                import re as _re
+                _lns = (self._caret_measure or {}).get("lines") or []
+                with open("/tmp/pdfte_gap.log", "a") as _fh:
+                    _fh.write("=== OPENED box: %d line(s) ===\n" % len(_lns))
+                    for _li, _ln in enumerate(_lns):
+                        if not _ln:
+                            _fh.write("  line%d: (none)\n" % _li); continue
+                        _ctx = _ln.get("ctx") or {}
+                        _cb = (_ctx.get("geom") or {}).get("char_boxes")
+                        _ot = _ctx.get("orig_text", "")
+                        _runs = [len(m.group()) for m in _re.finditer(r"  +", _ot)]
+                        _fh.write("  line%d: chars=%d char_boxes=%s multispace_runs=%s edges=%d\n"
+                                  % (_li, len(_ot),
+                                     ("%d" % len(_cb)) if (_cb and len(_cb) == len(_ot)) else "NONE",
+                                     _runs, len(_ln.get("edges", []))))
+            except Exception:
+                pass
+        else:
+            cover = self._make_cover(box)
+            cover.setZValue(Z_COVER)
+            self.scene().addItem(cover)
+            self._editor_cover = cover
 
         eff_color = eff.get("color", box.color) or box.color
 
@@ -6002,7 +7686,46 @@ class PageView(QGraphicsView):
                     QFont.SpacingType.PercentageSpacing, r * 100.0)
         editor.setFont(font)
         editor.document().setDefaultFont(font)
-        editor.setDefaultTextColor(QColor.fromRgbF(*eff_color))
+        if self._editor_scan_preserve:
+            # Glyphs invisible: the untouched scan shows through 1-for-1. The caret
+            # is painted by the editor; the live composite shows the edited text.
+            # Use the matched Qt family AND size the invisible text to the SCAN's
+            # measured ink width, so the layout OVERLAYS the scan -- a click on a
+            # scanned glyph then maps to the right character instead of drifting
+            # across the line (the box was mis-sized before).
+            editor._scan_preserve = True
+            editor.setDefaultTextColor(QColor(0, 0, 0, 0))
+            qfam = self.document.font_engine.qt_family_for(
+                getattr(box, "font_family", ""))
+            if qfam:
+                font.setFamily(qfam)
+            # Base weight/slant = the box's SEEDED scan style, so newly typed text
+            # defaults to the scan's style and _extract_editor_runs' base matches the
+            # bake's base (ctx want_*). Without this, unstyled text would read as a
+            # style change and wrongly re-bake the whole line. Detect it now (no-op once
+            # seeded) so a bold/italic scan opens with the right base + the bar reflects it.
+            seeded = self.document.seed_scan_style(box)
+            font.setBold(bool(getattr(seeded, "bold", False)))
+            font.setItalic(bool(getattr(seeded, "italic", False)))
+            ctx = self._editor_scan_ctx
+            if ctx and not self._editor_multiline:
+                # Single line only: stretch the invisible layout to the scan's measured
+                # ink width so a click maps to the right character. A paragraph uses its
+                # per-line hard-wrap layout below instead (one whole-block span would be
+                # meaningless across N lines).
+                txt = display.replace("\n", " ") or " "
+                probe = QFont(font)
+                probe.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 100.0)
+                nat = QFontMetricsF(probe).horizontalAdvance(txt)
+                scan_w = (ctx["right_px"] - ctx["left_px"]) / ctx["ppi"] * z
+                if nat > 1 and scan_w > 1:
+                    font.setLetterSpacing(
+                        QFont.SpacingType.PercentageSpacing,
+                        max(60.0, min(180.0, scan_w / nat * 100.0)))
+            editor.setFont(font)
+            editor.document().setDefaultFont(font)
+        else:
+            editor.setDefaultTextColor(QColor.fromRgbF(*eff_color))
         # Re-mount RICH runs as char formats so the editor shows (and round-
         # trips) per-word styling instead of flattening to uniform: previously
         # STAGED runs (a bolded selection), else a grouped/auto ParagraphBox's
@@ -6015,10 +7738,19 @@ class PageView(QGraphicsView):
             self._apply_runs_to_editor(editor, staged_runs)
 
         if self._editor_multiline:
-            x0, y0, x1, y1 = self.document.effective_bbox(page, box)
-            editor.setTextWidth(max(1.0, (x1 - x0) * z))
+            # An OCR paragraph carries box_w: its column width in DISPLAY points
+            # (rotation-correct). Wrap the editor to THAT, not the text-space bbox
+            # width -- on a /Rotate page the text-space width is the block's display
+            # HEIGHT, so wrapping to it stacked every paragraph ~one word per line.
+            bw = getattr(box, "box_w", None)
+            if bw:
+                wrap_w = bw * z
+            else:
+                x0, y0, x1, y1 = self.document.effective_bbox(page, box)
+                wrap_w = (x1 - x0) * z
+            editor.setTextWidth(max(1.0, wrap_w))
             align = eff.get("alignment", "left")
-            leading_pt = getattr(box, "leading", 0.0) or (eff_size * 1.2)
+            leading_pt = (getattr(box, "leading", 0.0) * _fit) or (eff_size * 1.2)
             if self._editor_hard_wrapped:
                 # Use the bake's hard breaks exactly (no Qt re-wrap), and lay out
                 # each line to the page: per-block alignment, a leading-matched
@@ -6031,7 +7763,28 @@ class PageView(QGraphicsView):
                 self._layout_overlay_blocks(
                     editor, layout, font, align, leading_pt * z, _width_ratio)
             else:
-                self._apply_editor_alignment(editor, align, leading_pt * z)
+                if self._editor_scan_preserve:
+                    # Fill the scanned block's height EXACTLY (box_height / N) so each
+                    # invisible line lands on its scanned line and the caret tracks the
+                    # click. Qt will not pin a line height SHORTER than the font, so
+                    # first shrink the (invisible) font until its natural height equals
+                    # that line pitch; then the N lines fill the block exactly.
+                    nlines = max(1, display.count("\n") + 1)
+                    line_px = self._span_scene_rect(box).height() / nlines
+                    natural = QFontMetricsF(font).height()
+                    if natural > 1.0 and line_px > 1.0:
+                        ratio = line_px / natural   # scale the font's OWN current size
+                        if font.pixelSize() > 0:
+                            font.setPixelSize(max(2, int(round(font.pixelSize() * ratio))))
+                        elif font.pointSizeF() > 0:
+                            font.setPointSizeF(max(1.0, font.pointSizeF() * ratio))
+                        editor.setFont(font)
+                        editor.document().setDefaultFont(font)
+                else:
+                    line_px = leading_pt * z
+                self._apply_editor_alignment(
+                    editor, align, line_px,
+                    clamp_natural=not self._editor_scan_preserve)
 
         ascent = QFontMetricsF(font).ascent()
         self._place_text_item(editor, box, ascent)
@@ -6040,8 +7793,12 @@ class PageView(QGraphicsView):
         # editor so the first baseline still lands on the box origin. The
         # hard-wrap path uses per-block top margins (first block margin 0), so it
         # needs no lift.
-        if self._editor_multiline and not self._editor_hard_wrapped:
-            leading_pt = getattr(box, "leading", 0.0) or (eff_size * 1.2)
+        if self._editor_multiline and not self._editor_hard_wrapped \
+                and len(getattr(box, "cover", ()) or ()) != 7:
+            # (An OCR paragraph is mounted at its display top-left in _place_text_item
+            # and must NOT be lifted -- the lift assumes a baseline mount and would
+            # push it back off the box.)
+            leading_pt = (getattr(box, "leading", 0.0) * _fit) or (eff_size * 1.2)
             surplus = leading_pt * z - QFontMetricsF(font).height()
             if surplus > 0:
                 editor.setY(editor.y() - surplus)
@@ -6054,6 +7811,24 @@ class PageView(QGraphicsView):
         self._editor_page = page
         self._editor_pixel_size = pixel_size
         editor.document().contentsChanged.connect(self._reresolve_editor_font)
+        if self._editor_scan_preserve:
+            self._scan_typing_style = None       # fresh open: no armed typing style
+            # Stamp the armed typing style onto NEWLY typed chars (contentsChange
+            # fires with the inserted range BEFORE the preview recomposes).
+            editor.document().contentsChange.connect(self._style_typed_chars)
+            # Compose SYNCHRONOUSLY on each keystroke (was a 70ms debounce): inplace_compose
+            # caches the EXACT per-char edges, and the caret (positioned right after) reads
+            # them -- so the caret sits where the glyphs render, with no lag. One line per
+            # keystroke is cheap. Connected BEFORE _position_caret_item so the edges are
+            # fresh when the caret reads them.
+            editor.document().contentsChanged.connect(self._update_ocr_preview)
+            editor.document().contentsChanged.connect(self._position_caret_item)
+            # REMAP-ON-EDIT: every keystroke rebuilds THIS box's map from the live text.
+            editor.document().contentsChanged.connect(self._remap_edited_box)
+            if self._debug_map:
+                self._debug_edit_id = (getattr(self._editor_box, "box_id", None)
+                                       or id(self._editor_box))
+                self._remap_edited_box()
 
         editor.setFocus(Qt.MouseFocusReason)
         cursor = editor.textCursor()
@@ -6068,20 +7843,40 @@ class PageView(QGraphicsView):
                 scene_x, editor.sceneBoundingRect().top() + 1.0)
         if scene_point is not None and staged:
             cursor.setPosition(editor.caret_index_at_scene_point(scene_point))
+        elif self._editor_scan_preserve:
+            # Scanned edit: clicking in must change NOTHING but show a caret -- a
+            # select-all would paint a highlight box over the scan. Drop the caret
+            # at the end of the line.
+            cursor.movePosition(QTextCursor.End)
         else:
             cursor.select(QTextCursor.Document)
         editor.setTextCursor(cursor)
+        if self._caret_measure:                 # show the blinking scene-item caret
+            self._position_caret_item()
+
+        # Hide the box's committed bake under the live editor so a RE-EDIT floats
+        # over the bare scan (not the old raster). The editor glyphs are transparent,
+        # so we MUST immediately draw the live composite of the STAGED text -- else
+        # the excluded bare scan (which still holds the original ink) shows through
+        # and a prior deletion looks like it "came back" until the next keystroke.
+        if self._editor_scan_preserve:
+            self._refresh_edit_pixmap(box)
+            self._update_ocr_preview()           # paint the staged edit NOW, not on first keypress
 
         self.modeChanged.emit(MODE_TEXT_EDIT)
         self.editStarted.emit(box, resolved)
 
     @staticmethod
     def _apply_editor_alignment(editor: "InlineRunEditor", alignment: str,
-                                line_height_px: float = 0.0) -> None:
+                                line_height_px: float = 0.0,
+                                clamp_natural: bool = True) -> None:
         """Mirror the paragraph alignment in the inline editor and, when
         ``line_height_px`` > 0, pin each wrapped line to that FIXED height so the
-        editor's line spacing matches the baked paragraph leading exactly (the
-        bake re-applies the true alignment/wrap via wrap_paragraph)."""
+        editor's line spacing matches the scanned leading exactly. ``clamp_natural``
+        keeps the height at/above the font's natural box (so VISIBLE glyphs never
+        collide); a SCAN-PRESERVE overlay passes False because its glyphs are
+        invisible and the line height MUST equal the scan leading (often tighter than
+        the rendered face) or every line -- and the caret -- drifts off the scan."""
         amap = {
             "left": Qt.AlignLeft, "center": Qt.AlignHCenter,
             "right": Qt.AlignRight, "justify": Qt.AlignJustify,
@@ -6089,9 +7884,11 @@ class PageView(QGraphicsView):
         block_fmt = editor.textCursor().blockFormat()
         block_fmt.setAlignment(amap.get(alignment, Qt.AlignLeft))
         if line_height_px > 0:
+            h = line_height_px
+            if clamp_natural:
+                h = max(h, QFontMetricsF(editor.document().defaultFont()).height())
             block_fmt.setLineHeight(
-                line_height_px,
-                QTextBlockFormat.LineHeightTypes.FixedHeight.value)
+                h, QTextBlockFormat.LineHeightTypes.FixedHeight.value)
         cur = editor.textCursor()
         cur.select(QTextCursor.Document)
         cur.mergeBlockFormat(block_fmt)
@@ -6157,7 +7954,19 @@ class PageView(QGraphicsView):
         if self._editor is None or self._committing or self._closing_editor:
             return
         self._committing = True
+        try:
+            self._commit_edit_impl(from_focus_out)
+        finally:
+            # NEVER leave _committing stuck True: an exception in the body used to
+            # wedge it, silently no-op'ing every later commit for the session.
+            self._committing = False
+
+    def _commit_edit_impl(self, from_focus_out: bool = False) -> None:
         editor, box = self._editor, self._editor_box
+        scan_preserve = self._editor_scan_preserve   # captured: teardown clears it
+        dlog("EDITOR", "commit", box=id(box) if box else None, scan=scan_preserve,
+             focus_out=from_focus_out,
+             text=editor.toPlainText() if editor is not None else "")
         # Read ALL editor state BEFORE teardown (§2.7a): text, base font flags,
         # and the extracted runs. The old code re-read ``editor.font()`` after
         # ``_teardown_editor()`` -- alive only via this local ref after the
@@ -6173,13 +7982,15 @@ class PageView(QGraphicsView):
             new_text = new_text.replace("\n", " ")
         base_b = editor.font().bold()
         base_i = editor.font().italic()
-        # Extract per-selection rich styling (NewBoxes are uniform-only).
-        # ``rich_runs`` stays None when every fragment matches the editor's
+        # Extract per-selection rich styling. Plain NewBoxes are uniform-only, but a
+        # SCANNED box carries per-run bold/italic (a bolded word, newly typed bold
+        # text). ``rich_runs`` stays None when every fragment matches the editor's
         # base style (a plain, uniform edit).
         rich_runs = None
-        if getattr(box, "box_id", None) is None:
-            extracted = self._extract_editor_runs(editor)
-            if any((b, i) != (base_b, base_i) for _, b, i in extracted):
+        if getattr(box, "box_id", None) is None or scan_preserve:
+            extracted = self._extract_editor_runs(editor, rich=scan_preserve)
+            if any((bool(r[1]), bool(r[2])) != (base_b, base_i)
+                   or (len(r) > 3 and r[3] is not None) for r in extracted):
                 rich_runs = extracted
         pending_add = self._pending_add
         self._teardown_editor()
@@ -6197,7 +8008,8 @@ class PageView(QGraphicsView):
         else:
             self._pending_add = None
             staged_runs = self.document.staged_runs(page, box) \
-                if getattr(box, "box_id", None) is None else None
+                if (getattr(box, "box_id", None) is None
+                    or scan_preserve) else None
             # The BASELINE a paragraph starts from is its intrinsic per-member
             # styling (a bold "2025" pulled into a group), not "nothing". A
             # commit that merely reproduces it with unchanged text is a NO-OP --
@@ -6206,6 +8018,10 @@ class PageView(QGraphicsView):
             baseline_runs = staged_runs
             if baseline_runs is None and getattr(box, "is_paragraph", False):
                 baseline_runs = self.document.paragraph_runs(box)
+            dlog("EDITOR", "commit_emit_decide", new=new_text,
+                 staged=self.document.staged_text(page, box),
+                 has_rich=(rich_runs is not None),
+                 has_staged_runs=(staged_runs is not None))
             if rich_runs is not None:
                 # Mixed weights/slants: stage the styled runs (unless they just
                 # reproduce the intrinsic baseline and the text is unchanged).
@@ -6225,9 +8041,15 @@ class PageView(QGraphicsView):
                 # (plain text); if it is a NON-natural style (e.g. the whole
                 # text was bolded from inside the editor), keep it as ONE
                 # uniform run so the styling survives the commit.
-                from ..fonts import is_bold, is_italic
-                natural = (is_bold(box.font, box.flags),
-                           is_italic(box.font, box.flags))
+                if isinstance(box, NewBox):
+                    # A NewBox (incl. every scanned box) owns its style directly --
+                    # it has no .font/.flags; its natural style is bold/italic.
+                    natural = (bool(getattr(box, "bold", False)),
+                               bool(getattr(box, "italic", False)))
+                else:
+                    from ..fonts import is_bold, is_italic
+                    natural = (is_bold(box.font, box.flags),
+                               is_italic(box.font, box.flags))
                 if (base_b, base_i) == natural:
                     payload = {"text": new_text, "runs": None}
                 else:
@@ -6249,7 +8071,7 @@ class PageView(QGraphicsView):
                 if tuple(vis) != tuple(box.color):
                     self.boxCommandRequested.emit(
                         "style", box, {"overrides": {"color": vis}})
-        self._committing = False
+        # (_committing is reset in commit_edit's finally.)
         # Selection persists across TEXT_EDIT -> SELECT (committing keeps the
         # box selected); restore the overlay if the box still exists.
         if not is_pending or new_text.strip():
@@ -6262,6 +8084,7 @@ class PageView(QGraphicsView):
         that was never typed into, roll the add back (empty-add cleanup)."""
         if self._editor is None or self._closing_editor:
             return
+        dlog("EDITOR", "cancel", box=id(self._editor_box) if self._editor_box else None)
         box = self._editor_box
         pending_add = self._pending_add
         self._teardown_editor()
@@ -6300,22 +8123,53 @@ class PageView(QGraphicsView):
     def _teardown_editor(self) -> None:
         """Remove the editor + its white cover without emitting commit/cancel."""
         self._closing_editor = True
+        _box, _scan = self._editor_box, self._editor_scan_preserve
         try:
             if self._editor is not None:
                 self.scene().removeItem(self._editor)
             if self._editor_cover is not None:
                 self.scene().removeItem(self._editor_cover)
+            if self._editor_preview is not None \
+                    and self._editor_preview.scene() is not None:
+                self.scene().removeItem(self._editor_preview)
             if self._editor_hotspot is not None:
                 self._editor_hotspot._editing = False
                 if self._editor_hotspot.scene() is not None:
                     self._editor_hotspot.update()
         finally:
+            self._preview_timer.stop()
             self._editor = None
             self._editor_cover = None
+            self._editor_preview = None
+            self._editor_scan_preserve = False
+            self._editor_scan_ctx = None
+            self._editor_page_rgb = None         # free the cached page raster
+            self._teardown_caret_item()          # remove the blinking caret item
+            if self._sel_item is not None:       # remove the selection band
+                sc = self._sel_item.scene()
+                if sc is not None:
+                    sc.removeItem(self._sel_item)
+                self._sel_item = None
+            self._scan_typing_style = None       # disarm any pending typing style
+            self._editor_style_changed = False
+            self._caret_measure = None           # drop the measured glyph edges
+            self._caret_fpath = None
+            self._editor_orig_text = ""
             self._editor_box = None
             self._editor_hotspot = None
             self._editor_multiline = False
             self._closing_editor = False
+        # Editor gone: restore the box's committed bake (exclude is now cleared, so
+        # this re-renders WITH the committed result). On commit the subsequent
+        # repaint_box re-renders the NEW staged result over this; on cancel this is
+        # what brings the prior committed bake back.
+        if _scan and _box is not None:
+            self._refresh_edit_pixmap(_box)
+        # Exited a SCAN box: re-map ONLY this box (splice its live edited-text geometry into
+        # the cache), NOT the whole page -- the full-page re-measure was a ~0.5s freeze on
+        # every open/close, and it dropped the edited box anyway.
+        if self._debug_map and _scan and _box is not None:
+            self._remap_one_box(_box)
 
     def _flush_editor(self) -> None:
         """Commit an OPEN inline editor through the normal commit path before a
@@ -6335,8 +8189,32 @@ class PageView(QGraphicsView):
     def _cancel_editor_silent(self) -> None:
         """Tear an open editor down with no signals (used by clear_document /
         begin_edit re-entry)."""
-        if self._editor is not None or self._editor_cover is not None:
+        if self._editor is not None or self._editor_cover is not None \
+                or self._editor_preview is not None:
+            if self._editor is not None:
+                dlog("EDITOR", "cancel_silent",
+                     box=id(self._editor_box) if self._editor_box else None)
             self._teardown_editor()
+
+    def _reassert_editor_focus(self, editor) -> None:
+        """Keep an open editor focused after a SPURIOUS focus steal -- a mouse move / hover
+        gives Qt ``MouseFocusReason`` and unfocuses the editor item, stopping the caret and
+        killing typing even though the box never closed. Re-grab on the next tick, but ONLY
+        if the editor is still the live editor, is not closing (a commit/cancel teardown makes
+        this no-op), is still in the scene, isn't already focused, and this window is still
+        active (so a dialog / other window is never fought). This enforces the rule that an
+        editor is left ONLY by Escape or a click outside the box."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+
+        def _regrab():
+            if (self._editor is editor and not self._committing
+                    and not self._closing_editor and editor.scene() is not None
+                    and not editor.hasFocus()
+                    and QApplication.activeWindow() is self.window()):
+                dlog("EDITOR", "refocus", box=id(self._editor_box) if self._editor_box else None)
+                editor.setFocus(Qt.OtherFocusReason)
+        QTimer.singleShot(0, _regrab)
 
     def is_edited(self, box) -> bool:
         """True when ``box`` carries staged text changes (the edited-hover
@@ -6344,14 +8222,36 @@ class PageView(QGraphicsView):
         the old ``page_index != self._page_index -> False`` short-circuit made
         the amber edited tint vanish on every materialized page except the one
         under the viewport center, which is wrong in the continuous view where
-        several pages' hotspots are live at once. A NewBox always counts as
-        edited (it IS an edit)."""
+        several pages' hotspots are live at once.
+
+        A NewBox counts as edited ONLY once it actually draws ink. An OCR
+        overlay is born invisible (render_mode 3) over the kept scan; the user
+        editing it flips it to visible (render_mode 0) via stage_edit. So a
+        PRISTINE OCR word (render_mode 3) is NOT edited -- it must stay unmarked
+        like any untouched run, or every recovered word wears the persistent
+        ochre edited tint at rest, smearing tan "yellow bars" across a scanned
+        page. User-added boxes are render_mode 0, so they read as edits as
+        before."""
         if not self.document or box is None:
             return False
         if isinstance(box, NewBox):
-            return True
+            return getattr(box, "render_mode", 0) == 0
         page = getattr(box, "page_index", self._page_index)
-        return self.document.staged_text(page, box) != box.text
+        # A STYLE-only edit (underline / bold / italic on a selection, text
+        # unchanged) stages rich runs but no text change -- still an edit, so it
+        # must wear the affordance. Check staged runs too, not just the text.
+        return (self.document.staged_text(page, box) != box.text
+                or self.document.staged_runs(page, box) is not None)
+
+    def is_unsaved_edit(self, box) -> bool:
+        """True when ``box`` carries an edit made since the last save. Drives
+        the persistent in-place edit signature, which flags PENDING changes and
+        clears once they are saved (a saved edit then reads as clean, like the
+        original text -- see ``Document.is_edit_unsaved``)."""
+        if not self.document or box is None:
+            return False
+        page = getattr(box, "page_index", self._page_index)
+        return self.document.is_edit_unsaved(page, box)
 
     # =====================================================================
     # Keyboard (view-level, depends on selection/editor state, §3.3/§5.5)
@@ -6707,6 +8607,24 @@ class PageView(QGraphicsView):
         top = origin.y() + min(ys) * z
         return QRectF(left, top, (max(xs) - min(xs)) * z, (max(ys) - min(ys)) * z)
 
+    def _cover_scene_rect(self, box) -> "QRectF | None":
+        """An OCR box's full SCAN COVER (the scanned cell region the user sees as the box)
+        -> scene rect on its page, rotation-aware. The text bbox can be tighter than the
+        cover, so the cover is what 'inside the box' must mean for the click-away exit rule.
+        None for a box without a cover (an ordinary added box)."""
+        cov = getattr(box, "cover", ()) or ()
+        if len(cov) < 4:
+            return None
+        page = getattr(box, "page_index", self._page_index)
+        z = self._zoom
+        corners = [self._display_point(cx, cy, page) for cx, cy in (
+            (cov[0], cov[1]), (cov[2], cov[1]), (cov[2], cov[3]), (cov[0], cov[3]))]
+        xs = [c[0] for c in corners]
+        ys = [c[1] for c in corners]
+        origin = self._sheet_origin_for(page)
+        return QRectF(origin.x() + min(xs) * z, origin.y() + min(ys) * z,
+                      (max(xs) - min(xs)) * z, (max(ys) - min(ys)) * z)
+
     def _image_scene_rect(self, box) -> QRectF:
         """A placed image's CURRENT staged rect -> scene rect on its page
         (images & signatures §3): the live rect from the model (the map's
@@ -6748,6 +8666,24 @@ class PageView(QGraphicsView):
             origin = (eb[0], origin[1])
         baseline = self._scene_point(*origin, page_index=page)
         rot = float(self._rotation_for(page) % 360)
+        # OCR overlay boxes (cover-marked) are placed DEROTATED so they bake + display
+        # upright over the scan; the inline editor must therefore show them upright
+        # too. Rotating by the page's raw /Rotate spun the editing text 90deg while
+        # the scan and baked text read upright (the "text rotates when you click in"
+        # bug on scanned /Rotate pages). Gated to OCR boxes; ordinary boxes on a
+        # genuinely rotated page still follow the page.
+        if len(getattr(box, "cover", ()) or ()) == 7:
+            rot = 0.0
+            if getattr(box, "is_paragraph", False):
+                # A multi-line OCR block's lines flow DOWN from the block's DISPLAY
+                # top-left. Mounting at the (rotation-mapped) text-space origin landed
+                # the editor at the box BOTTOM on a /Rotate page, so only the bottom
+                # corner was clickable. The scene rect IS the rotation-aware display
+                # box, so mount the editor at its top-left and let the lines fill it.
+                r = self._span_scene_rect(box)
+                item.setRotation(0.0)
+                item.setPos(r.left(), r.top())
+                return
         item.setRotation(rot)
         if rot == 0.0:
             item.setPos(baseline.x(), baseline.y() - ascent)
@@ -6844,8 +8780,7 @@ class PageView(QGraphicsView):
         (``_add_style_defaults``). A document's header text is often WHITE
         because it sits on a dark/colored bar; inherit that white onto a box
         dropped on the white page body and the text is invisible -- typed,
-        present, but unreadable (the bug Edward hit re-typing a name into a
-        background-check report). We do NOT touch a deliberate white-on-a-dark-
+        present, but unreadable. We do NOT touch a deliberate white-on-a-dark-
         bar add: the contrast there is fine, so the color is kept. Only an
         effectively-invisible same-luminance pairing is corrected."""
         try:
