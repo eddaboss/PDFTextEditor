@@ -780,7 +780,7 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
 </style></head><body>
 
 <header><div class="wrap bar">
-  <span class=brand><span class=mark>__LOGO__</span>PDF Text Editor __CHAN__</span>
+  <span class=brand><span class=mark>__LOGO__</span>PDF for Free __CHAN__</span>
   <nav class=nav>
     <a class=hidesm href="#free">[[nav1]]</a>
     <a class=hidesm href="#does">[[nav2]]</a>
@@ -1103,7 +1103,7 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
 # logo and, via /favicon.svg, the favicon.
 _LOGO_SVG = (
     '<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" '
-    'role="img" aria-label="PDF Text Editor">'
+    'role="img" aria-label="PDF for Free">'
     '<defs><linearGradient id="clay" x1="0" y1="0" x2="0" y2="1">'
     '<stop offset="0" stop-color="#C2643F"/>'
     '<stop offset="1" stop-color="#8B3E23"/></linearGradient></defs>'
@@ -1122,7 +1122,7 @@ _LOGO_SVG = (
 # filled by _login_page(); CSS braces are literal (this is not an f-string).
 _LOGIN_HTML = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>PDF Text Editor &middot; dev preview</title>
+<title>PDF for Free &middot; dev preview</title>
 <meta name=robots content="noindex,nofollow">
 <link rel=preconnect href="https://fonts.googleapis.com">
 <link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
@@ -1157,7 +1157,7 @@ button:hover{background:var(--clay-press)}
 </style></head>
 <body><main class=card>
 <div class=logo>__LOGO__</div>
-<h1>PDF Text Editor <span class=chan>dev</span></h1>
+<h1>PDF for Free <span class=chan>dev</span></h1>
 <p class=sub>Development preview. Enter the password to continue.</p>
 <form method=post action="/_gate/login" autocomplete=off>
 <input type=password name=password placeholder="Password" aria-label="Password" autofocus required>
@@ -1275,7 +1275,7 @@ _DEFAULT_COPY = {
     "final_heading": "Edit a PDF in the next two minutes.",
     "final_sub": "Download it, open a PDF, click a line of text. That is the whole setup.",
     "final_micro": "macOS now. Windows is on the way.",
-    "footer_note": "PDF Text Editor · free and on-device",
+    "footer_note": "PDF for Free · free and on-device",
     "footer_legal": "Privacy & Terms",
     "footer_link": "View the code on GitHub",
 }
