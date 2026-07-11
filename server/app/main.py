@@ -15,6 +15,7 @@ import hmac
 import html
 import io
 import json
+import logging
 import os
 import tarfile
 import tempfile
@@ -22,13 +23,14 @@ from pathlib import Path
 
 from fastapi import (Depends, FastAPI, File, Header, HTTPException, Request,
                      UploadFile)
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import accounts, models, security
+from . import accounts, models, r2, security
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
                      METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
                      TARGETS_DIR, UPDATES_DIR, ensure_dirs)
@@ -37,6 +39,7 @@ from .db import Base, engine, get_db
 ensure_dirs()  # before StaticFiles mounts below need the directories
 
 app = FastAPI(title="PDF Text Editor backend", docs_url=None, redoc_url=None)
+log = logging.getLogger("pdfte")
 
 # The account system (email verification, password reset, password change, a
 # brute-force throttle, optional CORS, and the account pages) lives in
@@ -106,10 +109,33 @@ async def gate_login(request: Request) -> Response:
 
 
 # --- tufup update repository (read by the desktop self-updater) -------------
-# The TUF client fetches signed metadata then the archive/patch targets. These
-# are plain static files produced by the release pipeline.
-# The whole per-platform update tree: /updates/<mac|win>/{metadata,targets}.
-# The desktop client points at its platform's subtree (see appconfig).
+# The TUF client fetches signed metadata then the archive/patch targets.
+#
+# The heavy target archives are offloaded to R2 (free egress): if the file is in
+# R2 we 302 the client straight there on a short-lived signed URL; otherwise we
+# serve it from the volume exactly as before. This route is declared BEFORE the
+# static mount so it wins for /updates/<plat>/targets/*, while the signed
+# metadata (tiny) keeps being served statically by the mount below. tufup checks
+# the target's signed hash regardless of where the bytes come from, so the
+# redirect changes nothing about update integrity.
+@app.get("/updates/{platform}/targets/{filename}")
+def update_target(platform: str, filename: str):
+    safe = os.path.basename(filename)
+    if platform not in ("mac", "win") or safe != filename:
+        raise HTTPException(404, "Not found.")
+    key = f"{CHANNEL}/updates/{platform}/targets/{safe}"
+    if r2.exists(key):
+        return RedirectResponse(r2.presigned_get(key), status_code=302,
+                                headers={"Cache-Control": "no-store"})
+    path = UPDATES_DIR / platform / "targets" / safe
+    if not path.is_file():
+        raise HTTPException(404, "Not found.")
+    return FileResponse(str(path), media_type="application/octet-stream")
+
+
+# Everything else under /updates (the signed metadata + release.json) stays a
+# plain static file. The whole per-platform tree: /updates/<mac|win>/{metadata,
+# targets}. The desktop client points at its platform's subtree (see appconfig).
 app.mount("/updates", StaticFiles(directory=str(UPDATES_DIR), check_dir=False),
           name="updates")
 
@@ -201,11 +227,18 @@ def me(user: "models.User" = Depends(current_user)) -> dict:
 
 # --- installers + download page --------------------------------------------
 @app.get("/download/{filename}")
-def download(filename: str) -> FileResponse:
+def download(filename: str):
     # basename only: no path traversal can escape the installers dir.
     safe = os.path.basename(filename)
+    if safe != filename:
+        raise HTTPException(404, "Not found.")
+    # Offloaded to R2 (free egress) when present; else served from the volume.
+    key = f"{CHANNEL}/installers/{safe}"
+    if r2.exists(key):
+        return RedirectResponse(r2.presigned_get(key), status_code=302,
+                                headers={"Cache-Control": "no-store"})
     path = INSTALLERS_DIR / safe
-    if safe != filename or not path.is_file():
+    if not path.is_file():
         raise HTTPException(404, "Not found.")
     return FileResponse(str(path), filename=safe,
                         media_type="application/octet-stream")
@@ -1605,6 +1638,14 @@ def publish(authorization: str = Header(default=""),
         # filter='data' blocks path traversal; merge (no rmtree) leaves the other
         # platform's repo and the other installer intact.
         tar.extractall(str(DATA_DIR), filter="data")
+    # Mirror the heavy bytes (installers + tufup targets) into R2 so users pull
+    # them from there (free egress) instead of Railway. Best-effort: if R2 is off
+    # or errors, the volume still serves everything, publish still succeeds.
+    if r2.enabled():
+        try:
+            r2.sync_release(CHANNEL, str(INSTALLERS_DIR), str(UPDATES_DIR))
+        except Exception as e:
+            log.warning("R2 sync failed (serving release from volume): %s", e)
     return {"ok": True, "channel": CHANNEL}
 
 

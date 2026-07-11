@@ -6,3 +6,5 @@ psycopg[binary]>=3.1
 argon2-cffi>=23
 pyjwt>=2.8
 python-multipart>=0.0.9
+# R2 (S3-compatible) offload for installers + tufup targets -- see app/r2.py.
+boto3>=1.34
