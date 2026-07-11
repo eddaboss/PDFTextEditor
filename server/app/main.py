@@ -1633,8 +1633,13 @@ def publish(authorization: str = Header(default=""),
     builds + signs the repo, then calls this. Token-protected."""
     _check_publish_token(authorization)
     ensure_dirs()
-    raw = bundle.file.read()
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+    # Stream extraction STRAIGHT from the spooled upload -- never read the whole
+    # (multi-GB, OCR-inclusive) bundle into RAM. Loading it via .read() + BytesIO
+    # ballooned memory ~6x and OOM-killed the memory-capped prod container on a
+    # large release (the roomier dev box survived, which masked it). tarfile
+    # decompresses the disk-backed UploadFile in a small streaming window.
+    bundle.file.seek(0)
+    with tarfile.open(fileobj=bundle.file, mode="r:gz") as tar:
         # filter='data' blocks path traversal; merge (no rmtree) leaves the other
         # platform's repo and the other installer intact.
         tar.extractall(str(DATA_DIR), filter="data")
