@@ -67,6 +67,25 @@ class OnboardCode(Base):
         DateTime, default=utcnow)
 
 
+class GateCode(Base):
+    """A short-lived 6-digit code emailed to prove someone owns the address they
+    typed at the download gate, BEFORE their agreement is recorded. Keyed by
+    email (they have no account yet); only the code hash is stored. One live code
+    per email -- minting a fresh one drops any earlier unused one."""
+
+    __tablename__ = "gate_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), index=True)
+    code_hash: Mapped[str] = mapped_column(String(64), index=True)
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime)
+    attempts: Mapped[int] = mapped_column(default=0)
+    used_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, default=utcnow)
+
+
 class RateEvent(Base):
     __tablename__ = "rate_events"
 
@@ -101,6 +120,13 @@ def run_migrations(engine) -> None:
                      f"NOT NULL DEFAULT {bool_false}")
     if "email_verified_at" not in cols:
         stmts.append(f"ALTER TABLE users ADD COLUMN email_verified_at {ts_type}")
+
+    # consents predates the emailed-code check; mark whether the agreeing address
+    # was proven. Existing rows default to unverified.
+    if "consents" in tables and "email_verified" not in {
+            c["name"] for c in insp.get_columns("consents")}:
+        stmts.append(f"ALTER TABLE consents ADD COLUMN email_verified BOOLEAN "
+                     f"NOT NULL DEFAULT {bool_false}")
 
     if stmts:
         with engine.begin() as conn:

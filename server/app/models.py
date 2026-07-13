@@ -44,5 +44,10 @@ class Consent(Base):
     terms_version: Mapped[str] = mapped_column(String(32))
     ip: Mapped[str] = mapped_column(String(64), default="")
     user_agent: Mapped[str] = mapped_column(Text, default="")
+    # True once the person proved the address via the emailed 6-digit code (new
+    # visitors) or authenticated with an account on that email. Added to the
+    # existing table by account_models.run_migrations().
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
