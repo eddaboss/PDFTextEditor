@@ -24,3 +24,10 @@ e2d422fdc65e89d9  person-name  # tests/test_forms.py:214 -- synthetic test perso
 ca0f8a958b7a5163  person-name  # tests/test_perf_foundation.py:310 -- synthetic test persona (not a real person)
 cec1c6eda957a769  person-name  # tests/test_perf_foundation.py:859 -- synthetic test persona (not a real person)
 4a2e0f331c327d66  person-name  # pdftexteditor/font_engine.py:666 -- a docstring example of a typeface family+weight, not a person
+# Terms section 18 DMCA designated-agent block. This contact info is REQUIRED to be
+# displayed publicly for DMCA safe harbor (17 U.S.C. 512(c)(2)); it is the shared
+# agent (Copyright Office reg. DMCA-1075531), not leaked personal PII. See main.py.
+fc53ce5090e31c21  address  # server/app/main.py -- DMCA designated-agent street address (public legal disclosure, intentional)
+bcaf506c94400087  address  # server/app/main.py -- DMCA designated-agent city/state/ZIP (public legal disclosure, intentional)
+4ef7fc9a15d44b03  us-phone  # server/app/main.py -- DMCA designated-agent phone (public legal disclosure, intentional)
+6bdbf14e00ff39a8  email  # server/app/main.py -- DMCA designated-agent email dmca@ (public legal disclosure, intentional)
