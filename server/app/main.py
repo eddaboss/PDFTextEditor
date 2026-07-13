@@ -10,6 +10,7 @@ One small, public API per environment. Responsibilities:
   * A token-auth publish flow so the release pipeline can push a new signed
     release onto the persistent volume.
 """
+import datetime
 import hashlib
 import hmac
 import html
@@ -27,10 +28,11 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import accounts, models, r2, security
+from . import accounts, emailer, metrics, models, r2, security, track
+from .account_models import GateCode, utcnow
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
                      METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
                      TARGETS_DIR, UPDATES_DIR, ensure_dirs)
@@ -45,6 +47,8 @@ log = logging.getLogger("pdfte")
 # brute-force throttle, optional CORS, and the account pages) lives in
 # accounts.py and wires itself in with this one call.
 accounts.install(app)
+# Private TOTP-gated metrics dashboard (no-op until METRICS_TOTP_SECRET is set).
+metrics.install(app)
 
 
 @app.on_event("startup")
@@ -94,6 +98,19 @@ async def _site_gate(request: Request, call_next):
     if request.url.path.startswith(_GATE_OPEN_PREFIXES) or _gate_ok(request):
         return await call_next(request)
     return HTMLResponse(_login_page(), status_code=401)
+
+
+@app.middleware("http")
+async def _visitor_cookie(request: Request, call_next):
+    """Give every browser a stable anonymous id so page views, downloads, and the
+    agreement can be stitched into one funnel. Defined AFTER the gate so it runs
+    outermost and stamps the cookie on every response. httponly: the server reads
+    it (the sendBeacon carries it automatically); page JS never needs it."""
+    resp = await call_next(request)
+    if not request.cookies.get(track.VID_COOKIE):
+        resp.set_cookie(track.VID_COOKIE, track.new_vid(),
+                        max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    return resp
 
 
 @app.post("/_gate/login")
@@ -227,20 +244,23 @@ def me(user: "models.User" = Depends(current_user)) -> dict:
 
 # --- installers + download page --------------------------------------------
 @app.get("/download/{filename}")
-def download(filename: str):
+def download(filename: str, request: Request, db: Session = Depends(get_db)):
     # basename only: no path traversal can escape the installers dir.
     safe = os.path.basename(filename)
     if safe != filename:
         raise HTTPException(404, "Not found.")
-    # Offloaded to R2 (free egress) when present; else served from the volume.
     key = f"{CHANNEL}/installers/{safe}"
-    if r2.exists(key):
+    from_r2 = r2.exists(key)
+    if not from_r2 and not (INSTALLERS_DIR / safe).is_file():
+        raise HTTPException(404, "Not found.")
+    # Count the real download (not 404s), with the platform read off the filename.
+    track.record(db, request, "download", path=f"/download/{safe}",
+                 platform=track.platform_from_name(safe))
+    # Offloaded to R2 (free egress) when present; else served from the volume.
+    if from_r2:
         return RedirectResponse(r2.presigned_get(key), status_code=302,
                                 headers={"Cache-Control": "no-store"})
-    path = INSTALLERS_DIR / safe
-    if not path.is_file():
-        raise HTTPException(404, "Not found.")
-    return FileResponse(str(path), filename=safe,
+    return FileResponse(str(INSTALLERS_DIR / safe), filename=safe,
                         media_type="application/octet-stream")
 
 
@@ -250,36 +270,127 @@ class ConsentIn(BaseModel):
     agreed: bool
 
 
+class GateVerifyIn(BaseModel):
+    email: EmailStr
+    code: str = ""
+
+
+def _client_ip(request: Request) -> str:
+    # X-Forwarded-For is set by Railway's proxy; take the first hop.
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd
+            else (request.client.host if request.client else ""))[:64]
+
+
+def _release_files() -> dict:
+    info = (json.loads(RELEASE_INFO.read_text("utf-8"))
+            if RELEASE_INFO.exists() else {})
+    return {"mac": info.get("mac"), "windows": info.get("windows")}
+
+
+def _record_consent(db, email, account, request, *, verified: bool) -> None:
+    """Write the provable agreement record for this email."""
+    db.add(models.Consent(
+        email=email, account_id=account.id if account else None,
+        terms_version=TERMS_VERSION, ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent", "")[:1000],
+        email_verified=verified,
+        visitor_id=track.visitor_id(request)))
+    db.commit()
+
+
+_GATE_CODE_TTL = datetime.timedelta(minutes=10)
+
+
+def _send_gate_code(db, email: str, request: Request) -> None:
+    """Email a fresh 6-digit code, unless one was sent seconds ago (anti-spam).
+    The code (not the send) is what gates the download, so a delivery failure is
+    logged, never raised."""
+    latest = db.scalar(select(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None))
+        .order_by(GateCode.id.desc()))
+    if latest and (utcnow() - latest.created_at).total_seconds() < 30:
+        return                       # just sent one; don't spam the inbox
+    db.execute(delete(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None)))
+    display, code_hash = security.new_gate_code()
+    db.add(GateCode(email=email, code_hash=code_hash,
+                    expires_at=utcnow() + _GATE_CODE_TTL))
+    db.commit()
+    text_body = (f"Your PDF for Free download code is {display}.\n\n"
+                 f"It expires in 10 minutes. If you did not request it, you can "
+                 f"ignore this email.")
+    html_body = (
+        '<div style="font-family:system-ui,sans-serif;font-size:15px;color:#2A2520">'
+        'Your PDF for Free download code:'
+        f'<div style="font-size:32px;font-weight:700;letter-spacing:.22em;'
+        f'margin:14px 0;color:#AA4E2C">{display}</div>'
+        'It expires in 10 minutes. If you did not request it, ignore this email.'
+        '</div>')
+    try:
+        emailer.send_email(email, "Your PDF for Free download code",
+                           text_body, html_body)
+    except Exception:
+        log.warning("gate code email failed to send")
+
+
 @app.post("/api/consent")
 def record_consent(body: ConsentIn, request: Request,
                    db: Session = Depends(get_db)) -> dict:
-    """Record that someone agreed to the Terms + Privacy before downloading.
-    Keyed by email and linked to an account if one already exists with that
-    email (otherwise linked later, at register). Returns the installer file
-    names so the client can start the download."""
+    """Step 1 of the download gate. An existing-account email takes the password
+    path (which proves the address), so its agreement is recorded now. A NEW
+    visitor is emailed a 6-digit code; their agreement is recorded only once they
+    verify it via /api/gate/verify."""
     if not body.agreed:
         raise HTTPException(400, "You must agree to the Terms to download.")
     email = body.email.lower().strip()
-    # X-Forwarded-For is set by Railway's proxy; take the first hop.
-    fwd = request.headers.get("x-forwarded-for", "")
-    ip = (fwd.split(",")[0].strip() if fwd
-          else (request.client.host if request.client else ""))[:64]
     account = db.scalar(select(models.User).where(models.User.email == email))
-    db.add(models.Consent(
-        email=email,
-        account_id=account.id if account else None,
-        terms_version=TERMS_VERSION,
-        ip=ip,
-        user_agent=request.headers.get("user-agent", "")[:1000],
-    ))
-    db.commit()
-    info = (json.loads(RELEASE_INFO.read_text("utf-8"))
-            if RELEASE_INFO.exists() else {})
-    # has_account tells the gate whether to ask for a password (an account uses
-    # this email) or send a brand-new visitor straight to the download.
-    return {"ok": True, "terms_version": TERMS_VERSION,
-            "has_account": account is not None,
-            "mac": info.get("mac"), "windows": info.get("windows")}
+    if account is not None:
+        _record_consent(db, email, account, request, verified=True)
+        return {"ok": True, "has_account": True}
+    _send_gate_code(db, email, request)
+    return {"ok": True, "has_account": False, "needs_code": True}
+
+
+@app.post("/api/gate/verify")
+def gate_verify(body: GateVerifyIn, request: Request,
+                db: Session = Depends(get_db)) -> dict:
+    """Step 2: check the emailed 6-digit code, record the VERIFIED agreement, and
+    return the installer names so the download can start."""
+    email = body.email.lower().strip()
+    row = db.scalar(select(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None))
+        .order_by(GateCode.id.desc()))
+    now = utcnow()
+    if row is None or row.expires_at < now:
+        raise HTTPException(400, "That code has expired -- request a new one.")
+    if row.attempts >= 5:
+        raise HTTPException(429, "Too many tries -- request a new code.")
+    if not hmac.compare_digest(row.code_hash,
+                               security.hash_gate_code(body.code)):
+        row.attempts += 1
+        db.commit()
+        raise HTTPException(400, "That code is not right.")
+    row.used_at = now
+    account = db.scalar(select(models.User).where(models.User.email == email))
+    _record_consent(db, email, account, request, verified=True)
+    return {"ok": True, **_release_files()}
+
+
+class TrackIn(BaseModel):
+    path: str = ""
+    ref: str = ""
+
+
+@app.post("/api/track")
+def api_track(body: TrackIn, request: Request,
+              db: Session = Depends(get_db)) -> dict:
+    """Record an anonymous page view -- a sendBeacon fires on every page load.
+    Public + best-effort: never raises, stores no PII beyond the CF-derived city.
+    Only a same-origin path is kept (never a full URL)."""
+    path = body.path if body.path.startswith("/") else "/"
+    track.record(db, request, "pageview", path=path, referrer=body.ref)
+    return {"ok": True}
 
 
 GITHUB_URL = "https://github.com/eddaboss/PDFTextEditor"
@@ -287,7 +398,7 @@ SITE_URL = "https://pdf-for-free.com"  # the canonical public domain
 # Bump when the Terms / Privacy change materially: the download gate records
 # which version each person agreed to, so a bump means new agreements going
 # forward (and you can tell who agreed to what).
-TERMS_VERSION = "2026-06-15"
+TERMS_VERSION = "2026-07-13"
 # Where the Donate button points. Set this to your real link (GitHub Sponsors,
 # Ko-fi, Buy Me a Coffee, a Stripe payment link, PayPal, etc.).
 DONATE_URL = os.environ.get("PDFTE_DONATE_URL",
@@ -969,9 +1080,11 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     <p class=dlintro id=dlintro>Add your email and agree to the terms. We link the agreement to your account so it stays on record.</p>
     <input class=dlfield type=email id=dlemail placeholder="you@example.com" autocomplete=email>
     <input class=dlfield type=password id=dlpw placeholder="Your password" autocomplete=current-password hidden>
+    <input class=dlfield type=text inputmode=numeric id=dlcodein placeholder="6-digit code" autocomplete=one-time-code maxlength=6 hidden>
     <label class=dlcheck id=dlagreerow><input type=checkbox id=dlagree> <span>I have read and agree to the <button type=button class=inlinelink data-legal=terms>Terms</button> and <button type=button class=inlinelink data-legal=privacy>Privacy Policy</button>.</span></label>
     <button class="btn dlgo" type=button id=dlgo disabled>Agree &amp; continue</button>
     <a id=dlforgot href="/forgot" style="display:none;font-size:13px;margin-top:10px;color:var(--clay-press);text-decoration:none">Forgot your password?</a>
+    <button type=button id=dlresend class=inlinelink style="display:none;margin-top:10px;font-size:13px;color:var(--clay-press)">Resend the code</button>
     <p class=dlerr id=dlerr hidden></p>
     <div id=dlcode hidden style="margin-top:6px"></div>
   </div>
@@ -983,19 +1096,27 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
       go=document.getElementById('dlgo'),err=document.getElementById('dlerr'),
       title=document.getElementById('dltitle'),intro=document.getElementById('dlintro'),
       agreerow=document.getElementById('dlagreerow'),forgot=document.getElementById('dlforgot'),
-      codebox=document.getElementById('dlcode'),target=null,stage='consent';
+      codebox=document.getElementById('dlcode'),codein=document.getElementById('dlcodein'),
+      resend=document.getElementById('dlresend'),target=null,stage='consent';
   function emailok(){return /\S+@\S+\.\S+/.test(email.value.trim());}
-  function valid(){return stage==='password'?pw.value.length>0:(agree.checked&&emailok());}
+  function valid(){if(stage==='code')return /^[0-9]{6}$/.test(codein.value.trim());
+    return stage==='password'?pw.value.length>0:(agree.checked&&emailok());}
   function sync(){go.disabled=!valid();}
   email.addEventListener('input',sync);agree.addEventListener('change',sync);pw.addEventListener('input',sync);
   email.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
   pw.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
+  codein.addEventListener('input',sync);
+  codein.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
+  resend.addEventListener('click',function(){resend.disabled=true;resend.textContent='Sent';
+    jpost('/api/consent',{email:email.value.trim(),agreed:true}).catch(function(){});
+    setTimeout(function(){resend.disabled=false;resend.textContent='Resend the code';},20000);});
   function resetCard(url){
     target=url;stage='consent';err.hidden=true;codebox.hidden=true;codebox.innerHTML='';
     title.textContent='Before you download';
     intro.textContent='Add your email and agree to the terms. We link the agreement to your account so it stays on record.';
     intro.style.display='';email.style.display='';email.disabled=false;
-    pw.hidden=true;pw.value='';forgot.style.display='none';agreerow.style.display='';
+    pw.hidden=true;pw.value='';codein.hidden=true;codein.value='';resend.style.display='none';
+    forgot.style.display='none';agreerow.style.display='';
     go.style.display='';go.textContent='Agree & continue';sync();
   }
   function open(url){resetCard(url);m.hidden=false;document.body.style.overflow='hidden';
@@ -1020,10 +1141,18 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     pw.hidden=false;forgot.style.display='inline-block';go.textContent='Sign in & download';
     err.hidden=true;sync();setTimeout(function(){pw.focus();},30);
   }
+  function toCode(){
+    stage='code';agreerow.style.display='none';email.disabled=true;pw.hidden=true;
+    title.textContent='Check your email';
+    intro.textContent='We emailed a 6-digit code to '+email.value.trim()+'. Enter it to download.';
+    codein.hidden=false;resend.style.display='inline-block';go.textContent='Verify & download';
+    err.hidden=true;sync();setTimeout(function(){codein.focus();},30);
+  }
   function newUser(){
     download();title.textContent='Your download is starting';
     intro.innerHTML='No account uses this email yet. Open the app to create one, or <a href="/signup?email='+encodeURIComponent(email.value.trim())+'" style="color:var(--clay-press)">create it on the web</a>.';
-    email.style.display='none';agreerow.style.display='none';go.style.display='none';err.hidden=true;
+    email.style.display='none';agreerow.style.display='none';go.style.display='none';
+    codein.hidden=true;resend.style.display='none';err.hidden=true;
   }
   function showCode(code){
     download();title.textContent="You're signed in";intro.style.display='none';
@@ -1039,8 +1168,13 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     if(stage==='consent'){
       go.disabled=true;go.textContent='One sec...';err.hidden=true;
       jpost('/api/consent',{email:email.value.trim(),agreed:true}).then(function(d){
-        if(d&&d.has_account){toPassword();}else{newUser();}
+        if(d&&d.has_account){toPassword();}else{toCode();}
       }).catch(function(e2){go.textContent='Agree & continue';fail(e2.message);});
+    }else if(stage==='code'){
+      go.disabled=true;go.textContent='Verifying...';err.hidden=true;
+      jpost('/api/gate/verify',{email:email.value.trim(),code:codein.value.trim()}).then(function(){
+        newUser();
+      }).catch(function(e2){go.textContent='Verify & download';fail(e2.message);});
     }else{
       go.disabled=true;go.textContent='Signing in...';err.hidden=true;
       jpost('/api/auth/login',{email:email.value.trim(),password:pw.value}).then(function(d){
@@ -1095,6 +1229,8 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
   items.forEach(function(el){io.observe(el);});
 })();
 </script>
+<script>/* anonymous page-view beacon (no PII; geo added server-side from CF) */
+try{navigator.sendBeacon('/api/track',new Blob([JSON.stringify({path:location.pathname,ref:document.referrer})],{type:'application/json'}))}catch(e){}</script>
 </body></html>"""
 
 # small inline SVGs reused via token replacement (keeps the markup readable)
@@ -1299,79 +1435,106 @@ def _load_copy() -> dict:
 
 
 # Legal copy shown in the Privacy / Terms modal. Plain-language and grounded in
-# what the app actually does. Edit the wording here; set edw.luko@gmail.com
-# (and, if you want one, a governing-law line) before going live.
+# what the app actually does. Edit the wording here; the Contact sections point
+# to the public contact form (no personal email or name in the repo). The lone
+# exception is the DMCA designated agent in Terms sec. 16 -- a shared role inbox
+# (dmca@, no personal name) that safe harbor requires be displayed publicly.
 _PRIVACY_HTML = """
 <h3>Privacy Policy</h3>
-<p class=leff>Last updated June 15, 2026</p>
-<p>PDF for Free is a desktop app that edits PDFs on your own computer. This
-policy explains what information we collect, how we use it, and your rights, in
-plain language. It is written for users in the United States, including
+<p class=leff>Last updated July 13, 2026</p>
+<p>PDF for Free is a desktop app that edits PDFs on your own computer, for macOS
+and Windows. This policy explains, in plain language, what we collect, how we use
+it, and your rights. It is written for users in the United States, including
 California.</p>
 
-<h4>Your PDFs stay on your device</h4>
-<p>All PDF editing happens locally on your Mac. Your documents are not uploaded
-to us to be edited, and we never see, read, or store the files you edit, unless
-you choose to use one of the optional cloud features described below.</p>
+<h4>Your PDFs never leave your device</h4>
+<p>All PDF editing, rendering, and OCR happen locally on your own computer. Your
+documents are never uploaded to us or anyone else. We do not see, receive, or
+store the files you edit, the text in them, or your OCR results. Optional cloud
+features (such as cloud OCR and cloud storage) are planned but not yet available;
+if you choose to use one after it launches, only the specific data you send to
+that feature would leave your device, and we will update this policy with the
+details before that happens.</p>
+
+<h4>What the app sends over the network</h4>
+<p>The app talks to our servers only to: (a) check for and download updates;
+(b) the first time you use OCR, download the optional OCR component; and (c) if
+you choose to create or sign in to an account, send the email, password, and
+display name you type. That is all. The app contains no analytics, telemetry,
+crash reporting, advertising, device fingerprinting, or &ldquo;phone-home&rdquo; of
+any kind, and an account is optional &mdash; the app is fully functional without
+one.</p>
 
 <h4>Information we collect</h4>
-<p><b>Account.</b> Your email address, a securely hashed password, and the
-display name you choose.</p>
-<p><b>Agreement records.</b> When you agree to the Terms at download, we record
-your email, the version of the Terms you agreed to, the date and time, your IP
-address, and your browser's user-agent, so the agreement is on record and can be
-linked to your account.</p>
-<p><b>Server logs.</b> When you download the app or it checks for updates, our
-servers receive routine request information such as your IP address.</p>
-<p><b>Cloud features (only if you use them).</b> The page images you send to
-cloud OCR, and the files you choose to sync with cloud storage.</p>
-<p><b>Payments.</b> Handled by our payment processor and by Venmo for donations.
-We never receive or store your full card details.</p>
+<p><b>Account (optional).</b> If you create one: your email address, a password
+we store only as a secure hash, and a display name.</p>
+<p><b>Download agreement.</b> When you agree to the Terms to download, we record
+your email, that you verified it, the version of the Terms you agreed to, the date
+and time, your IP address, and your browser's user-agent, so the agreement is on
+record.</p>
+<p><b>Email verification.</b> To confirm you own the address you enter, we email a
+one-time 6-digit code through our email provider and check the code you type back.</p>
+<p><b>Website analytics (anonymous).</b> On this website we record page views and
+downloads, tied to a random cookie-based visitor id that is never linked to your
+name or email, plus an approximate location (country, region, city) that our
+network provider derives from your IP. This is used only to understand site
+traffic in aggregate, never for advertising.</p>
+<p><b>Server logs.</b> When you visit the site, download the app, or the app
+checks for updates, our servers receive routine request information such as your
+IP address and user-agent.</p>
 
 <h4>How we use it</h4>
-<p>To sign you in and run your account, to deliver downloads and updates, to keep
-a record that you accepted the Terms, to provide any cloud feature you turn on,
-to take payment for paid features, and to keep the Service secure and working. We
-do not use your information for advertising.</p>
+<p>To run optional accounts, to deliver downloads and updates, to keep a record
+that you agreed to the Terms and verified your email, to understand website
+traffic in aggregate, and to keep the Service secure and working. We do not use
+your information for advertising, and we do not sell it.</p>
 
-<h4>Optional cloud features</h4>
-<p><b>Cloud OCR.</b> If you turn it on, the pages you run through it are sent to
-Google Document AI to be read into text, then returned to you. Use it only on
-documents you are comfortable processing in the cloud. The built-in on-device
-OCR never leaves your computer.</p>
-<p><b>Cloud storage.</b> If you turn it on, the PDFs you choose to sync are
-stored on our servers so you can open them on another device. You can delete them
-at any time. Both cloud features are off by default and entirely optional.</p>
+<h4>Cookies</h4>
+<p>The website uses one first-party cookie to hold the anonymous analytics
+visitor id described above, plus short-lived cookies needed to operate the
+download flow. We do not use third-party advertising or cross-site tracking
+cookies.</p>
 
-<h4>How we share it</h4>
+<h4>Who we share it with</h4>
 <p>We share information only with the service providers that make the Service
-work: our hosting provider, our payment processor, Google (cloud OCR), and Venmo
-(donations), each only as needed for their part. We do not sell your personal
-information, and we do not share it for cross-context behavioral advertising.</p>
+work, each only for its part:</p>
+<ul>
+<li><b>Railway</b> &mdash; hosting for our website, API, and database.</li>
+<li><b>Cloudflare</b> &mdash; content delivery and security for the website, and
+the approximate-location data used for analytics; <b>Cloudflare R2</b> stores and
+serves the app installers and update files.</li>
+<li><b>Resend</b> &mdash; sends the email-verification code and any account emails.</li>
+<li><b>Google Fonts</b> &mdash; serves the fonts used on this website.</li>
+<li><b>Google Forms</b> &mdash; hosts the contact form.</li>
+</ul>
+<p>We do not sell your personal information and do not share it for cross-context
+behavioral advertising. Donations, if you make one, go through your own Venmo
+account; no payment details pass through us.</p>
 
 <h4>Data retention</h4>
-<p>We keep account and agreement records for as long as your account exists and
-as needed for our legal and operational purposes, then delete or anonymize them.
-Cloud-storage files are kept until you delete them or close your account.</p>
+<p>We keep account and download-agreement records for as long as your account or
+the record is needed for our legal and operational purposes, then delete or
+anonymize them. Email-verification codes are short-lived and single-use, and
+analytics records are anonymous.</p>
 
 <h4>Security</h4>
 <p>We use reasonable measures to protect your information, including hashing
-passwords and serving the site and APIs over HTTPS. No system is perfectly
-secure, so we cannot guarantee absolute security.</p>
+passwords, storing verification codes only as hashes, and serving the site and
+APIs over HTTPS. No system is perfectly secure, so we cannot guarantee absolute
+security.</p>
 
 <h4>Your California privacy rights</h4>
 <p>If you are a California resident, you have the right to know what personal
 information we collect and how we use it, to request a copy, to ask us to correct
-or delete it, and to not be discriminated against for exercising these rights.
+or delete it, and not to be discriminated against for exercising these rights.
 Because we do not sell or share your personal information for cross-context
-behavioral advertising, there is nothing to opt out of, but you may still
-contact us to exercise any of these rights. Email us and we will verify and
-respond as required by law.</p>
+behavioral advertising, there is nothing to opt out of, but you may still contact
+us to exercise these rights and we will verify and respond as required by law.</p>
 
 <h4>Children</h4>
-<p>The Service is not directed to children under 13, and we do not knowingly
-collect their information. If you believe a child has given us information,
-contact us and we will delete it.</p>
+<p>The Service is intended for adults and is not directed to children. We do not
+knowingly collect information from anyone under 18. If you believe a minor has
+given us information, contact us and we will delete it.</p>
 
 <h4>Changes</h4>
 <p>We may update this policy; when we do, we will change the date above.
@@ -1379,18 +1542,18 @@ Significant changes will be made clear on this page.</p>
 
 <h4>Contact</h4>
 <p>To exercise your rights, request deletion, or ask any question about privacy,
-email edw.luko@gmail.com.</p>
+use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 _TERMS_HTML = """
 <h3>Terms of Service</h3>
-<p class=leff>Last updated June 15, 2026 (version 2026-06-15)</p>
+<p class=leff>Last updated July 13, 2026 (version 2026-07-13)</p>
 <p>These Terms of Service ("Terms") are a binding agreement between you and the
-individual developer of PDF for Free ("we", "us", or "the Developer"). They
-cover the PDF for Free desktop application, this website, and any related cloud
-services (together, the "Service"). By checking "I agree" at download, or by
-downloading, installing, or using the Service, you accept these Terms and our
-Privacy Policy. If you do not agree, do not download or use the Service.</p>
+individual developer of PDF for Free ("we", "us", or "the Developer"). They cover
+the PDF for Free desktop application (for macOS and Windows) and this website
+(together, the "Service"). By checking "I agree" at download, or by downloading,
+installing, or using the Service, you accept these Terms and our Privacy Policy.
+If you do not agree, do not download or use the Service.</p>
 
 <h4>1. Eligibility</h4>
 <p>You must be at least 18 years old and able to form a binding contract to use
@@ -1404,56 +1567,47 @@ license to download and use the Service for your own document editing. We retain
 all right, title, and interest in the Service, including all intellectual
 property in it. These Terms grant you no rights except the license stated here.</p>
 
-<h4>3. What you may not do</h4>
+<h4>3. Acceptable use</h4>
 <p>You agree not to: (a) resell, sublicense, rent, or redistribute the Service;
-(b) use it for anything unlawful, infringing, or harmful; (c) upload to a cloud
-feature any content you do not have the right to process; (d) attempt to break,
+(b) use it for anything unlawful, infringing, or harmful; (c) attempt to break,
 overload, probe, or gain unauthorized access to the Service or its
-infrastructure; (e) circumvent or tamper with billing, usage limits, or
-security; (f) use the Service to build or train a competing product; or (g)
-remove or alter any notices, or misrepresent the Service as your own.</p>
+infrastructure; (d) circumvent or tamper with any security or access controls;
+(e) use the Service to build or train a competing product; or (f) remove or alter
+any notices, or misrepresent the Service as your own.</p>
 
-<h4>4. Your account</h4>
-<p>Using the app requires a free account. You agree to provide accurate
-information, to keep your password secure, and that you are responsible for all
-activity under your account. We may suspend or terminate accounts that violate
-these Terms, abuse the Service, or create risk for us or other users.</p>
+<h4>4. Your account (optional)</h4>
+<p>You do not need an account to use the app; it is fully functional without one.
+If you choose to create an account, you agree to provide accurate information, to
+keep your password secure, and that you are responsible for activity under your
+account. We may suspend or terminate accounts that violate these Terms, abuse the
+Service, or create risk for us or other users.</p>
 
-<h4>5. Free and paid features</h4>
-<p>The app and all PDF editing are free and will remain free. Cloud OCR (page
-processing via Google Document AI) and cloud storage are optional paid features,
-because they cost us money to run. Prices and limits are shown before you use a
-paid feature and may change on a going-forward basis.</p>
+<h4>5. Cost</h4>
+<p>The app and all of its PDF editing are free, and today there are no paid
+features, subscriptions, or charges. We plan to add optional paid features &mdash;
+cloud OCR for tough scans, and cloud storage to sync files across devices &mdash;
+because they cost us to run. When they launch they will be optional, the core app
+and its editing will stay free, and we will show each feature's price and terms
+before you use it. Donations are voluntary and go through your own Venmo account.</p>
 
-<h4>6. Billing, auto-renewal, and cancellation</h4>
-<p>Paid features are billed through our third-party payment processor; we do not
-store your full card details. Pay-per-use charges (such as cloud OCR) are
-incurred as you use them. If a feature is offered as a recurring subscription
-(such as cloud storage), it will, consistent with California's Automatic
-Renewal Law, automatically renew at the stated price and interval until you
-cancel, and you may cancel at any time from your account settings or by emailing
-us, effective at the end of the current billing period.</p>
+<h4>6. Your files and content</h4>
+<p>You keep all ownership of the documents you edit; we claim no ownership of
+them. Today all editing, rendering, and OCR happen on your own device, and the
+app never sends your files, their contents, or your OCR results to us. If we
+launch an optional cloud feature and you choose to use it, you would grant us only
+the limited permission needed to provide that feature (for example, sending a page
+to cloud OCR, or storing a file you choose to sync). You are solely responsible
+for your files, for having the right to use and edit them, and for keeping your
+own backups.</p>
 
-<h4>7. Refunds</h4>
-<p>Except where required by law, payments are non-refundable, including used
-pay-per-use charges and the current period of any subscription. If the law in
-your jurisdiction gives you a refund or cancellation right, that right applies.</p>
+<h4>7. Third-party services</h4>
+<p>The website and download service rely on third parties, including Railway
+(hosting), Cloudflare and Cloudflare R2 (content delivery and file hosting),
+Resend (sending verification email), Google Fonts, and Google Forms (the contact
+form). Your use of those is also subject to those providers' terms, and we are
+not responsible for their acts, omissions, or availability.</p>
 
-<h4>8. Your files and content</h4>
-<p>You keep all ownership of the documents you edit. We claim no ownership of
-them. You grant us only the limited permission needed to provide a feature you
-choose to use (for example, transmitting a page to cloud OCR, or storing a file
-you choose to sync). The app's local editing never sends your files to us. You
-are solely responsible for your files and for having the right to use and edit
-them.</p>
-
-<h4>9. Third-party services</h4>
-<p>The Service relies on third parties, including Google Document AI (cloud
-OCR), our hosting provider, our payment processor, and Venmo (donations). Your
-use of those features is also subject to those providers' terms, and we are not
-responsible for their acts, omissions, or availability.</p>
-
-<h4>10. Disclaimer of warranties</h4>
+<h4>8. Disclaimer of warranties</h4>
 <p>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITH ALL FAULTS AND
 WITHOUT WARRANTY OF ANY KIND. TO THE FULLEST EXTENT PERMITTED BY LAW, WE DISCLAIM
 ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A
@@ -1462,7 +1616,7 @@ SERVICE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR THAT IT WILL PRESERVE,
 EDIT, OR RENDER YOUR DOCUMENTS CORRECTLY. YOU USE THE SERVICE AT YOUR OWN RISK
 AND ARE RESPONSIBLE FOR KEEPING YOUR OWN BACKUPS.</p>
 
-<h4>11. Limitation of liability</h4>
+<h4>9. Limitation of liability</h4>
 <p>TO THE FULLEST EXTENT PERMITTED BY LAW, WE WILL NOT BE LIABLE FOR ANY
 INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR
 FOR ANY LOST PROFITS, DATA, OR DOCUMENTS, ARISING FROM OR RELATING TO THE
@@ -1471,51 +1625,78 @@ WILL NOT EXCEED THE GREATER OF THE AMOUNT YOU PAID US IN THE 12 MONTHS BEFORE TH
 CLAIM OR US$50. Some jurisdictions do not allow certain limitations, so parts of
 this section may not apply to you.</p>
 
-<h4>12. Indemnification</h4>
+<h4>10. Indemnification</h4>
 <p>You agree to indemnify, defend, and hold harmless the Developer from any
 claims, damages, liabilities, and expenses (including reasonable legal fees)
 arising from your use of the Service, your content, or your violation of these
 Terms, the law, or any third party's rights.</p>
 
-<h4>13. Termination</h4>
+<h4>11. Termination</h4>
 <p>You may stop using the Service at any time. We may suspend or end your access
 at any time, with or without notice, including if you violate these Terms.
-Sections that by their nature should survive (including 8-12, 14, and 15) survive
+Sections that by their nature should survive (including 6, 8-10, 12, and 13) survive
 termination.</p>
 
-<h4>14. Dispute resolution; arbitration; class-action waiver</h4>
+<h4>12. Dispute resolution; arbitration; class-action waiver</h4>
 <p>Please read this carefully; it affects your rights. You and the Developer
-agree to first try to resolve any dispute informally by email. If that fails,
+agree to first try to resolve any dispute informally through our contact form. If that fails,
 any dispute arising out of or relating to the Service or these Terms will be
 resolved by binding individual arbitration administered by a recognized
 arbitration provider under its consumer rules, seated in California, rather than
 in court, except that either party may bring an individual claim in small-claims
 court. TO THE EXTENT PERMITTED BY LAW, YOU AND THE DEVELOPER WAIVE ANY RIGHT TO A
 JURY TRIAL AND ANY RIGHT TO BRING OR PARTICIPATE IN A CLASS, COLLECTIVE, OR
-REPRESENTATIVE ACTION. You may opt out of this arbitration agreement by emailing
-us within 30 days of first accepting these Terms.</p>
+REPRESENTATIVE ACTION. You may opt out of this arbitration agreement by contacting
+us through our contact form within 30 days of first accepting these Terms.</p>
 
-<h4>15. Governing law</h4>
+<h4>13. Governing law</h4>
 <p>These Terms are governed by the laws of the State of California, without
 regard to its conflict-of-laws rules. For any matter not subject to arbitration,
 you agree to the exclusive jurisdiction and venue of the state and federal courts
 located in California.</p>
 
-<h4>16. Changes to these Terms</h4>
+<h4>14. Changes to these Terms</h4>
 <p>We may update these Terms as the project evolves. When we make material
 changes we will update the date and version above, and continued use after that
 means you accept the updated Terms. The download gate records which version you
 agreed to.</p>
 
-<h4>17. General</h4>
+<h4>15. General</h4>
 <p>These Terms and the Privacy Policy are the entire agreement between us about
 the Service. If any provision is unenforceable, the rest stays in effect. Our
 failure to enforce a provision is not a waiver. You may not assign these Terms;
 we may. We are not liable for delays or failures caused by events beyond our
 reasonable control.</p>
 
-<h4>18. Contact</h4>
-<p>Questions about these Terms? Email edw.luko@gmail.com.</p>
+<h4>16. Copyright and DMCA notices</h4>
+<p>We respect intellectual property rights and respond to clear notices of
+alleged copyright infringement that comply with the Digital Millennium Copyright
+Act (DMCA). Our agent designated to receive notifications of claimed infringement
+is registered with the U.S. Copyright Office under registration number
+DMCA-1075531, and can be reached directly at:</p>
+<p><b>Designated agent for copyright notices:</b><br>
+DMCA Agent<br>
+18034 Ventura Blvd, Unit #655<br>
+Encino, CA 91316, United States<br>
+Phone: (818) 794-0599<br>
+Email: <a href="mailto:dmca@hockeydatamodels.com">dmca@hockeydatamodels.com</a></p>
+<p>To report material you believe infringes your copyright, send a written notice
+to the designated agent above, or through our
+<a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>
+(choose &ldquo;Copyright or DMCA notice&rdquo;), that includes: (a) your physical or
+electronic signature; (b) identification of the copyrighted work you claim has
+been infringed; (c) identification of the material you claim is infringing and
+information reasonably sufficient to let us locate it; (d) your contact
+information; (e) a statement that you have a good-faith belief that the use is
+not authorized by the copyright owner, its agent, or the law; and (f) a
+statement, made under penalty of perjury, that the information in your notice is
+accurate and that you are the copyright owner or are authorized to act on the
+owner's behalf. A notice missing these elements may not be valid.</p>
+<p>We may remove or disable access to material claimed to be infringing, and in
+appropriate circumstances we will terminate the accounts of repeat infringers.</p>
+
+<h4>17. Contact</h4>
+<p>Questions about these Terms? Use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 

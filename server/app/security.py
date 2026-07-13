@@ -67,3 +67,17 @@ def hash_setup_code(code: str) -> str:
     norm = code.upper().replace("-", "").replace(" ", "")
     # Domain-separated from link tokens so the two hash spaces never overlap.
     return hashlib.sha256(("setup:" + norm).encode("utf-8")).hexdigest()
+
+
+# --- download-gate email codes (6 digits, emailed to prove the address) ------
+def new_gate_code() -> tuple[str, str]:
+    """Return ``(display, code_hash)`` for the download-gate email check. Six
+    cryptographically-secure digits (``secrets``, never the ``random`` module);
+    only the hash is ever stored."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    return code, hash_gate_code(code)
+
+
+def hash_gate_code(code: str) -> str:
+    norm = "".join(ch for ch in str(code) if ch.isdigit())
+    return hashlib.sha256(("gate:" + norm).encode("utf-8")).hexdigest()
