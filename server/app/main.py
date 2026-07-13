@@ -363,7 +363,7 @@ SITE_URL = "https://pdf-for-free.com"  # the canonical public domain
 # Bump when the Terms / Privacy change materially: the download gate records
 # which version each person agreed to, so a bump means new agreements going
 # forward (and you can tell who agreed to what).
-TERMS_VERSION = "2026-06-15"
+TERMS_VERSION = "2026-07-13"
 # Where the Donate button points. Set this to your real link (GitHub Sponsors,
 # Ko-fi, Buy Me a Coffee, a Stripe payment link, PayPal, etc.).
 DONATE_URL = os.environ.get("PDFTE_DONATE_URL",
@@ -1402,75 +1402,98 @@ def _load_copy() -> dict:
 # to the public contact form (no personal email or name in the repo).
 _PRIVACY_HTML = """
 <h3>Privacy Policy</h3>
-<p class=leff>Last updated June 15, 2026</p>
-<p>PDF for Free is a desktop app that edits PDFs on your own computer. This
-policy explains what information we collect, how we use it, and your rights, in
-plain language. It is written for users in the United States, including
+<p class=leff>Last updated July 13, 2026</p>
+<p>PDF for Free is a desktop app that edits PDFs on your own computer, for macOS
+and Windows. This policy explains, in plain language, what we collect, how we use
+it, and your rights. It is written for users in the United States, including
 California.</p>
 
-<h4>Your PDFs stay on your device</h4>
-<p>All PDF editing happens locally on your Mac. Your documents are not uploaded
-to us to be edited, and we never see, read, or store the files you edit, unless
-you choose to use one of the optional cloud features described below.</p>
+<h4>Your PDFs never leave your device</h4>
+<p>All PDF editing, rendering, and OCR happen locally on your own computer. Your
+documents are never uploaded to us or anyone else. We do not see, receive, or
+store the files you edit, the text in them, or your OCR results. There are no
+cloud-editing, cloud-OCR, or cloud-storage features, so there is no exception to
+this.</p>
+
+<h4>What the app sends over the network</h4>
+<p>The app talks to our servers only to: (a) check for and download updates;
+(b) the first time you use OCR, download the optional OCR component; and (c) if
+you choose to create or sign in to an account, send the email, password, and
+display name you type. That is all. The app contains no analytics, telemetry,
+crash reporting, advertising, device fingerprinting, or &ldquo;phone-home&rdquo; of
+any kind, and an account is optional &mdash; the app is fully functional without
+one.</p>
 
 <h4>Information we collect</h4>
-<p><b>Account.</b> Your email address, a securely hashed password, and the
-display name you choose.</p>
-<p><b>Agreement records.</b> When you agree to the Terms at download, we record
-your email, the version of the Terms you agreed to, the date and time, your IP
-address, and your browser's user-agent, so the agreement is on record and can be
-linked to your account.</p>
-<p><b>Server logs.</b> When you download the app or it checks for updates, our
-servers receive routine request information such as your IP address.</p>
-<p><b>Cloud features (only if you use them).</b> The page images you send to
-cloud OCR, and the files you choose to sync with cloud storage.</p>
-<p><b>Payments.</b> Handled by our payment processor and by Venmo for donations.
-We never receive or store your full card details.</p>
+<p><b>Account (optional).</b> If you create one: your email address, a password
+we store only as a secure hash, and a display name.</p>
+<p><b>Download agreement.</b> When you agree to the Terms to download, we record
+your email, that you verified it, the version of the Terms you agreed to, the date
+and time, your IP address, and your browser's user-agent, so the agreement is on
+record.</p>
+<p><b>Email verification.</b> To confirm you own the address you enter, we email a
+one-time 6-digit code through our email provider and check the code you type back.</p>
+<p><b>Website analytics (anonymous).</b> On this website we record page views and
+downloads, tied to a random cookie-based visitor id that is never linked to your
+name or email, plus an approximate location (country, region, city) that our
+network provider derives from your IP. This is used only to understand site
+traffic in aggregate, never for advertising.</p>
+<p><b>Server logs.</b> When you visit the site, download the app, or the app
+checks for updates, our servers receive routine request information such as your
+IP address and user-agent.</p>
 
 <h4>How we use it</h4>
-<p>To sign you in and run your account, to deliver downloads and updates, to keep
-a record that you accepted the Terms, to provide any cloud feature you turn on,
-to take payment for paid features, and to keep the Service secure and working. We
-do not use your information for advertising.</p>
+<p>To run optional accounts, to deliver downloads and updates, to keep a record
+that you agreed to the Terms and verified your email, to understand website
+traffic in aggregate, and to keep the Service secure and working. We do not use
+your information for advertising, and we do not sell it.</p>
 
-<h4>Optional cloud features</h4>
-<p><b>Cloud OCR.</b> If you turn it on, the pages you run through it are sent to
-Google Document AI to be read into text, then returned to you. Use it only on
-documents you are comfortable processing in the cloud. The built-in on-device
-OCR never leaves your computer.</p>
-<p><b>Cloud storage.</b> If you turn it on, the PDFs you choose to sync are
-stored on our servers so you can open them on another device. You can delete them
-at any time. Both cloud features are off by default and entirely optional.</p>
+<h4>Cookies</h4>
+<p>The website uses one first-party cookie to hold the anonymous analytics
+visitor id described above, plus short-lived cookies needed to operate the
+download flow. We do not use third-party advertising or cross-site tracking
+cookies.</p>
 
-<h4>How we share it</h4>
+<h4>Who we share it with</h4>
 <p>We share information only with the service providers that make the Service
-work: our hosting provider, our payment processor, Google (cloud OCR), and Venmo
-(donations), each only as needed for their part. We do not sell your personal
-information, and we do not share it for cross-context behavioral advertising.</p>
+work, each only for its part:</p>
+<ul>
+<li><b>Railway</b> &mdash; hosting for our website, API, and database.</li>
+<li><b>Cloudflare</b> &mdash; content delivery and security for the website, and
+the approximate-location data used for analytics; <b>Cloudflare R2</b> stores and
+serves the app installers and update files.</li>
+<li><b>Resend</b> &mdash; sends the email-verification code and any account emails.</li>
+<li><b>Google Fonts</b> &mdash; serves the fonts used on this website.</li>
+<li><b>Google Forms</b> &mdash; hosts the contact form.</li>
+</ul>
+<p>We do not sell your personal information and do not share it for cross-context
+behavioral advertising. Donations, if you make one, go through your own Venmo
+account; no payment details pass through us.</p>
 
 <h4>Data retention</h4>
-<p>We keep account and agreement records for as long as your account exists and
-as needed for our legal and operational purposes, then delete or anonymize them.
-Cloud-storage files are kept until you delete them or close your account.</p>
+<p>We keep account and download-agreement records for as long as your account or
+the record is needed for our legal and operational purposes, then delete or
+anonymize them. Email-verification codes are short-lived and single-use, and
+analytics records are anonymous.</p>
 
 <h4>Security</h4>
 <p>We use reasonable measures to protect your information, including hashing
-passwords and serving the site and APIs over HTTPS. No system is perfectly
-secure, so we cannot guarantee absolute security.</p>
+passwords, storing verification codes only as hashes, and serving the site and
+APIs over HTTPS. No system is perfectly secure, so we cannot guarantee absolute
+security.</p>
 
 <h4>Your California privacy rights</h4>
 <p>If you are a California resident, you have the right to know what personal
 information we collect and how we use it, to request a copy, to ask us to correct
-or delete it, and to not be discriminated against for exercising these rights.
+or delete it, and not to be discriminated against for exercising these rights.
 Because we do not sell or share your personal information for cross-context
-behavioral advertising, there is nothing to opt out of, but you may still
-contact us to exercise any of these rights, and we will verify and
-respond as required by law.</p>
+behavioral advertising, there is nothing to opt out of, but you may still contact
+us to exercise these rights and we will verify and respond as required by law.</p>
 
 <h4>Children</h4>
-<p>The Service is not directed to children under 13, and we do not knowingly
-collect their information. If you believe a child has given us information,
-contact us and we will delete it.</p>
+<p>The Service is intended for adults and is not directed to children. We do not
+knowingly collect information from anyone under 18. If you believe a minor has
+given us information, contact us and we will delete it.</p>
 
 <h4>Changes</h4>
 <p>We may update this policy; when we do, we will change the date above.
@@ -1483,13 +1506,13 @@ use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjIC
 
 _TERMS_HTML = """
 <h3>Terms of Service</h3>
-<p class=leff>Last updated June 15, 2026 (version 2026-06-15)</p>
+<p class=leff>Last updated July 13, 2026 (version 2026-07-13)</p>
 <p>These Terms of Service ("Terms") are a binding agreement between you and the
-individual developer of PDF for Free ("we", "us", or "the Developer"). They
-cover the PDF for Free desktop application, this website, and any related cloud
-services (together, the "Service"). By checking "I agree" at download, or by
-downloading, installing, or using the Service, you accept these Terms and our
-Privacy Policy. If you do not agree, do not download or use the Service.</p>
+individual developer of PDF for Free ("we", "us", or "the Developer"). They cover
+the PDF for Free desktop application (for macOS and Windows) and this website
+(together, the "Service"). By checking "I agree" at download, or by downloading,
+installing, or using the Service, you accept these Terms and our Privacy Policy.
+If you do not agree, do not download or use the Service.</p>
 
 <h4>1. Eligibility</h4>
 <p>You must be at least 18 years old and able to form a binding contract to use
@@ -1503,56 +1526,42 @@ license to download and use the Service for your own document editing. We retain
 all right, title, and interest in the Service, including all intellectual
 property in it. These Terms grant you no rights except the license stated here.</p>
 
-<h4>3. What you may not do</h4>
+<h4>3. Acceptable use</h4>
 <p>You agree not to: (a) resell, sublicense, rent, or redistribute the Service;
-(b) use it for anything unlawful, infringing, or harmful; (c) upload to a cloud
-feature any content you do not have the right to process; (d) attempt to break,
+(b) use it for anything unlawful, infringing, or harmful; (c) attempt to break,
 overload, probe, or gain unauthorized access to the Service or its
-infrastructure; (e) circumvent or tamper with billing, usage limits, or
-security; (f) use the Service to build or train a competing product; or (g)
-remove or alter any notices, or misrepresent the Service as your own.</p>
+infrastructure; (d) circumvent or tamper with any security or access controls;
+(e) use the Service to build or train a competing product; or (f) remove or alter
+any notices, or misrepresent the Service as your own.</p>
 
-<h4>4. Your account</h4>
-<p>Using the app requires a free account. You agree to provide accurate
-information, to keep your password secure, and that you are responsible for all
-activity under your account. We may suspend or terminate accounts that violate
-these Terms, abuse the Service, or create risk for us or other users.</p>
+<h4>4. Your account (optional)</h4>
+<p>You do not need an account to use the app; it is fully functional without one.
+If you choose to create an account, you agree to provide accurate information, to
+keep your password secure, and that you are responsible for activity under your
+account. We may suspend or terminate accounts that violate these Terms, abuse the
+Service, or create risk for us or other users.</p>
 
-<h4>5. Free and paid features</h4>
-<p>The app and all PDF editing are free and will remain free. Cloud OCR (page
-processing via Google Document AI) and cloud storage are optional paid features,
-because they cost us money to run. Prices and limits are shown before you use a
-paid feature and may change on a going-forward basis.</p>
+<h4>5. Cost</h4>
+<p>The app and all of its PDF editing are free, and there are no paid features,
+subscriptions, or charges. If we ever offer an optional paid feature, we will show
+its price and terms before you use it, on a going-forward basis. Donations are
+voluntary and go through your own Venmo account.</p>
 
-<h4>6. Billing, auto-renewal, and cancellation</h4>
-<p>Paid features are billed through our third-party payment processor; we do not
-store your full card details. Pay-per-use charges (such as cloud OCR) are
-incurred as you use them. If a feature is offered as a recurring subscription
-(such as cloud storage), it will, consistent with California's Automatic
-Renewal Law, automatically renew at the stated price and interval until you
-cancel, and you may cancel at any time from your account settings or by emailing
-us, effective at the end of the current billing period.</p>
+<h4>6. Your files and content</h4>
+<p>You keep all ownership of the documents you edit; we claim no ownership of
+them. All editing, rendering, and OCR happen on your own device, and the app
+never sends your files, their contents, or your OCR results to us. You are solely
+responsible for your files, for having the right to use and edit them, and for
+keeping your own backups.</p>
 
-<h4>7. Refunds</h4>
-<p>Except where required by law, payments are non-refundable, including used
-pay-per-use charges and the current period of any subscription. If the law in
-your jurisdiction gives you a refund or cancellation right, that right applies.</p>
+<h4>7. Third-party services</h4>
+<p>The website and download service rely on third parties, including Railway
+(hosting), Cloudflare and Cloudflare R2 (content delivery and file hosting),
+Resend (sending verification email), Google Fonts, and Google Forms (the contact
+form). Your use of those is also subject to those providers' terms, and we are
+not responsible for their acts, omissions, or availability.</p>
 
-<h4>8. Your files and content</h4>
-<p>You keep all ownership of the documents you edit. We claim no ownership of
-them. You grant us only the limited permission needed to provide a feature you
-choose to use (for example, transmitting a page to cloud OCR, or storing a file
-you choose to sync). The app's local editing never sends your files to us. You
-are solely responsible for your files and for having the right to use and edit
-them.</p>
-
-<h4>9. Third-party services</h4>
-<p>The Service relies on third parties, including Google Document AI (cloud
-OCR), our hosting provider, our payment processor, and Venmo (donations). Your
-use of those features is also subject to those providers' terms, and we are not
-responsible for their acts, omissions, or availability.</p>
-
-<h4>10. Disclaimer of warranties</h4>
+<h4>8. Disclaimer of warranties</h4>
 <p>THE SERVICE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITH ALL FAULTS AND
 WITHOUT WARRANTY OF ANY KIND. TO THE FULLEST EXTENT PERMITTED BY LAW, WE DISCLAIM
 ALL WARRANTIES, EXPRESS OR IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A
@@ -1561,7 +1570,7 @@ SERVICE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR THAT IT WILL PRESERVE,
 EDIT, OR RENDER YOUR DOCUMENTS CORRECTLY. YOU USE THE SERVICE AT YOUR OWN RISK
 AND ARE RESPONSIBLE FOR KEEPING YOUR OWN BACKUPS.</p>
 
-<h4>11. Limitation of liability</h4>
+<h4>9. Limitation of liability</h4>
 <p>TO THE FULLEST EXTENT PERMITTED BY LAW, WE WILL NOT BE LIABLE FOR ANY
 INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR
 FOR ANY LOST PROFITS, DATA, OR DOCUMENTS, ARISING FROM OR RELATING TO THE
@@ -1570,50 +1579,50 @@ WILL NOT EXCEED THE GREATER OF THE AMOUNT YOU PAID US IN THE 12 MONTHS BEFORE TH
 CLAIM OR US$50. Some jurisdictions do not allow certain limitations, so parts of
 this section may not apply to you.</p>
 
-<h4>12. Indemnification</h4>
+<h4>10. Indemnification</h4>
 <p>You agree to indemnify, defend, and hold harmless the Developer from any
 claims, damages, liabilities, and expenses (including reasonable legal fees)
 arising from your use of the Service, your content, or your violation of these
 Terms, the law, or any third party's rights.</p>
 
-<h4>13. Termination</h4>
+<h4>11. Termination</h4>
 <p>You may stop using the Service at any time. We may suspend or end your access
 at any time, with or without notice, including if you violate these Terms.
-Sections that by their nature should survive (including 8-12, 14, and 15) survive
+Sections that by their nature should survive (including 6, 8-10, 12, and 13) survive
 termination.</p>
 
-<h4>14. Dispute resolution; arbitration; class-action waiver</h4>
+<h4>12. Dispute resolution; arbitration; class-action waiver</h4>
 <p>Please read this carefully; it affects your rights. You and the Developer
-agree to first try to resolve any dispute informally by email. If that fails,
+agree to first try to resolve any dispute informally through our contact form. If that fails,
 any dispute arising out of or relating to the Service or these Terms will be
 resolved by binding individual arbitration administered by a recognized
 arbitration provider under its consumer rules, seated in California, rather than
 in court, except that either party may bring an individual claim in small-claims
 court. TO THE EXTENT PERMITTED BY LAW, YOU AND THE DEVELOPER WAIVE ANY RIGHT TO A
 JURY TRIAL AND ANY RIGHT TO BRING OR PARTICIPATE IN A CLASS, COLLECTIVE, OR
-REPRESENTATIVE ACTION. You may opt out of this arbitration agreement by emailing
-us within 30 days of first accepting these Terms.</p>
+REPRESENTATIVE ACTION. You may opt out of this arbitration agreement by contacting
+us through our contact form within 30 days of first accepting these Terms.</p>
 
-<h4>15. Governing law</h4>
+<h4>13. Governing law</h4>
 <p>These Terms are governed by the laws of the State of California, without
 regard to its conflict-of-laws rules. For any matter not subject to arbitration,
 you agree to the exclusive jurisdiction and venue of the state and federal courts
 located in California.</p>
 
-<h4>16. Changes to these Terms</h4>
+<h4>14. Changes to these Terms</h4>
 <p>We may update these Terms as the project evolves. When we make material
 changes we will update the date and version above, and continued use after that
 means you accept the updated Terms. The download gate records which version you
 agreed to.</p>
 
-<h4>17. General</h4>
+<h4>15. General</h4>
 <p>These Terms and the Privacy Policy are the entire agreement between us about
 the Service. If any provision is unenforceable, the rest stays in effect. Our
 failure to enforce a provision is not a waiver. You may not assign these Terms;
 we may. We are not liable for delays or failures caused by events beyond our
 reasonable control.</p>
 
-<h4>18. Copyright and DMCA notices</h4>
+<h4>16. Copyright and DMCA notices</h4>
 <p>We respect intellectual property rights and respond to clear notices of
 alleged copyright infringement that comply with the Digital Millennium Copyright
 Act (DMCA). Our agent designated to receive notifications of claimed infringement
@@ -1634,7 +1643,7 @@ owner's behalf. A notice missing these elements may not be valid.</p>
 <p>We may remove or disable access to material claimed to be infringing, and in
 appropriate circumstances we will terminate the accounts of repeat infringers.</p>
 
-<h4>19. Contact</h4>
+<h4>17. Contact</h4>
 <p>Questions about these Terms? Use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
