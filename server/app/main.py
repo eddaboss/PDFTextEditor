@@ -1613,7 +1613,28 @@ failure to enforce a provision is not a waiver. You may not assign these Terms;
 we may. We are not liable for delays or failures caused by events beyond our
 reasonable control.</p>
 
-<h4>18. Contact</h4>
+<h4>18. Copyright and DMCA notices</h4>
+<p>We respect intellectual property rights and respond to clear notices of
+alleged copyright infringement that comply with the Digital Millennium Copyright
+Act (DMCA). Our agent designated to receive notifications of claimed infringement
+is registered with the U.S. Copyright Office under registration number
+DMCA-1075531; the designated agent's full contact details are on file and
+publicly available in the Copyright Office's Directory of Designated Agents.</p>
+<p>To report material you believe infringes your copyright, send a notice through
+our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>
+(choose &ldquo;Copyright or DMCA notice&rdquo;) that includes: (a) your physical or
+electronic signature; (b) identification of the copyrighted work you claim has
+been infringed; (c) identification of the material you claim is infringing and
+information reasonably sufficient to let us locate it; (d) your contact
+information; (e) a statement that you have a good-faith belief that the use is
+not authorized by the copyright owner, its agent, or the law; and (f) a
+statement, made under penalty of perjury, that the information in your notice is
+accurate and that you are the copyright owner or are authorized to act on the
+owner's behalf. A notice missing these elements may not be valid.</p>
+<p>We may remove or disable access to material claimed to be infringing, and in
+appropriate circumstances we will terminate the accounts of repeat infringers.</p>
+
+<h4>19. Contact</h4>
 <p>Questions about these Terms? Use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
