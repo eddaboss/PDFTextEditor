@@ -30,7 +30,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import accounts, models, r2, security
+from . import accounts, models, r2, security, track
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
                      METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
                      TARGETS_DIR, UPDATES_DIR, ensure_dirs)
@@ -94,6 +94,19 @@ async def _site_gate(request: Request, call_next):
     if request.url.path.startswith(_GATE_OPEN_PREFIXES) or _gate_ok(request):
         return await call_next(request)
     return HTMLResponse(_login_page(), status_code=401)
+
+
+@app.middleware("http")
+async def _visitor_cookie(request: Request, call_next):
+    """Give every browser a stable anonymous id so page views, downloads, and the
+    agreement can be stitched into one funnel. Defined AFTER the gate so it runs
+    outermost and stamps the cookie on every response. httponly: the server reads
+    it (the sendBeacon carries it automatically); page JS never needs it."""
+    resp = await call_next(request)
+    if not request.cookies.get(track.VID_COOKIE):
+        resp.set_cookie(track.VID_COOKIE, track.new_vid(),
+                        max_age=60 * 60 * 24 * 365, httponly=True, samesite="lax")
+    return resp
 
 
 @app.post("/_gate/login")
@@ -227,20 +240,23 @@ def me(user: "models.User" = Depends(current_user)) -> dict:
 
 # --- installers + download page --------------------------------------------
 @app.get("/download/{filename}")
-def download(filename: str):
+def download(filename: str, request: Request, db: Session = Depends(get_db)):
     # basename only: no path traversal can escape the installers dir.
     safe = os.path.basename(filename)
     if safe != filename:
         raise HTTPException(404, "Not found.")
-    # Offloaded to R2 (free egress) when present; else served from the volume.
     key = f"{CHANNEL}/installers/{safe}"
-    if r2.exists(key):
+    from_r2 = r2.exists(key)
+    if not from_r2 and not (INSTALLERS_DIR / safe).is_file():
+        raise HTTPException(404, "Not found.")
+    # Count the real download (not 404s), with the platform read off the filename.
+    track.record(db, request, "download", path=f"/download/{safe}",
+                 platform=track.platform_from_name(safe))
+    # Offloaded to R2 (free egress) when present; else served from the volume.
+    if from_r2:
         return RedirectResponse(r2.presigned_get(key), status_code=302,
                                 headers={"Cache-Control": "no-store"})
-    path = INSTALLERS_DIR / safe
-    if not path.is_file():
-        raise HTTPException(404, "Not found.")
-    return FileResponse(str(path), filename=safe,
+    return FileResponse(str(INSTALLERS_DIR / safe), filename=safe,
                         media_type="application/octet-stream")
 
 
@@ -271,6 +287,7 @@ def record_consent(body: ConsentIn, request: Request,
         terms_version=TERMS_VERSION,
         ip=ip,
         user_agent=request.headers.get("user-agent", "")[:1000],
+        visitor_id=track.visitor_id(request),
     ))
     db.commit()
     info = (json.loads(RELEASE_INFO.read_text("utf-8"))
@@ -280,6 +297,22 @@ def record_consent(body: ConsentIn, request: Request,
     return {"ok": True, "terms_version": TERMS_VERSION,
             "has_account": account is not None,
             "mac": info.get("mac"), "windows": info.get("windows")}
+
+
+class TrackIn(BaseModel):
+    path: str = ""
+    ref: str = ""
+
+
+@app.post("/api/track")
+def api_track(body: TrackIn, request: Request,
+              db: Session = Depends(get_db)) -> dict:
+    """Record an anonymous page view -- a sendBeacon fires on every page load.
+    Public + best-effort: never raises, stores no PII beyond the CF-derived city.
+    Only a same-origin path is kept (never a full URL)."""
+    path = body.path if body.path.startswith("/") else "/"
+    track.record(db, request, "pageview", path=path, referrer=body.ref)
+    return {"ok": True}
 
 
 GITHUB_URL = "https://github.com/eddaboss/PDFTextEditor"
@@ -1095,6 +1128,8 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
   items.forEach(function(el){io.observe(el);});
 })();
 </script>
+<script>/* anonymous page-view beacon (no PII; geo added server-side from CF) */
+try{navigator.sendBeacon('/api/track',new Blob([JSON.stringify({path:location.pathname,ref:document.referrer})],{type:'application/json'}))}catch(e){}</script>
 </body></html>"""
 
 # small inline SVGs reused via token replacement (keeps the markup readable)

@@ -102,6 +102,14 @@ def run_migrations(engine) -> None:
     if "email_verified_at" not in cols:
         stmts.append(f"ALTER TABLE users ADD COLUMN email_verified_at {ts_type}")
 
+    # consents predates the analytics funnel; give it the visitor_id column so a
+    # download agreement can be tied back to the anonymous browser that made it.
+    if "consents" in tables:
+        ccols = {c["name"] for c in insp.get_columns("consents")}
+        if "visitor_id" not in ccols:
+            stmts.append("ALTER TABLE consents ADD COLUMN visitor_id "
+                         "VARCHAR(36) NOT NULL DEFAULT ''")
+
     if stmts:
         with engine.begin() as conn:
             for sql in stmts:

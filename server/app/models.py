@@ -44,5 +44,38 @@ class Consent(Base):
     terms_version: Mapped[str] = mapped_column(String(32))
     ip: Mapped[str] = mapped_column(String(64), default="")
     user_agent: Mapped[str] = mapped_column(Text, default="")
+    # The anonymous analytics cookie of the browser that agreed, so the metrics
+    # dashboard can stitch the funnel visit -> download -> account. Added to the
+    # existing table by account_models.run_migrations().
+    visitor_id: Mapped[str] = mapped_column(String(36), default="", index=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now())
+
+
+class Event(Base):
+    """One analytics event -- a page view, a download, or a desktop update
+    check-in. Anonymous by design: keyed by a random ``visitor_id`` cookie, never
+    an email. Powers the private metrics dashboard (visits vs downloads, geo,
+    the visit->download->signup funnel, active installs). New table, so
+    ``Base.metadata.create_all`` builds it; no migration needed."""
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True)
+    # "pageview" (a site visit), "download" (an installer fetch), or "ping" (the
+    # desktop updater checking in -- a live-install signal).
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    visitor_id: Mapped[str] = mapped_column(String(36), default="", index=True)
+    path: Mapped[str] = mapped_column(String(255), default="")
+    referrer: Mapped[str] = mapped_column(String(512), default="")
+    # From Cloudflare's visitor-location headers (needs the "Add visitor location
+    # headers" managed transform on). country is ISO-2.
+    country: Mapped[str] = mapped_column(String(2), default="", index=True)
+    region: Mapped[str] = mapped_column(String(80), default="")
+    city: Mapped[str] = mapped_column(String(128), default="")
+    platform: Mapped[str] = mapped_column(String(16), default="")  # mac|windows|other
+    app_version: Mapped[str] = mapped_column(String(32), default="")
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
