@@ -10,6 +10,7 @@ One small, public API per environment. Responsibilities:
   * A token-auth publish flow so the release pipeline can push a new signed
     release onto the persistent volume.
 """
+import datetime
 import hashlib
 import hmac
 import html
@@ -27,10 +28,11 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from . import accounts, metrics, models, r2, security, track
+from . import accounts, emailer, metrics, models, r2, security, track
+from .account_models import GateCode, utcnow
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
                      METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
                      TARGETS_DIR, UPDATES_DIR, ensure_dirs)
@@ -268,37 +270,111 @@ class ConsentIn(BaseModel):
     agreed: bool
 
 
+class GateVerifyIn(BaseModel):
+    email: EmailStr
+    code: str = ""
+
+
+def _client_ip(request: Request) -> str:
+    # X-Forwarded-For is set by Railway's proxy; take the first hop.
+    fwd = request.headers.get("x-forwarded-for", "")
+    return (fwd.split(",")[0].strip() if fwd
+            else (request.client.host if request.client else ""))[:64]
+
+
+def _release_files() -> dict:
+    info = (json.loads(RELEASE_INFO.read_text("utf-8"))
+            if RELEASE_INFO.exists() else {})
+    return {"mac": info.get("mac"), "windows": info.get("windows")}
+
+
+def _record_consent(db, email, account, request, *, verified: bool) -> None:
+    """Write the provable agreement record for this email."""
+    db.add(models.Consent(
+        email=email, account_id=account.id if account else None,
+        terms_version=TERMS_VERSION, ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent", "")[:1000],
+        email_verified=verified,
+        visitor_id=track.visitor_id(request)))
+    db.commit()
+
+
+_GATE_CODE_TTL = datetime.timedelta(minutes=10)
+
+
+def _send_gate_code(db, email: str, request: Request) -> None:
+    """Email a fresh 6-digit code, unless one was sent seconds ago (anti-spam).
+    The code (not the send) is what gates the download, so a delivery failure is
+    logged, never raised."""
+    latest = db.scalar(select(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None))
+        .order_by(GateCode.id.desc()))
+    if latest and (utcnow() - latest.created_at).total_seconds() < 30:
+        return                       # just sent one; don't spam the inbox
+    db.execute(delete(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None)))
+    display, code_hash = security.new_gate_code()
+    db.add(GateCode(email=email, code_hash=code_hash,
+                    expires_at=utcnow() + _GATE_CODE_TTL))
+    db.commit()
+    text_body = (f"Your PDF for Free download code is {display}.\n\n"
+                 f"It expires in 10 minutes. If you did not request it, you can "
+                 f"ignore this email.")
+    html_body = (
+        '<div style="font-family:system-ui,sans-serif;font-size:15px;color:#2A2520">'
+        'Your PDF for Free download code:'
+        f'<div style="font-size:32px;font-weight:700;letter-spacing:.22em;'
+        f'margin:14px 0;color:#AA4E2C">{display}</div>'
+        'It expires in 10 minutes. If you did not request it, ignore this email.'
+        '</div>')
+    try:
+        emailer.send_email(email, "Your PDF for Free download code",
+                           text_body, html_body)
+    except Exception:
+        log.warning("gate code email failed to send")
+
+
 @app.post("/api/consent")
 def record_consent(body: ConsentIn, request: Request,
                    db: Session = Depends(get_db)) -> dict:
-    """Record that someone agreed to the Terms + Privacy before downloading.
-    Keyed by email and linked to an account if one already exists with that
-    email (otherwise linked later, at register). Returns the installer file
-    names so the client can start the download."""
+    """Step 1 of the download gate. An existing-account email takes the password
+    path (which proves the address), so its agreement is recorded now. A NEW
+    visitor is emailed a 6-digit code; their agreement is recorded only once they
+    verify it via /api/gate/verify."""
     if not body.agreed:
         raise HTTPException(400, "You must agree to the Terms to download.")
     email = body.email.lower().strip()
-    # X-Forwarded-For is set by Railway's proxy; take the first hop.
-    fwd = request.headers.get("x-forwarded-for", "")
-    ip = (fwd.split(",")[0].strip() if fwd
-          else (request.client.host if request.client else ""))[:64]
     account = db.scalar(select(models.User).where(models.User.email == email))
-    db.add(models.Consent(
-        email=email,
-        account_id=account.id if account else None,
-        terms_version=TERMS_VERSION,
-        ip=ip,
-        user_agent=request.headers.get("user-agent", "")[:1000],
-        visitor_id=track.visitor_id(request),
-    ))
-    db.commit()
-    info = (json.loads(RELEASE_INFO.read_text("utf-8"))
-            if RELEASE_INFO.exists() else {})
-    # has_account tells the gate whether to ask for a password (an account uses
-    # this email) or send a brand-new visitor straight to the download.
-    return {"ok": True, "terms_version": TERMS_VERSION,
-            "has_account": account is not None,
-            "mac": info.get("mac"), "windows": info.get("windows")}
+    if account is not None:
+        _record_consent(db, email, account, request, verified=True)
+        return {"ok": True, "has_account": True}
+    _send_gate_code(db, email, request)
+    return {"ok": True, "has_account": False, "needs_code": True}
+
+
+@app.post("/api/gate/verify")
+def gate_verify(body: GateVerifyIn, request: Request,
+                db: Session = Depends(get_db)) -> dict:
+    """Step 2: check the emailed 6-digit code, record the VERIFIED agreement, and
+    return the installer names so the download can start."""
+    email = body.email.lower().strip()
+    row = db.scalar(select(GateCode).where(
+        GateCode.email == email, GateCode.used_at.is_(None))
+        .order_by(GateCode.id.desc()))
+    now = utcnow()
+    if row is None or row.expires_at < now:
+        raise HTTPException(400, "That code has expired -- request a new one.")
+    if row.attempts >= 5:
+        raise HTTPException(429, "Too many tries -- request a new code.")
+    if not hmac.compare_digest(row.code_hash,
+                               security.hash_gate_code(body.code)):
+        row.attempts += 1
+        db.commit()
+        raise HTTPException(400, "That code is not right.")
+    row.used_at = now
+    account = db.scalar(select(models.User).where(models.User.email == email))
+    _record_consent(db, email, account, request, verified=True)
+    return {"ok": True, **_release_files()}
 
 
 class TrackIn(BaseModel):
@@ -1004,9 +1080,11 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     <p class=dlintro id=dlintro>Add your email and agree to the terms. We link the agreement to your account so it stays on record.</p>
     <input class=dlfield type=email id=dlemail placeholder="you@example.com" autocomplete=email>
     <input class=dlfield type=password id=dlpw placeholder="Your password" autocomplete=current-password hidden>
+    <input class=dlfield type=text inputmode=numeric id=dlcodein placeholder="6-digit code" autocomplete=one-time-code maxlength=6 hidden>
     <label class=dlcheck id=dlagreerow><input type=checkbox id=dlagree> <span>I have read and agree to the <button type=button class=inlinelink data-legal=terms>Terms</button> and <button type=button class=inlinelink data-legal=privacy>Privacy Policy</button>.</span></label>
     <button class="btn dlgo" type=button id=dlgo disabled>Agree &amp; continue</button>
     <a id=dlforgot href="/forgot" style="display:none;font-size:13px;margin-top:10px;color:var(--clay-press);text-decoration:none">Forgot your password?</a>
+    <button type=button id=dlresend class=inlinelink style="display:none;margin-top:10px;font-size:13px;color:var(--clay-press)">Resend the code</button>
     <p class=dlerr id=dlerr hidden></p>
     <div id=dlcode hidden style="margin-top:6px"></div>
   </div>
@@ -1018,19 +1096,27 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
       go=document.getElementById('dlgo'),err=document.getElementById('dlerr'),
       title=document.getElementById('dltitle'),intro=document.getElementById('dlintro'),
       agreerow=document.getElementById('dlagreerow'),forgot=document.getElementById('dlforgot'),
-      codebox=document.getElementById('dlcode'),target=null,stage='consent';
+      codebox=document.getElementById('dlcode'),codein=document.getElementById('dlcodein'),
+      resend=document.getElementById('dlresend'),target=null,stage='consent';
   function emailok(){return /\S+@\S+\.\S+/.test(email.value.trim());}
-  function valid(){return stage==='password'?pw.value.length>0:(agree.checked&&emailok());}
+  function valid(){if(stage==='code')return /^[0-9]{6}$/.test(codein.value.trim());
+    return stage==='password'?pw.value.length>0:(agree.checked&&emailok());}
   function sync(){go.disabled=!valid();}
   email.addEventListener('input',sync);agree.addEventListener('change',sync);pw.addEventListener('input',sync);
   email.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
   pw.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
+  codein.addEventListener('input',sync);
+  codein.addEventListener('keydown',function(e){if(e.key==='Enter'&&valid())go.click();});
+  resend.addEventListener('click',function(){resend.disabled=true;resend.textContent='Sent';
+    jpost('/api/consent',{email:email.value.trim(),agreed:true}).catch(function(){});
+    setTimeout(function(){resend.disabled=false;resend.textContent='Resend the code';},20000);});
   function resetCard(url){
     target=url;stage='consent';err.hidden=true;codebox.hidden=true;codebox.innerHTML='';
     title.textContent='Before you download';
     intro.textContent='Add your email and agree to the terms. We link the agreement to your account so it stays on record.';
     intro.style.display='';email.style.display='';email.disabled=false;
-    pw.hidden=true;pw.value='';forgot.style.display='none';agreerow.style.display='';
+    pw.hidden=true;pw.value='';codein.hidden=true;codein.value='';resend.style.display='none';
+    forgot.style.display='none';agreerow.style.display='';
     go.style.display='';go.textContent='Agree & continue';sync();
   }
   function open(url){resetCard(url);m.hidden=false;document.body.style.overflow='hidden';
@@ -1055,10 +1141,18 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     pw.hidden=false;forgot.style.display='inline-block';go.textContent='Sign in & download';
     err.hidden=true;sync();setTimeout(function(){pw.focus();},30);
   }
+  function toCode(){
+    stage='code';agreerow.style.display='none';email.disabled=true;pw.hidden=true;
+    title.textContent='Check your email';
+    intro.textContent='We emailed a 6-digit code to '+email.value.trim()+'. Enter it to download.';
+    codein.hidden=false;resend.style.display='inline-block';go.textContent='Verify & download';
+    err.hidden=true;sync();setTimeout(function(){codein.focus();},30);
+  }
   function newUser(){
     download();title.textContent='Your download is starting';
     intro.innerHTML='No account uses this email yet. Open the app to create one, or <a href="/signup?email='+encodeURIComponent(email.value.trim())+'" style="color:var(--clay-press)">create it on the web</a>.';
-    email.style.display='none';agreerow.style.display='none';go.style.display='none';err.hidden=true;
+    email.style.display='none';agreerow.style.display='none';go.style.display='none';
+    codein.hidden=true;resend.style.display='none';err.hidden=true;
   }
   function showCode(code){
     download();title.textContent="You're signed in";intro.style.display='none';
@@ -1074,8 +1168,13 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     if(stage==='consent'){
       go.disabled=true;go.textContent='One sec...';err.hidden=true;
       jpost('/api/consent',{email:email.value.trim(),agreed:true}).then(function(d){
-        if(d&&d.has_account){toPassword();}else{newUser();}
+        if(d&&d.has_account){toPassword();}else{toCode();}
       }).catch(function(e2){go.textContent='Agree & continue';fail(e2.message);});
+    }else if(stage==='code'){
+      go.disabled=true;go.textContent='Verifying...';err.hidden=true;
+      jpost('/api/gate/verify',{email:email.value.trim(),code:codein.value.trim()}).then(function(){
+        newUser();
+      }).catch(function(e2){go.textContent='Verify & download';fail(e2.message);});
     }else{
       go.disabled=true;go.textContent='Signing in...';err.hidden=true;
       jpost('/api/auth/login',{email:email.value.trim(),password:pw.value}).then(function(d){
@@ -1336,8 +1435,8 @@ def _load_copy() -> dict:
 
 
 # Legal copy shown in the Privacy / Terms modal. Plain-language and grounded in
-# what the app actually does. Edit the wording here; set edw.luko@gmail.com
-# (and, if you want one, a governing-law line) before going live.
+# what the app actually does. Edit the wording here; the Contact sections point
+# to the public contact form (no personal email or name in the repo).
 _PRIVACY_HTML = """
 <h3>Privacy Policy</h3>
 <p class=leff>Last updated June 15, 2026</p>
@@ -1402,7 +1501,7 @@ information we collect and how we use it, to request a copy, to ask us to correc
 or delete it, and to not be discriminated against for exercising these rights.
 Because we do not sell or share your personal information for cross-context
 behavioral advertising, there is nothing to opt out of, but you may still
-contact us to exercise any of these rights. Email us and we will verify and
+contact us to exercise any of these rights, and we will verify and
 respond as required by law.</p>
 
 <h4>Children</h4>
@@ -1416,7 +1515,7 @@ Significant changes will be made clear on this page.</p>
 
 <h4>Contact</h4>
 <p>To exercise your rights, request deletion, or ask any question about privacy,
-email edw.luko@gmail.com.</p>
+use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 _TERMS_HTML = """
@@ -1551,8 +1650,29 @@ failure to enforce a provision is not a waiver. You may not assign these Terms;
 we may. We are not liable for delays or failures caused by events beyond our
 reasonable control.</p>
 
-<h4>18. Contact</h4>
-<p>Questions about these Terms? Email edw.luko@gmail.com.</p>
+<h4>18. Copyright and DMCA notices</h4>
+<p>We respect intellectual property rights and respond to clear notices of
+alleged copyright infringement that comply with the Digital Millennium Copyright
+Act (DMCA). Our agent designated to receive notifications of claimed infringement
+is registered with the U.S. Copyright Office under registration number
+DMCA-1075531; the designated agent's full contact details are on file and
+publicly available in the Copyright Office's Directory of Designated Agents.</p>
+<p>To report material you believe infringes your copyright, send a notice through
+our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>
+(choose &ldquo;Copyright or DMCA notice&rdquo;) that includes: (a) your physical or
+electronic signature; (b) identification of the copyrighted work you claim has
+been infringed; (c) identification of the material you claim is infringing and
+information reasonably sufficient to let us locate it; (d) your contact
+information; (e) a statement that you have a good-faith belief that the use is
+not authorized by the copyright owner, its agent, or the law; and (f) a
+statement, made under penalty of perjury, that the information in your notice is
+accurate and that you are the copyright owner or are authorized to act on the
+owner's behalf. A notice missing these elements may not be valid.</p>
+<p>We may remove or disable access to material claimed to be infringing, and in
+appropriate circumstances we will terminate the accounts of repeat infringers.</p>
+
+<h4>19. Contact</h4>
+<p>Questions about these Terms? Use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 
