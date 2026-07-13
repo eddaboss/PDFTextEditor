@@ -207,6 +207,16 @@ def register(body: RegisterIn, db: Session = Depends(get_db)) -> dict:
         models.Consent.email == email,
         models.Consent.account_id.is_(None),
     ).update({models.Consent.account_id: user.id})
+    # The download gate already proved this email with the 6-digit code, so a new
+    # account for that same address starts confirmed -- don't make them verify the
+    # same email twice. (The client's follow-up verify/send then no-ops.)
+    proven = db.scalar(select(models.Consent.id).where(
+        models.Consent.email == email,
+        models.Consent.email_verified.is_(True),
+    ))
+    if proven is not None:
+        user.email_verified = True
+        user.email_verified_at = datetime.datetime.now(datetime.timezone.utc)
     db.commit()
     return {"token": security.make_token(user.id, user.email),
             "user": _user_public(user)}
