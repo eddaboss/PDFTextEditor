@@ -1398,8 +1398,8 @@ def _load_copy() -> dict:
 
 
 # Legal copy shown in the Privacy / Terms modal. Plain-language and grounded in
-# what the app actually does. Edit the wording here; set edw.luko@gmail.com
-# (and, if you want one, a governing-law line) before going live.
+# what the app actually does. Edit the wording here; the Contact sections point
+# to the public contact form (no personal email or name in the repo).
 _PRIVACY_HTML = """
 <h3>Privacy Policy</h3>
 <p class=leff>Last updated June 15, 2026</p>
@@ -1464,7 +1464,7 @@ information we collect and how we use it, to request a copy, to ask us to correc
 or delete it, and to not be discriminated against for exercising these rights.
 Because we do not sell or share your personal information for cross-context
 behavioral advertising, there is nothing to opt out of, but you may still
-contact us to exercise any of these rights. Email us and we will verify and
+contact us to exercise any of these rights, and we will verify and
 respond as required by law.</p>
 
 <h4>Children</h4>
@@ -1478,7 +1478,7 @@ Significant changes will be made clear on this page.</p>
 
 <h4>Contact</h4>
 <p>To exercise your rights, request deletion, or ask any question about privacy,
-email edw.luko@gmail.com.</p>
+use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 _TERMS_HTML = """
@@ -1614,7 +1614,7 @@ we may. We are not liable for delays or failures caused by events beyond our
 reasonable control.</p>
 
 <h4>18. Contact</h4>
-<p>Questions about these Terms? Email edw.luko@gmail.com.</p>
+<p>Questions about these Terms? Use our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>.</p>
 """
 
 
