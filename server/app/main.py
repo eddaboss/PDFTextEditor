@@ -1436,7 +1436,9 @@ def _load_copy() -> dict:
 
 # Legal copy shown in the Privacy / Terms modal. Plain-language and grounded in
 # what the app actually does. Edit the wording here; the Contact sections point
-# to the public contact form (no personal email or name in the repo).
+# to the public contact form (no personal email or name in the repo). The lone
+# exception is the DMCA designated agent in Terms sec. 16 -- a shared role inbox
+# (dmca@, no personal name) that safe harbor requires be displayed publicly.
 _PRIVACY_HTML = """
 <h3>Privacy Policy</h3>
 <p class=leff>Last updated July 13, 2026</p>
@@ -1671,11 +1673,17 @@ reasonable control.</p>
 alleged copyright infringement that comply with the Digital Millennium Copyright
 Act (DMCA). Our agent designated to receive notifications of claimed infringement
 is registered with the U.S. Copyright Office under registration number
-DMCA-1075531; the designated agent's full contact details are on file and
-publicly available in the Copyright Office's Directory of Designated Agents.</p>
-<p>To report material you believe infringes your copyright, send a notice through
-our <a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>
-(choose &ldquo;Copyright or DMCA notice&rdquo;) that includes: (a) your physical or
+DMCA-1075531, and can be reached directly at:</p>
+<p><b>Designated agent for copyright notices:</b><br>
+DMCA Agent<br>
+18034 Ventura Blvd, Unit #655<br>
+Encino, CA 91316, United States<br>
+Phone: (818) 794-0599<br>
+Email: <a href="mailto:dmca@hockeydatamodels.com">dmca@hockeydatamodels.com</a></p>
+<p>To report material you believe infringes your copyright, send a written notice
+to the designated agent above, or through our
+<a href="https://docs.google.com/forms/d/e/1FAIpQLSeLS7dXUPF8zk9zkzXZjICMv-Nl1NLQogI7hLfu1NTKQcYVew/viewform" target="_blank" rel="noopener">contact form</a>
+(choose &ldquo;Copyright or DMCA notice&rdquo;), that includes: (a) your physical or
 electronic signature; (b) identification of the copyrighted work you claim has
 been infringed; (c) identification of the material you claim is infringing and
 information reasonably sufficient to let us locate it; (d) your contact
