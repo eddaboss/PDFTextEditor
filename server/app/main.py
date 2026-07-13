@@ -30,7 +30,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import accounts, models, r2, security, track
+from . import accounts, metrics, models, r2, security, track
 from .config import (CHANNEL, DATA_DIR, ENV_NAME, INSTALLERS_DIR, JWT_SECRET,
                      METADATA_DIR, PUBLISH_TOKEN, RELEASE_INFO, SITE_PASSWORD,
                      TARGETS_DIR, UPDATES_DIR, ensure_dirs)
@@ -45,6 +45,8 @@ log = logging.getLogger("pdfte")
 # brute-force throttle, optional CORS, and the account pages) lives in
 # accounts.py and wires itself in with this one call.
 accounts.install(app)
+# Private TOTP-gated metrics dashboard (no-op until METRICS_TOTP_SECRET is set).
+metrics.install(app)
 
 
 @app.on_event("startup")
