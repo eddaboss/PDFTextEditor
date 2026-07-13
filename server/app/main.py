@@ -1411,9 +1411,11 @@ California.</p>
 <h4>Your PDFs never leave your device</h4>
 <p>All PDF editing, rendering, and OCR happen locally on your own computer. Your
 documents are never uploaded to us or anyone else. We do not see, receive, or
-store the files you edit, the text in them, or your OCR results. There are no
-cloud-editing, cloud-OCR, or cloud-storage features, so there is no exception to
-this.</p>
+store the files you edit, the text in them, or your OCR results. Optional cloud
+features (such as cloud OCR and cloud storage) are planned but not yet available;
+if you choose to use one after it launches, only the specific data you send to
+that feature would leave your device, and we will update this policy with the
+details before that happens.</p>
 
 <h4>What the app sends over the network</h4>
 <p>The app talks to our servers only to: (a) check for and download updates;
@@ -1542,17 +1544,22 @@ account. We may suspend or terminate accounts that violate these Terms, abuse th
 Service, or create risk for us or other users.</p>
 
 <h4>5. Cost</h4>
-<p>The app and all of its PDF editing are free, and there are no paid features,
-subscriptions, or charges. If we ever offer an optional paid feature, we will show
-its price and terms before you use it, on a going-forward basis. Donations are
-voluntary and go through your own Venmo account.</p>
+<p>The app and all of its PDF editing are free, and today there are no paid
+features, subscriptions, or charges. We plan to add optional paid features &mdash;
+cloud OCR for tough scans, and cloud storage to sync files across devices &mdash;
+because they cost us to run. When they launch they will be optional, the core app
+and its editing will stay free, and we will show each feature's price and terms
+before you use it. Donations are voluntary and go through your own Venmo account.</p>
 
 <h4>6. Your files and content</h4>
 <p>You keep all ownership of the documents you edit; we claim no ownership of
-them. All editing, rendering, and OCR happen on your own device, and the app
-never sends your files, their contents, or your OCR results to us. You are solely
-responsible for your files, for having the right to use and edit them, and for
-keeping your own backups.</p>
+them. Today all editing, rendering, and OCR happen on your own device, and the
+app never sends your files, their contents, or your OCR results to us. If we
+launch an optional cloud feature and you choose to use it, you would grant us only
+the limited permission needed to provide that feature (for example, sending a page
+to cloud OCR, or storing a file you choose to sync). You are solely responsible
+for your files, for having the right to use and edit them, and for keeping your
+own backups.</p>
 
 <h4>7. Third-party services</h4>
 <p>The website and download service rely on third parties, including Railway
