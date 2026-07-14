@@ -6588,12 +6588,20 @@ class PDFDocument:
     # Every staging method follows one rule (BUILD_SPEC §1.5): capture the
     # box's COMPLETE before-state, mutate staged state, push a _Command, clear
     # redo, set dirty. The private _command() helper does the snapshot + push so
-    # each mutator is a few lines. Existing spans key by (page, span.key);
+    # each mutator is a few lines. Existing spans key by (page, box.identity);
     # NewBoxes key by their edit_key.
+    #
+    # identity, NOT box.key: a ParagraphBox.key == its members[0] Span.key (both
+    # (block,line,span)), so on a dense form where a paragraph and an overlapping
+    # single line are both editable, keying _edits by box.key made their staged
+    # edits share ONE slot -- a commit on one clobbered the other and the edit
+    # reverted on reopen. identity is ("para",)-prefixed for a ParagraphBox so
+    # the two never collide. box.key is left untouched (redaction keys off the
+    # raw (block,line,span) via edited_keys, so it must stay the member indices).
 
     @staticmethod
     def _span_edit_key(page_index: int, span: Span) -> tuple:
-        return (page_index, span.key)
+        return (page_index, span.identity)
 
     def _span_state(self, key: tuple) -> _BoxState:
         """Snapshot an existing box's current staged state into a _BoxState."""
@@ -7997,7 +8005,7 @@ class PDFDocument:
         if isinstance(box, NewBox):
             cur = self._new_boxes.get(box.edit_key)
             return cur.text if cur is not None else box.text
-        edit = self._edits.get((page_index, box.key))
+        edit = self._edits.get(self._span_edit_key(page_index, box))
         return edit.effective_text(box) if edit is not None else box.text
 
     def editor_line_layout(self, page_index: int, box) -> list | None:
@@ -8017,7 +8025,7 @@ class PDFDocument:
             # which edits the block fine; the authoritative reflow happens in the
             # bake's paragraph raster on commit.
             return None
-        edit = self._edits.get((page_index, box.key))
+        edit = self._edits.get(self._span_edit_key(page_index, box))
         e = edit if edit is not None else Edit(span=box)
         result = self._wrap_for_edit_cached(page_index, box, e)
         out = []
@@ -8043,7 +8051,7 @@ class PDFDocument:
                 cur = self.seed_scan_style(cur)
             return {"font_family": cur.font_family, "size": cur.size,
                     "color": cur.color, "bold": cur.bold, "italic": cur.italic}
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         style = edit.style if edit is not None else StyleOverride()
         from .fonts import is_bold, is_italic
         orig_bold = is_bold(box.font, box.flags)
@@ -9329,7 +9337,7 @@ class PDFDocument:
             return cur.origin
         if isinstance(box, ExistingImage):
             return box.origin       # frozen file truth (moves are macros)
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None:
             return box.origin
         if getattr(box, "is_paragraph", False) or not box.is_horizontal:
@@ -9362,7 +9370,7 @@ class PDFDocument:
             return cur.rect
         if isinstance(box, ExistingImage):
             return box.rect         # frozen file truth (moves are macros)
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None or edit.is_noop:
             return box.bbox
         # A reflowing box (a ParagraphBox, OR any box the user RESIZED so box_w
@@ -9440,7 +9448,7 @@ class PDFDocument:
         # overflow cleanly instead of raising AttributeError for the UI to swallow.
         if isinstance(box, NewBox):
             return 0.0
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None or edit.is_noop:
             return 0.0
         result = self._wrap_for_edit_cached(page, box, edit)
