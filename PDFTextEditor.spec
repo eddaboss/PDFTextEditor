@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for "PDF Text Editor" -- ONE spec for macOS and Windows.
+"""PyInstaller spec for "PDF for Free" -- ONE spec for macOS and Windows.
 
 This is the single source of truth for the desktop build on both platforms. The
 shared Analysis / PYZ / EXE / COLLECT stages are identical everywhere; only the
@@ -8,7 +8,7 @@ final packaging differs by OS:
   * macOS   -> a .app BUNDLE carrying the Info.plist folder-access usage strings
               and the dark-appearance hint. Without them the Open dialog shows
               empty folders and a light title bar sits above the dark chrome.
-  * Windows -> the COLLECT output directory holding "PDF Text Editor.exe" (a
+  * Windows -> the COLLECT output directory holding "PDF for Free.exe" (a
               windowed, one-folder build). Inno Setup wraps that directory into
               the installer.
 
@@ -40,7 +40,11 @@ _CHANNEL = os.environ.get("PDFTE_BUILD_CHANNEL", "stable")
 _IS_DEV = _CHANNEL == "dev"
 with open("pdftexteditor/_build_channel.py", "w", encoding="utf-8") as _bc:
     _bc.write(f"CHANNEL = {_CHANNEL!r}\n")
-_NAME = "PDF Text Editor (Dev)" if _IS_DEV else "PDF Text Editor"
+# Display name only (the .app/.exe, dock, DMG volume, installer). The tufup
+# update id (appconfig.TUFUP_APP_NAME / repo_config.APP_NAME) and the bundle id
+# below stay "PDFTextEditor"/com.eddaboss.pdftexteditor so the update channel and
+# macOS app identity are unchanged.
+_NAME = "PDF for Free (Dev)" if _IS_DEV else "PDF for Free"
 _BUNDLE_ID = ("com.eddaboss.pdftexteditor.dev" if _IS_DEV
               else "com.eddaboss.pdftexteditor")
 
@@ -49,7 +53,7 @@ _BUNDLE_ID = ("com.eddaboss.pdftexteditor.dev" if _IS_DEV
 # missing other-OS icon file never breaks the build.
 _ICON = "assets/AppIcon.icns" if _IS_MAC else "assets/AppIcon.ico"
 
-_USAGE = "PDF Text Editor needs access so you can open and save your PDF files."
+_USAGE = "PDF for Free needs access so you can open and save your PDF files."
 
 # OCR runtime data: RapidOCR ships its PP-OCR detection/recognition/cls models as
 # .onnx PACKAGE DATA (~14 MB) and onnxruntime ships native provider libraries.
