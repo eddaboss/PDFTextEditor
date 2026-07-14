@@ -5410,6 +5410,8 @@ class PageView(QGraphicsView):
                 fmt.setForeground(QColor.fromRgbF(*rs.color))
             if rs is not None and getattr(rs, "underline", False):
                 fmt.setFontUnderline(True)
+            if rs is not None and getattr(rs, "strike", False):
+                fmt.setFontStrikeOut(True)
             cursor.mergeCharFormat(fmt)
             pos += len(text)
 
@@ -5448,6 +5450,7 @@ class PageView(QGraphicsView):
         base_bold, base_italic = base.bold(), base.italic()
         base_family = base.family()
         base_underline = base.underline()
+        base_strike = base.strikeOut()
         runs: list = []
         block = editor.document().begin()
         while block.isValid():
@@ -5480,6 +5483,7 @@ class PageView(QGraphicsView):
                     # whose hasProperty() is always False), so read it via fontUnderline();
                     # an unset fragment reports False, so only user-underlined runs carry it.
                     underline = bool(cf.fontUnderline()) or base_underline
+                    strike = bool(cf.fontStrikeOut()) or base_strike
                     color = family = None
                     if rich:
                         if cf.hasProperty(QTextFormat.ForegroundBrush):
@@ -5492,8 +5496,9 @@ class PageView(QGraphicsView):
                                    else fams if isinstance(fams, str) else None)
                             if fam and fam != base_family:
                                 family = fam
-                    rs = (RunStyle(font_family=family, color=color, underline=underline)
-                          if (underline or color is not None or family is not None)
+                    rs = (RunStyle(font_family=family, color=color, underline=underline,
+                                   strike=strike)
+                          if (underline or strike or color is not None or family is not None)
                           else None)
                     runs.append((text, bold, italic, rs) if rs is not None
                                 else (text, bold, italic))

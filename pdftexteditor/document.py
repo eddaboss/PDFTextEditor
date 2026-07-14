@@ -312,11 +312,12 @@ class RunStyle:
     font_family: str | None = None
     color: tuple | None = None          # (r, g, b) 0..1
     underline: bool = False             # per-run underline (vector text-layer spans)
+    strike: bool = False                # per-run strikethrough (vector text-layer spans)
 
     @property
     def is_empty(self) -> bool:
         return (self.font_family is None and self.color is None
-                and not self.underline)
+                and not self.underline and not self.strike)
 
 
 @dataclass(frozen=True)
@@ -9125,24 +9126,29 @@ class PDFDocument:
                 t, b, i = run[0], run[1], run[2]
                 rs = run[3] if len(run) > 3 else None
                 ul = bool(rs.underline) if rs is not None else False
+                st = bool(rs.strike) if rs is not None else False
                 rf_run = PDFDocument._resolve_run(engine, page_index, span,
                                                   edit, t, b, i)
                 fname = PDFDocument._register_resolved(engine, page, rf_run,
                                                        registered)
                 w = engine.fitz_font_for(rf_run).text_length(t, fontsize=size)
-                drawn.append((t, fname, w, ul))
+                drawn.append((t, fname, w, ul, st))
                 total_w += w
             origin = PDFDocument._maybe_recenter(page, span, edit, origin,
                                                  total_w)
             x, y = origin
             uls: list = []
-            for t, fname, w, ul in drawn:
+            sts: list = []
+            for t, fname, w, ul, st in drawn:
                 PDFDocument._insert_run(shape, (x, y), t, size, fname, color,
                                         span.dir)
                 if ul:
                     uls.append(((x, y), w, span.dir))
+                if st:
+                    sts.append(((x, y), w, span.dir))
                 x += w
             PDFDocument._stroke_underlines(shape, uls, size, color)
+            PDFDocument._stroke_strikes(shape, sts, size, color)
             return
         rf = PDFDocument._resolve_for_edit(engine, page_index, span, edit, text)
         fontname = PDFDocument._register_resolved(engine, page, rf, registered)
@@ -9240,33 +9246,35 @@ class PDFDocument:
         if edit.runs:
             reg = registered if registered is not None else set()
 
-            def _fields(run):                    # (text, bold, italic, underline)
+            def _fields(run):                    # (text, bold, italic, underline, strike)
                 rs = run[3] if len(run) > 3 else None
                 return (run[0], run[1], run[2],
-                        bool(rs.underline) if rs is not None else False)
+                        bool(rs.underline) if rs is not None else False,
+                        bool(rs.strike) if rs is not None else False)
             # One resolve/register per distinct style key, with ALL of that
             # style's text so glyph-coverage checks see every character. The key
-            # includes underline so a seg carries it to the stroke pass; the face
-            # itself resolves off (bold, italic) only (underline is drawn, not a face).
+            # includes underline/strike so a seg carries them to the stroke pass; the
+            # face itself resolves off (bold, italic) only (they are drawn, not a face).
             by_style: dict[tuple, list] = {}
             for run in edit.runs:
-                t, b, i, ul = _fields(run)
-                by_style.setdefault((b, i, ul), []).append(t)
+                t, b, i, ul, st = _fields(run)
+                by_style.setdefault((b, i, ul, st), []).append(t)
             fonts: dict[tuple, object] = {}
             fnames: dict[tuple, str] = {}
             for style_key, parts in by_style.items():
-                b, i, _ul = style_key
+                b, i, _ul, _st = style_key
                 rf_k = PDFDocument._resolve_run(engine, page_index, box, edit,
                                                 "".join(parts), b, i)
                 fnames[style_key] = PDFDocument._register_resolved(
                     engine, page, rf_k, reg)
                 fonts[style_key] = engine.fitz_font_for(rf_k)
             result = wrap_rich(
-                [(t, (b, i, ul)) for t, b, i, ul in map(_fields, edit.runs)],
+                [(t, (b, i, ul, st)) for t, b, i, ul, st in map(_fields, edit.runs)],
                 fonts, size, left, first_y, width, alignment=align,
                 leading=leading, line_spacing=spacing,
             )
             uls: list = []
+            sts: list = []
             for ln in result.lines:
                 for seg in ln.segments:
                     PDFDocument._insert_run(
@@ -9276,7 +9284,11 @@ class PDFDocument:
                     if seg.style[2]:             # underline flag in the style key
                         w = fonts[seg.style].text_length(seg.text, fontsize=size)
                         uls.append(((seg.x, ln.origin[1]), w, (1.0, 0.0)))
+                    if seg.style[3]:             # strike flag in the style key
+                        w = fonts[seg.style].text_length(seg.text, fontsize=size)
+                        sts.append(((seg.x, ln.origin[1]), w, (1.0, 0.0)))
             PDFDocument._stroke_underlines(shape, uls, size, color)
+            PDFDocument._stroke_strikes(shape, sts, size, color)
             return
 
         font = engine.fitz_font_for(rf)
@@ -9940,6 +9952,24 @@ class PDFDocument:
         off = 0.11 * size
         for (ox, oy), w, (dx, dy) in segs:
             px, py = -dy * off, dx * off        # down-perpendicular (PDF y-down)
+            shape.draw_line(fitz.Point(ox + px, oy + py),
+                            fitz.Point(ox + w * dx + px, oy + w * dy + py))
+        shape.finish(color=color, width=max(0.4, 0.055 * size))
+
+    @staticmethod
+    def _stroke_strikes(shape: "fitz.Shape", segs: list, size: float,
+                        color: tuple) -> None:
+        """Stroke a strikethrough THROUGH each run in ``segs`` = [(baseline_origin,
+        width, direction), ...] on the page's batch ``shape``. Twin of
+        ``_stroke_underlines`` but the line sits ~0.3*size ABOVE the baseline
+        (through the glyph body near x-height/2, at ``baseline_y - 0.3*size``),
+        PERPENDICULAR to the writing direction, thickness ~0.055*size. One
+        ``finish`` per call. No-op on an empty list."""
+        if not segs:
+            return
+        off = -0.3 * size                       # up-perpendicular (PDF y-down)
+        for (ox, oy), w, (dx, dy) in segs:
+            px, py = -dy * off, dx * off
             shape.draw_line(fitz.Point(ox + px, oy + py),
                             fitz.Point(ox + w * dx + px, oy + w * dy + py))
         shape.finish(color=color, width=max(0.4, 0.055 * size))
