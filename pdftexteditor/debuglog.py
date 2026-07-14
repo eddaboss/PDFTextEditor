@@ -7,8 +7,10 @@ when the editor opened/closed, when text or style changed, and -- crucially -- w
 MAP recomputed for that change. An action that moves characters but logs no following
 ``MAP remap`` is the bug.
 
-Always on; truncated at the start of each session. Local-only: lines may contain document
-text (truncated), so this is never sent anywhere.
+DEV builds only -- ``main()`` calls ``set_enabled(appconfig.IS_DEV or $PDFTE_DEBUG_LOG)``,
+so a stable build writes nothing (the trace can carry truncated document text, which must
+never hit disk in a potentially PHI-handling build). Truncated at the start of each
+session. Local-only: never sent anywhere.
 
 Usage:
     from .debuglog import log
@@ -31,11 +33,14 @@ _PATH = os.environ.get("PDFTE_DEBUG_LOG", "/tmp/pdfte_debug.log")
 _lock = threading.Lock()
 _seq = 0
 _t0 = time.monotonic()
-enabled = True
+enabled = False   # main() flips this on for DEV builds (see module docstring)
 
 
 def new_session() -> None:
-    """Truncate the log and write a session header (called once at app start)."""
+    """Truncate the log and write a session header (called once at app start).
+    No-op when logging is disabled, so a stable build never even touches the file."""
+    if not enabled:
+        return
     global _seq, _t0
     with _lock:
         _seq = 0
