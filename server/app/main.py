@@ -1463,7 +1463,7 @@ details before that happens.</p>
 you choose to create or sign in to an account, send the email, password, and
 display name you type. That is all. The app contains no analytics, telemetry,
 crash reporting, advertising, device fingerprinting, or &ldquo;phone-home&rdquo; of
-any kind, and an account is optional &mdash; the app is fully functional without
+any kind, and an account is optional; the app is fully functional without
 one.</p>
 
 <h4>Information we collect</h4>
@@ -1500,13 +1500,13 @@ cookies.</p>
 <p>We share information only with the service providers that make the Service
 work, each only for its part:</p>
 <ul>
-<li><b>Railway</b> &mdash; hosting for our website, API, and database.</li>
-<li><b>Cloudflare</b> &mdash; content delivery and security for the website, and
+<li><b>Railway</b>: hosting for our website, API, and database.</li>
+<li><b>Cloudflare</b>: content delivery and security for the website, and
 the approximate-location data used for analytics; <b>Cloudflare R2</b> stores and
 serves the app installers and update files.</li>
-<li><b>Resend</b> &mdash; sends the email-verification code and any account emails.</li>
-<li><b>Google Fonts</b> &mdash; serves the fonts used on this website.</li>
-<li><b>Google Forms</b> &mdash; hosts the contact form.</li>
+<li><b>Resend</b>: sends the email-verification code and any account emails.</li>
+<li><b>Google Fonts</b>: serves the fonts used on this website.</li>
+<li><b>Google Forms</b>: hosts the contact form.</li>
 </ul>
 <p>We do not sell your personal information and do not share it for cross-context
 behavioral advertising. Donations, if you make one, go through your own Venmo
@@ -1585,9 +1585,8 @@ Service, or create risk for us or other users.</p>
 
 <h4>5. Cost</h4>
 <p>The app and all of its PDF editing are free, and today there are no paid
-features, subscriptions, or charges. We plan to add optional paid features &mdash;
-cloud OCR for tough scans, and cloud storage to sync files across devices &mdash;
-because they cost us to run. When they launch they will be optional, the core app
+features, subscriptions, or charges. We plan to add optional paid features (cloud OCR for tough scans, and cloud storage to
+sync files across devices) because they cost us to run. When they launch they will be optional, the core app
 and its editing will stay free, and we will show each feature's price and terms
 before you use it. Donations are voluntary and go through your own Venmo account.</p>
 
