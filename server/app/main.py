@@ -422,7 +422,11 @@ DONATE_URL = os.environ.get("PDFTE_DONATE_URL",
 _PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>PDF for Free - the PDF editor that's actually free</title>
+<link rel="icon" href="/favicon.ico" sizes="32x32 48x48">
+<link rel="icon" type="image/png" sizes="96x96" href="/favicon-96.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/favicon-192.png">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="mask-icon" href="/favicon.svg" color="#C2643F">
 <meta name="theme-color" content="#C2643F">
 <meta name=description content="A free PDF editor for Mac and Windows. Retype text in place in the document's own font, OCR scans, sign, and reorder pages, all on your own computer. No subscription, no watermark, nothing uploaded.">
@@ -1772,6 +1776,32 @@ def og_image() -> FileResponse:
     return FileResponse(str(Path(__file__).parent / "og-image.png"),
                         media_type="image/png",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+def _asset(name: str, media: str) -> FileResponse:
+    return FileResponse(str(Path(__file__).parent / name), media_type=media,
+                        headers={"Cache-Control": "public, max-age=604800"})
+
+
+# Raster favicons: Google Search + older clients need a PNG/ICO, not the SVG.
+@app.get("/favicon.ico")
+def favicon_ico() -> FileResponse:
+    return _asset("favicon.ico", "image/x-icon")
+
+
+@app.get("/favicon-96.png")
+def favicon_96() -> FileResponse:
+    return _asset("favicon-96.png", "image/png")
+
+
+@app.get("/favicon-192.png")
+def favicon_192() -> FileResponse:
+    return _asset("favicon-192.png", "image/png")
+
+
+@app.get("/apple-touch-icon.png")
+def apple_touch_icon() -> FileResponse:
+    return _asset("apple-touch-icon.png", "image/png")
 
 
 @app.get("/robots.txt")
