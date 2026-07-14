@@ -11,10 +11,12 @@ live in users/consents and are only ever shown as COUNTS here.
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime
 import hashlib
 import hmac
 import html
+import logging
 import os
 import struct
 import time
@@ -28,16 +30,34 @@ from .config import JWT_SECRET
 from .db import get_db
 from .models import Consent, Event, User
 
+log = logging.getLogger("pdfte")
+
 PATH = "/0101-pdfte-metrics-0101"          # obscure + TOTP-gated
 _SECRET = os.environ.get("METRICS_TOTP_SECRET", "")
 _COOKIE = "pdfte_metrics"
 _SESSION_TTL = 8 * 60 * 60                  # 8h
 
 
+def _load_key(secret: str) -> bytes | None:
+    """Decode the base32 TOTP secret once. Returns None (dashboard stays off)
+    when it is unset or not valid base32, so a bad env var never 500s a request."""
+    if not secret:
+        return None
+    try:
+        return base64.b32decode(secret.upper() + "=" * (-len(secret) % 8))
+    except binascii.Error:
+        log.error("METRICS_TOTP_SECRET is not valid base32 (allowed characters: "
+                  "A-Z and 2-7) -- the metrics dashboard is disabled until it is "
+                  "set to a valid base32 value.")
+        return None
+
+
+_KEY = _load_key(_SECRET)
+
+
 # --- TOTP (RFC 6238, stdlib) + signed session ------------------------------
 def _totp(when: int, step: int = 30, digits: int = 6) -> str:
-    key = base64.b32decode(_SECRET.upper() + "=" * (-len(_SECRET) % 8))
-    mac = hmac.new(key, struct.pack(">Q", when // step), hashlib.sha1).digest()
+    mac = hmac.new(_KEY, struct.pack(">Q", when // step), hashlib.sha1).digest()
     off = mac[-1] & 0x0F
     code = (struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
     return str(code).zfill(digits)
@@ -45,7 +65,7 @@ def _totp(when: int, step: int = 30, digits: int = 6) -> str:
 
 def _totp_ok(code: str) -> bool:
     code = (code or "").strip()
-    if not (_SECRET and code.isdigit()):
+    if not (_KEY and code.isdigit()):
         return False
     now = int(time.time())
     return any(hmac.compare_digest(_totp(now + d * 30), code) for d in (-1, 0, 1))
@@ -235,14 +255,14 @@ _LOGIN = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <link rel=preconnect href="https://fonts.googleapis.com">
 <link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@700&family=Hanken+Grotesk:wght@400;600&display=swap" rel=stylesheet>
-<style>:root{--paper:#FBF9F5;--panel:#F5F1EA;--line:#E2DACD;--ink:#2A2520;--clay-fill:#AA4E2C;--clay-press:#8B3E23}
+<style>*{box-sizing:border-box}:root{--paper:#FBF9F5;--panel:#F5F1EA;--line:#E2DACD;--ink:#2A2520;--clay-fill:#AA4E2C;--clay-press:#8B3E23}
 body{margin:0;background:var(--paper);color:var(--ink);font-family:"Hanken Grotesk",system-ui,sans-serif;
 display:grid;place-items:center;height:100vh}
 form{background:var(--panel);border:1px solid var(--line);padding:30px;border-radius:18px;width:280px;
 text-align:center;box-shadow:0 10px 34px rgba(58,40,26,.10)}
 .t{font-family:"Bricolage Grotesque",system-ui,sans-serif;font-weight:700;font-size:20px;letter-spacing:-.02em}
 input{width:100%;padding:12px;margin:14px 0 4px;font-size:23px;text-align:center;letter-spacing:.32em;
-background:#fff;border:1px solid var(--line);border-radius:11px;color:var(--ink);font-family:inherit}
+text-indent:.32em;background:#fff;border:1px solid var(--line);border-radius:11px;color:var(--ink);font-family:inherit}
 input:focus{outline:3px solid rgba(194,100,63,.4);border-color:var(--clay-fill)}
 button{width:100%;padding:12px;margin-top:10px;background:var(--clay-fill);color:#fff;border:0;
 border-radius:11px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
@@ -254,8 +274,8 @@ button:hover{background:var(--clay-press)}.e{color:#B0341F;font-size:13px;min-he
 
 def install(app) -> None:
     """Wire the dashboard routes. No-op (route 404s) when the TOTP secret is
-    unset, so an un-provisioned deploy simply has no dashboard."""
-    if not _SECRET:
+    unset or invalid, so an un-provisioned deploy simply has no dashboard."""
+    if not _KEY:
         return
 
     @app.get(PATH, response_class=HTMLResponse)
