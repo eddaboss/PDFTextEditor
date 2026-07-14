@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from . import track
 from .config import JWT_SECRET
 from .db import get_db
 from .models import Consent, Event, User
@@ -172,9 +173,15 @@ def _row(label, val) -> str:
     return f"<tr><td>{html.escape(str(label))}</td><td class=n>{val}</td></tr>"
 
 
-def _page(s: dict) -> str:
+def _page(s: dict, excluded: bool = False) -> str:
     def pct(a, b):
         return f"{100*a/b:.1f}%" if b else "-"
+    if excluded:
+        optout = (f'This browser is <b>excluded</b> from these numbers &middot; '
+                  f'<a href="{PATH}/include">count it again</a>')
+    else:
+        optout = (f'This browser is counted &middot; '
+                  f'<a href="{PATH}/exclude">exclude this browser</a>')
     tiles = [
         ("Visits (page views)", s["visits"]),
         ("Unique visitors", s["uniq_visitors"]),
@@ -228,6 +235,7 @@ table{{width:100%;border-collapse:collapse}}
 td{{padding:9px 2px;border-top:1px solid var(--line);font-size:14px;color:var(--ink2)}}
 td.n{{text-align:right;font-variant-numeric:tabular-nums;font-weight:600;color:var(--ink)}}
 tr:first-child td{{border-top:0}}
+a{{color:var(--clay-press);text-decoration:none;font-weight:600}}a:hover{{text-decoration:underline}}
 .legend{{color:var(--ink3);font-size:12.5px;margin:8px 0 4px;display:flex;gap:18px}}
 .sw{{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}}
 .note{{color:var(--ink3);font-size:13px;margin-top:26px;border-top:1px solid var(--line);padding-top:14px}}
@@ -245,7 +253,7 @@ tr:first-child td{{border-top:0}}
  <div><h2>Downloads by platform</h2><div class=card><table>{plat}</table></div></div>
  <div><h2>Top pages</h2><div class=card><table>{pages}</table></div></div>
 </div>
-<p class=note>Agreements on record: {s['consents']:,}. Active-installs-by-version needs a desktop-side ping (not built yet).</p>
+<p class=note>{optout}<br>Agreements on record: {s['consents']:,}. Active-installs-by-version needs a desktop-side ping (not built yet).</p>
 </body></html>"""
 
 
@@ -282,7 +290,8 @@ def install(app) -> None:
     def dash(request: Request, db: Session = Depends(get_db)):
         if not _session_ok(request.cookies.get(_COOKIE, "")):
             return HTMLResponse(_LOGIN.replace("__ERR__", ""))
-        return HTMLResponse(_page(_stats(db)))
+        excluded = bool(request.cookies.get(track.NOTRACK_COOKIE))
+        return HTMLResponse(_page(_stats(db), excluded))
 
     @app.post(PATH, response_class=HTMLResponse)
     async def login(request: Request):
@@ -293,4 +302,23 @@ def install(app) -> None:
         resp = RedirectResponse(PATH, status_code=303)
         resp.set_cookie(_COOKIE, _mint(), max_age=_SESSION_TTL,
                         httponly=True, samesite="lax")
+        return resp
+
+    # Opt this browser out of (or back into) analytics. Session-gated so only the
+    # dashboard viewer can toggle it; the cookie is what track.record() checks.
+    _NOTRACK_TTL = 10 * 365 * 24 * 3600  # ~10 years
+
+    @app.get(PATH + "/exclude")
+    def exclude(request: Request):
+        resp = RedirectResponse(PATH, status_code=303)
+        if _session_ok(request.cookies.get(_COOKIE, "")):
+            resp.set_cookie(track.NOTRACK_COOKIE, "1", max_age=_NOTRACK_TTL,
+                            path="/", httponly=True, samesite="lax")
+        return resp
+
+    @app.get(PATH + "/include")
+    def include(request: Request):
+        resp = RedirectResponse(PATH, status_code=303)
+        if _session_ok(request.cookies.get(_COOKIE, "")):
+            resp.delete_cookie(track.NOTRACK_COOKIE, path="/")
         return resp
