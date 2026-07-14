@@ -425,20 +425,20 @@ _PAGE = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="mask-icon" href="/favicon.svg" color="#C2643F">
 <meta name="theme-color" content="#C2643F">
-<meta name=description content="A real PDF editor that runs on your Mac. Retype text in place in the document's own font. No subscription, no watermark, no upload. Actually free.">
+<meta name=description content="A free PDF editor for Mac and Windows. Retype text in place in the document's own font, OCR scans, sign, and reorder pages, all on your own computer. No subscription, no watermark, nothing uploaded.">
 <meta name=robots content="index,follow">
 <link rel=canonical href="https://pdf-for-free.com/">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="PDF for Free">
 <meta property="og:title" content="PDF for Free - the PDF editor that's actually free">
-<meta property="og:description" content="A real PDF editor that runs on your Mac. Retype text in place in the document's own font. No subscription, no watermark, no upload.">
+<meta property="og:description" content="A free PDF editor for Mac and Windows. Retype text in place in the document's own font, OCR scans, and sign. No subscription, no watermark, nothing uploaded.">
 <meta property="og:url" content="https://pdf-for-free.com/">
 <meta property="og:image" content="https://pdf-for-free.com/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="PDF for Free - the PDF editor that's actually free">
-<meta name="twitter:description" content="A real PDF editor that runs on your Mac. No subscription, no watermark, no upload.">
+<meta name="twitter:description" content="A free PDF editor for Mac and Windows. Edit text in place, OCR scans, sign. No subscription, no watermark, nothing uploaded.">
 <meta name="twitter:image" content="https://pdf-for-free.com/og.png">
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"SoftwareApplication","name":"PDF for Free","alternateName":"PDF Text Editor","url":"https://pdf-for-free.com/","description":"A real PDF editor that runs on your Mac or PC. Retype text in place in the document's own font. No subscription, no watermark, no upload. Actually free.","applicationCategory":"UtilitiesApplication","operatingSystem":"macOS, Windows","downloadUrl":"https://pdf-for-free.com/","screenshot":"https://pdf-for-free.com/og.png","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"publisher":{"@type":"Organization","name":"PDF for Free","url":"https://pdf-for-free.com/"}}
@@ -1009,8 +1009,8 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     <h2>[[paid_heading]]</h2>
     <p class=sub>[[paid_sub]]</p>
     <div class=paidgrid>
-      <div class=paiditem><div class=ptag>Pay per use</div><h3>[[paid1_t]]</h3><p>[[paid1_b]]</p></div>
-      <div class=paiditem><div class=ptag>Optional</div><h3>[[paid2_t]]</h3><p>[[paid2_b]]</p></div>
+      <div class=paiditem><div class=ptag>Coming soon</div><h3>[[paid1_t]]</h3><p>[[paid1_b]]</p></div>
+      <div class=paiditem><div class=ptag>Coming soon</div><h3>[[paid2_t]]</h3><p>[[paid2_b]]</p></div>
     </div>
     <p class=paidnote>[[paid_note]]</p>
   </section>
@@ -1357,8 +1357,8 @@ _DEFAULT_COPY = {
     "q3": "Will it work all the time?",
     "a3": "Probably not.",
     "q4": "Is it free?",
-    "a4": ("Yes, 100%. (Unless you want better OCR or cloud storage. I'm not a"
-           " charity giving that away for free.)"),
+    "a4": ("Yes, 100%. (Cloud OCR and cloud storage are coming, and those will"
+           " cost money. I'm not a charity giving away cloud compute.)"),
     "hero_micro": "Free and on-device.",
     "catch_heading": "Everyone says free. Then the asterisk shows up.",
     "catch_sub": ("You go to edit one PDF and hit a wall. Turns out the free part"
@@ -1375,25 +1375,26 @@ _DEFAULT_COPY = {
                  " your machine to do it."),
     "band_heading": "Here, free means free.",
     "band_sub": ("The app and 100% of the PDF editing are free, forever. The only"
-                 " things you ever pay for are cloud features that cost real"
-                 " money to run."),
+                 " things that will ever cost money are the optional cloud"
+                 " features we're building."),
     "check1": "The editor is free forever. No subscription, no trial.",
-    "check2": "A free account to sign in, and no credit card.",
+    "check2": "No account required. Sign-in is optional and free, no credit card.",
     "check3": "No watermark on anything you save.",
     "check4": "No cap on pages or file size.",
-    "check5": "Your PDFs stay on your Mac, unless you turn on a cloud feature.",
+    "check5": "Your PDFs stay on your own computer, unless you turn on a cloud feature.",
     "check6": "No ads, no tracking, nothing harvested from your files.",
-    "paid_heading": "Two things cost money, and only if you want them.",
-    "paid_sub": ("Everything above is free forever. These two run in the cloud"
-                 " and cost real money every time, so they are paid. The app"
-                 " works fully without either one."),
+    "paid_heading": "Coming soon: two optional cloud add-ons.",
+    "paid_sub": ("Everything above is free forever. We're building two optional"
+                 " cloud extras; they will run in the cloud and cost real money"
+                 " to run, so they will be paid. The app works fully without them,"
+                 " today and after they launch."),
     "paid1_t": "Sharper OCR",
-    "paid1_b": ("Cloud OCR (Google Document AI) reads messy or low-quality scans"
-                " far better than the built-in on-device OCR. Each page costs"
-                " money to run, so it is pay-per-use. The free OCR stays free."),
+    "paid1_b": ("Cloud OCR (Google Document AI) will read messy or low-quality"
+                " scans far better than the built-in on-device OCR. It costs money"
+                " to run, so it will be pay-per-use. The free OCR stays free."),
     "paid2_t": "Cloud storage",
     "paid2_b": ("Keep your PDFs in sync so you can pick up on another device."
-                " Storage and bandwidth cost money, so it is a paid option."),
+                " Storage and bandwidth cost money, so it will be a paid option."),
     "paid_note": ("No PDF editing is ever locked behind a paywall. You only pay"
                   " for cloud compute and storage that cannot run for free, and"
                   " only when you choose to use them."),
@@ -1472,7 +1473,7 @@ details before that happens.</p>
 you choose to create or sign in to an account, send the email, password, and
 display name you type. That is all. The app contains no analytics, telemetry,
 crash reporting, advertising, device fingerprinting, or &ldquo;phone-home&rdquo; of
-any kind, and an account is optional &mdash; the app is fully functional without
+any kind, and an account is optional; the app is fully functional without
 one.</p>
 
 <h4>Information we collect</h4>
@@ -1509,13 +1510,13 @@ cookies.</p>
 <p>We share information only with the service providers that make the Service
 work, each only for its part:</p>
 <ul>
-<li><b>Railway</b> &mdash; hosting for our website, API, and database.</li>
-<li><b>Cloudflare</b> &mdash; content delivery and security for the website, and
+<li><b>Railway</b>: hosting for our website, API, and database.</li>
+<li><b>Cloudflare</b>: content delivery and security for the website, and
 the approximate-location data used for analytics; <b>Cloudflare R2</b> stores and
 serves the app installers and update files.</li>
-<li><b>Resend</b> &mdash; sends the email-verification code and any account emails.</li>
-<li><b>Google Fonts</b> &mdash; serves the fonts used on this website.</li>
-<li><b>Google Forms</b> &mdash; hosts the contact form.</li>
+<li><b>Resend</b>: sends the email-verification code and any account emails.</li>
+<li><b>Google Fonts</b>: serves the fonts used on this website.</li>
+<li><b>Google Forms</b>: hosts the contact form.</li>
 </ul>
 <p>We do not sell your personal information and do not share it for cross-context
 behavioral advertising. Donations, if you make one, go through your own Venmo
@@ -1594,9 +1595,8 @@ Service, or create risk for us or other users.</p>
 
 <h4>5. Cost</h4>
 <p>The app and all of its PDF editing are free, and today there are no paid
-features, subscriptions, or charges. We plan to add optional paid features &mdash;
-cloud OCR for tough scans, and cloud storage to sync files across devices &mdash;
-because they cost us to run. When they launch they will be optional, the core app
+features, subscriptions, or charges. We plan to add optional paid features (cloud OCR for tough scans, and cloud storage to
+sync files across devices) because they cost us to run. When they launch they will be optional, the core app
 and its editing will stay free, and we will show each feature's price and terms
 before you use it. Donations are voluntary and go through your own Venmo account.</p>
 
