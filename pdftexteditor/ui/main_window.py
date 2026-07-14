@@ -208,7 +208,17 @@ class _ModelCommand(QUndoCommand):
     def redo(self) -> None:
         if not self._applied:
             self._applied = True
+            depth_before = self._doc.history_depth()
             new_box = self._apply()
+            if self._doc.history_depth() == depth_before:
+                # The model mutator no-oped (e.g. set_style on an identical
+                # style): no history entry was added. Leaving this command on
+                # the Qt stack would desync it one longer than the model,
+                # reverting the WRONG edit on a later undo. QUndoStack.push()
+                # drops a command left obsolete by its first redo (without ever
+                # running its undo), restoring lockstep.
+                self.setObsolete(True)
+                return
             if new_box is not None:
                 self._box = new_box
         else:

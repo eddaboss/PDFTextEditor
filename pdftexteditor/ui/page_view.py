@@ -4383,8 +4383,12 @@ class PageView(QGraphicsView):
         # char format (the glyph-run bake persists bold/italic; u/s show while
         # editing). They only apply with an open editor, handled here.
         if getattr(self._editor_box, "box_id", None) is not None \
-                and set(overrides) <= {"bold", "italic"} and not scan:
+                and set(overrides) <= {"bold", "italic", "underline", "strike"} \
+                and not scan:
             return False              # plain NewBox: uniform bold/italic only
+            # (underline/strike can't persist in the plain-NewBox bake, so decline
+            #  the whole non-scan set here rather than show a phantom u/s that is
+            #  lost on commit)
         cursor = self._editor.textCursor()
         had_selection = cursor.hasSelection()
         fmt = QTextCharFormat()
@@ -4942,10 +4946,6 @@ class PageView(QGraphicsView):
                 or self._committing or self._closing_editor \
                 or self._editor_box is None:
             return
-        if self._editor_preview is not None:
-            if self._editor_preview.scene() is not None:
-                self.scene().removeItem(self._editor_preview)
-            self._editor_preview = None
         text = self._editor.toPlainText()
         box = self._editor_box
         dlog("RENDER", "compose_preview", box=id(box), text=text,
@@ -5001,6 +5001,14 @@ class PageView(QGraphicsView):
         item.setScale((disp[2] - disp[0]) * z / max(pm.width(), 1))
         item.setZValue(Z_COVER)                 # above the page, below the caret
         self.scene().addItem(item)
+        # Remove the OLD preview only now that the NEW tile is composed + on the
+        # scene: any early return above (e.g. compose returned None) leaves the
+        # prior preview on screen (one-frame stale at worst) instead of blanking
+        # the whole composite.
+        if self._editor_preview is not None:
+            if self._editor_preview.scene() is not None:
+                self.scene().removeItem(self._editor_preview)
+            self._editor_preview = None
         self._editor_preview = item
 
     # ----- DEBUG console: map overlay + inverted binary view ---------------
@@ -8671,9 +8679,7 @@ class PageView(QGraphicsView):
             item.setPos(baseline.x(), baseline.y() - ascent)
             return
         rad = math.radians(rot)
-        dx = ascent * math.sin(rad)
-        dy = -ascent * math.cos(rad)
-        item.setPos(baseline.x() - dx, baseline.y() - dy)
+        item.setPos(baseline.x() + ascent * math.sin(rad), baseline.y() - ascent * math.cos(rad))
 
     def _make_cover(self, box) -> QGraphicsRectItem:
         """A rect covering a box's bbox (hides the rasterized original under the

@@ -5615,6 +5615,13 @@ class PDFDocument:
                        else self.scan_edit_context(box, cover_override=lc,
                                                    text_override=o, page_rgb=page_rgb))
                 if ctx is None:
+                    # A CHANGED line whose scan_edit_context failed cannot be
+                    # composed, but the canvas is seeded from the real scan crop,
+                    # so skipping it would silently keep the ORIGINAL text (lost
+                    # edit). Bail the whole block to the _scanned_paragraph_raster
+                    # fallback. Only an unchanged-but-styled line is safe to skip.
+                    if n != o:
+                        return None
                     continue
                 tile, disp = self.inplace_compose(ctx, n, lruns)
                 if tile is None:
@@ -7990,6 +7997,12 @@ class PDFDocument:
         # shared return below hands the UI a ref with .page_index/.identity.
         return page, cmd.span
 
+    def history_depth(self) -> int:
+        """Current length of the universal model-history stack (``_undo``).
+        ``_ModelCommand.redo`` in ui/main_window.py reads this to tell whether a
+        replayed command actually pushed onto the model."""
+        return len(self._undo)
+
     @property
     def can_undo(self) -> bool:
         return bool(self._undo)
@@ -8558,9 +8571,15 @@ class PDFDocument:
                 from .ocr import layer_io
                 _blob = layer_io.serialize_layer(self)
                 if _blob:
-                    out.embfile_add(layer_io.EMB_NAME, _blob)
-            except Exception:
-                pass
+                    # A reopened file already contains the embedded layer, so a
+                    # plain embfile_add raises ValueError('...already exists') and
+                    # the stale copy survives -- update in place when present.
+                    if layer_io.EMB_NAME in out.embfile_names():
+                        out.embfile_upd(layer_io.EMB_NAME, _blob)
+                    else:
+                        out.embfile_add(layer_io.EMB_NAME, _blob)
+            except Exception as _e:
+                dlog("OCR", "embed_layer_failed", err=repr(_e))
         except Exception:
             out.close()
             raise
@@ -8727,8 +8746,15 @@ class PDFDocument:
         redact_rects += [
             fitz.Rect(bb) for s in extra_redact_spans for bb in s.redact_rects
         ]
+        # Parallel per-rect writing directions so the neighbor rescue can tell a
+        # same-direction residue (drop) from a cross-direction watermark overlap
+        # (redraw) -- see _overlapping_neighbors.
+        redact_dirs = [tuple(e.span.dir) for e in edits for _ in e.span.redact_rects]
+        redact_dirs += [
+            tuple(s.dir) for s in extra_redact_spans for _ in s.redact_rects
+        ]
         neighbors = self._overlapping_neighbors_cached(
-            out, page_index, edited_keys, redact_rects
+            out, page_index, edited_keys, redact_rects, redact_dirs
         )
 
         # Remove originals first (apply_redactions drops pre-registered fonts,
@@ -9730,6 +9756,7 @@ class PDFDocument:
         page_index: int,
         edited_keys: set[tuple],
         redact_rects: list["fitz.Rect"],
+        redact_dirs: list[tuple] | None = None,
     ) -> list[dict]:
         """Memoized ``_overlapping_neighbors`` for the instance bake pipeline
         (perf foundation M1b). Sound because the walk runs BEFORE this page's
@@ -9744,12 +9771,13 @@ class PDFDocument:
             page_index,
             frozenset(edited_keys),
             tuple(tuple(r) for r in redact_rects),
+            tuple(redact_dirs) if redact_dirs is not None else None,
         )
         hit = self._neighbors_cache.get(key)
         if hit is not None:
             return hit
         result = self._overlapping_neighbors(
-            out, page_index, edited_keys, redact_rects
+            out, page_index, edited_keys, redact_rects, redact_dirs
         )
         # FIFO cap: dicts iterate in insertion order, so evict the oldest. The
         # working set is tiny (the pages currently being re-rendered).
@@ -9764,6 +9792,7 @@ class PDFDocument:
         page_index: int,
         edited_keys: set[tuple],
         redact_rects: list["fitz.Rect"],
+        redact_dirs: list[tuple] | None = None,
     ) -> list[dict]:
         """Unedited spans on ``page_index`` whose ink overlaps a redaction rect.
 
@@ -9773,6 +9802,16 @@ class PDFDocument:
         after redaction so the rect does not silently truncate them. The overlap
         must be a real area intersection (more than a hairline touch) so spans
         that merely abut an edited rect are not needlessly redrawn.
+
+        ``redact_dirs`` (parallel to ``redact_rects``) carries each covering
+        rect's SOURCE-span writing direction. A neighbor mostly inside a rect is
+        normally dropped as residue (a duplicate of the box being removed), but
+        a rotated watermark's axis-aligned bbox blankets every horizontal body
+        line -- so a same->different direction overlap is never a same-box
+        duplicate (mirror of ``_merge_overlapping``'s direction gate). When a
+        neighbor's direction differs from EVERY covering rect's direction, it is
+        redrawn regardless of the overlap fraction. Absent ``redact_dirs`` the
+        old fraction-only behaviour is preserved.
         """
         page = out[page_index]
         raw = page.get_text("rawdict")
@@ -9800,13 +9839,29 @@ class PDFDocument:
                     # the residue bug). A span only edge-clipped (small fraction)
                     # is a distinct neighbor to redraw.
                     inside = 0.0
-                    for rect in redact_rects:
+                    cover_dirs: list[tuple] = []
+                    for ri, rect in enumerate(redact_rects):
                         inter = sbbox & rect
                         if not inter.is_empty:
                             inside += inter.get_area()
+                            if redact_dirs is not None:
+                                cover_dirs.append(redact_dirs[ri])
                     frac = min(inside / sarea, 1.0)
-                    if frac < 0.02 or frac >= 0.5:
+                    if frac < 0.02:
                         continue
+                    if frac >= 0.5:
+                        # >=50% inside = residue of the removed box ONLY when the
+                        # neighbor shares a covering rect's writing direction. A
+                        # cross-direction overlap (e.g. a diagonal watermark's
+                        # bbox blanketing this body line) is never a same-box
+                        # duplicate -- redraw it instead of erasing it.
+                        same_dir = any(
+                            abs(line_dir[0] - d[0]) <= 1e-3
+                            and abs(line_dir[1] - d[1]) <= 1e-3
+                            for d in cover_dirs
+                        )
+                        if same_dir or not cover_dirs:
+                            continue
                     neighbors.append({
                         "text": text,
                         "origin": tuple(span["origin"]),
@@ -9965,7 +10020,8 @@ class PDFDocument:
                   annots_map: dict | None = None,
                   overrides_map: dict | None = None,
                   images_map: dict | None = None,
-                  xim_map: dict | None = None) -> None:
+                  xim_map: dict | None = None,
+                  owner: "PDFDocument | None" = None) -> None:
         """Realize the staged edits in ``edits_map`` / ``newbox_map`` (and the
         staged annotations / overrides, annotations & markup §3.5, and the
         placed images + existing-image deletions, images & signatures §2.4)
@@ -10008,7 +10064,7 @@ class PDFDocument:
             PDFDocument._apply_page_edits_for(target, engine, pi, edits,
                                               newbox_map, annots_map,
                                               overrides_map, images_map,
-                                              xim_map)
+                                              xim_map, owner=owner)
 
     @staticmethod
     def _apply_page_edits_for(target: "fitz.Document", engine: "FontEngine",
@@ -10017,12 +10073,21 @@ class PDFDocument:
                               annots_map: dict | None = None,
                               overrides_map: dict | None = None,
                               images_map: dict | None = None,
-                              xim_map: dict | None = None) -> None:
+                              xim_map: dict | None = None,
+                              owner: "PDFDocument | None" = None) -> None:
         """``_apply_page_edits`` for ARBITRARY newbox/annot/image maps (used
         when baking a foreign doc whose staged state lives in the passed maps,
         not ``self``). The body mirrors ``_apply_page_edits`` exactly but
         draws the foreign maps' state for ``page_index`` instead of
-        ``self``'s -- keep BOTH in lockstep (the screen == save invariant)."""
+        ``self``'s -- keep BOTH in lockstep (the screen == save invariant).
+
+        ``owner`` is the PDFDocument whose ``_restore_line_in_cover`` (table-rule
+        redraw) applies to ``target``. Only ``_bake_pending_edits`` passes it
+        (its target IS ``self.working`` with aligned page indices), so a moved
+        OCR box that crossed a table rule bakes the rule back on structural ops
+        too. merge/split/extract leave it ``None`` -- their throwaway target's
+        indices don't align, so the surgical redraw would land on the wrong
+        page (behavior unchanged for them)."""
         page = target[page_index]
         # Existing-image deletions FIRST, mirroring ``_apply_page_edits``
         # exactly (images & signatures §2.4(1), M3).
@@ -10033,8 +10098,10 @@ class PDFDocument:
         edited_keys = {e.span.key for e in edits}
         redact_rects = [fitz.Rect(bb) for e in edits
                         for bb in e.span.redact_rects]
+        redact_dirs = [tuple(e.span.dir) for e in edits
+                       for _ in e.span.redact_rects]
         neighbors = PDFDocument._overlapping_neighbors(
-            target, page_index, edited_keys, redact_rects)
+            target, page_index, edited_keys, redact_rects, redact_dirs)
         for rect in redact_rects:
             page.add_redact_annot(rect)
         if redact_rects:
@@ -10072,12 +10139,21 @@ class PDFDocument:
                 if not covers:
                     page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                    color=(r, g, b), fill=(r, g, b), width=0)
+                    # Redraw the rule segment(s) the vacated box sat on, clipped
+                    # to the cover -- lockstep with _apply_page_edits. Only when
+                    # owner's page indices align with target (see docstring).
+                    if owner is not None:
+                        owner._restore_line_in_cover(
+                            page, (x0, y0, x1, y1), page_index)
                 # 0.3.0: blended raster for an edited scanned word / paragraph
                 # tile (see _apply_page_edits; keep both seams in lockstep).
                 if box.edit_image and box.edit_image_rect:
                     page.insert_image(fitz.Rect(box.edit_image_rect),
                                       stream=box.edit_image, keep_proportion=False,
                                       rotate=page.rotation)
+                    if owner is not None:
+                        owner._restore_line_in_cover(
+                            page, tuple(box.edit_image_rect), page_index)
                     continue
             if box.is_paragraph and box.render_mode == 3:
                 continue                # invisible paragraph overlay: scan shows
@@ -10142,7 +10218,7 @@ class PDFDocument:
             )
         self._bake_doc(self.working, self._edits, self._new_boxes,
                        self._annots, self._annot_overrides, self._images,
-                       self._xim_deletes)
+                       self._xim_deletes, owner=self)
         self._edits.clear()
         self._new_boxes.clear()
         # Baked images are now real ink in ``working`` (and staged

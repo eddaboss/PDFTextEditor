@@ -33,7 +33,10 @@ _SANS_HINTS = ("sans", "arial", "helvetica", "verdana", "tahoma", "calibri",
 def _family(font_name: str, flags: int) -> str:
     name = (font_name or "").lower()
     # Name hints first (more reliable than the serif/mono flag bits)...
-    if any(h in name for h in _MONO_HINTS):
+    # 'monotype' is the known false positive: the bare 'mono' hint matches
+    # script faces like 'Monotype Corsiva', so exclude it from that match.
+    if "courier" in name or "consol" in name or "menlo" in name or (
+            "mono" in name and "monotype" not in name):
         return "cour"
     if any(h in name for h in _SANS_HINTS):
         return "helv"

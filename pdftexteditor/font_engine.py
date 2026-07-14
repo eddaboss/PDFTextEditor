@@ -277,7 +277,11 @@ def _alias_candidates(base_norm: str, raw_norm: str, flags: int) -> list[str]:
     # token-based families
     if "garamond" in raw_norm or n.startswith("cmr") or n.startswith("nimbusrom"):
         return ["Times New Roman", "Times"]
-    if (flags & FLAG_MONO) or any(t in raw_norm for t in ("mono", "consol", "menlo")):
+    # 'monotype' is the known false positive: the bare 'mono' hint matches
+    # script faces like 'Monotype Corsiva', so exclude it from that match.
+    mono_hint = ("mono" in raw_norm and "monotype" not in raw_norm) or any(
+        t in raw_norm for t in ("consol", "menlo"))
+    if (flags & FLAG_MONO) or mono_hint:
         return ["Menlo", "Courier New"]
     # If the bare family name itself is an installed family, try it directly
     # first (e.g. "Georgia", "Verdana"), then fall back on style heuristics.
@@ -508,8 +512,13 @@ class FontEngine:
             res = self.extract_embedded(xref)
             if res is not None:
                 buffer = res[3]
-                font = fitz.Font(fontbuffer=buffer)
-                if self.font_covers(font, new_text):
+                try:
+                    font = fitz.Font(fontbuffer=buffer)
+                except Exception:
+                    # Damaged/Type1 embedded buffer: fitz raises FzErrorLibrary
+                    # (not ValueError). Fall through to Tier 2 so preview == save.
+                    font = None
+                if font is not None and self.font_covers(font, new_text):
                     qt_family = self.load_qt_family(buffer)
                     if qt_family:
                         rf = ResolvedFont(
@@ -881,11 +890,21 @@ class FontEngine:
           BASE14   -> fitz.Font(rf.base14_code)
         """
         if rf.tier == TIER_EMBEDDED:
-            return fitz.Font(fontbuffer=rf.pdf_fontbuffer)
+            try:
+                return fitz.Font(fontbuffer=rf.pdf_fontbuffer)
+            except Exception:
+                # Damaged embedded buffer: fall to the base-14 floor so
+                # metrics/bake stay glyph-safe.
+                return fitz.Font(rf.base14_code or "helv")
         if rf.tier == TIER_SYSTEM:
             rec = self.system_record_for(rf.qt_family, rf.qt_bold, rf.qt_italic)
             if rec is not None:
-                return fitz.Font(fontbuffer=face_bytes(rec.path, rec.face_index))
+                try:
+                    return fitz.Font(fontbuffer=face_bytes(rec.path, rec.face_index))
+                except Exception:
+                    # Unparseable system face: fall to the base-14 floor so
+                    # metrics/bake stay glyph-safe.
+                    return fitz.Font(rf.base14_code or "helv")
             # No concrete face despite a SYSTEM tier (defensive): fall to the
             # base-14 floor so metrics stay glyph-safe.
             return fitz.Font(rf.base14_code or "helv")
