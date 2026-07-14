@@ -7634,24 +7634,6 @@ class PageView(QGraphicsView):
                                  if self._editor_scan_ctx
                                  else self.document._edit_font_file(
                                      getattr(box, "font_family", "")))
-            try:                                 # TEMP gap diagnostic (no PHI: counts only)
-                import re as _re
-                _lns = (self._caret_measure or {}).get("lines") or []
-                with open("/tmp/pdfte_gap.log", "a") as _fh:
-                    _fh.write("=== OPENED box: %d line(s) ===\n" % len(_lns))
-                    for _li, _ln in enumerate(_lns):
-                        if not _ln:
-                            _fh.write("  line%d: (none)\n" % _li); continue
-                        _ctx = _ln.get("ctx") or {}
-                        _cb = (_ctx.get("geom") or {}).get("char_boxes")
-                        _ot = _ctx.get("orig_text", "")
-                        _runs = [len(m.group()) for m in _re.finditer(r"  +", _ot)]
-                        _fh.write("  line%d: chars=%d char_boxes=%s multispace_runs=%s edges=%d\n"
-                                  % (_li, len(_ot),
-                                     ("%d" % len(_cb)) if (_cb and len(_cb) == len(_ot)) else "NONE",
-                                     _runs, len(_ln.get("edges", []))))
-            except Exception:
-                pass
         else:
             cover = self._make_cover(box)
             cover.setZValue(Z_COVER)
