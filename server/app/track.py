@@ -11,6 +11,9 @@ import uuid
 from .models import Event
 
 VID_COOKIE = "vid"
+# A browser that clicked "exclude this browser" on the metrics dashboard carries
+# this cookie; record() then drops its events so your own traffic isn't counted.
+NOTRACK_COOKIE = "pdfte_notrack"
 
 
 def new_vid() -> str:
@@ -54,6 +57,8 @@ def platform_from_name(name: str) -> str:
 def record(db, request, kind: str, *, path: str = "", referrer: str = "",
            platform: str = "", app_version: str = "", account_id=None) -> None:
     """Store one event. Swallows everything -- analytics never breaks the site."""
+    if request.cookies.get(NOTRACK_COOKIE):
+        return  # this browser opted out from the metrics dashboard
     try:
         country, region, city = geo(request)
         if not platform:
