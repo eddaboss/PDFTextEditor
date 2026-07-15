@@ -42,13 +42,60 @@ from . import theme
 # Bookmarks panel (navigation M1); "find" opens Find & Replace. The Select-Text
 # tool (copy words off the page, ws2 M4) stays reachable via its 'S' shortcut +
 # the Tools menu, so it is no longer a rail button.
-_TOOLS = (
-    ("select", "select", "Select", "Select (V)"),
-    ("text_edit", "text_edit", "Text", "Text Edit (E)"),
-    ("markup", "highlight", "Markup", "Markup tools"),
-    ("comments", "comments", "Notes", "Comments (Cmd+Shift+C)"),
-    ("bookmarks", "bookmark", "Outline", "Bookmarks (Cmd+Alt+B)"),
-    ("find", "find", "Find", "Find & Replace (Cmd+F)"),
+# Every rail CATEGORY across all three modes, keyed by id -> (icon, label, tip).
+# The rail shows only the current mode's subset (``_MODE_TOOLS``); selecting one
+# emits ``toolSelected`` and swaps the panel to what that category does
+# (``_TOOL_PANEL``). Edit keeps the original document tools; Form Fields and
+# Fill Form each get their own category set (three-mode adaptive rail).
+_CATEGORIES = {
+    "select": ("select", "Select", "Select (V)"),
+    "text_edit": ("text_edit", "Text", "Text Edit (E)"),
+    "markup": ("highlight", "Markup", "Markup tools"),
+    "comments": ("comments", "Notes", "Comments (Cmd+Shift+C)"),
+    "bookmarks": ("bookmark", "Outline", "Bookmarks (Cmd+Alt+B)"),
+    "find": ("find", "Find", "Find & Replace (Cmd+F)"),
+    # Form Fields (form making) -- one unified builder surface
+    "field_build": ("field_add", "Build", "Build the form's fields"),
+    # Fill Form (filling + signing)
+    "fill_fields": ("mode_fill_form", "Fill", "Fill in the form's fields"),
+    "fill_sign": ("signature", "Sign", "Sign the document"),
+    "fill_image": ("image", "Image", "Place an image"),
+    "fill_flatten": ("flatten", "Finish", "Export a flattened copy"),
+}
+# Which categories show in each top mode, in display order.
+_MODE_TOOLS = {
+    "document": ("select", "text_edit", "markup", "comments", "bookmarks", "find"),
+    "form_fields": ("field_build",),
+    "fill_form": ("fill_fields", "fill_sign", "fill_image", "fill_flatten"),
+}
+# The category auto-selected when a mode becomes active.
+_MODE_DEFAULT_TOOL = {
+    "document": "select", "form_fields": "field_build", "fill_form": "fill_fields",
+}
+# Category -> (panel key, header title). Categories NOT listed here (select,
+# text_edit) fall back to the Format panel. The window installs each keyed panel
+# via ``install_named_panel``; the built-in ones keep their dedicated slots.
+_TOOL_PANEL = {
+    "markup": ("markup", "Markup"),
+    "find": ("find", "Find & Replace"),
+    "comments": ("comments", "Comments"),
+    "bookmarks": ("bookmarks", "Bookmarks"),
+    "field_build": ("forms_build", "Form fields"),
+    "fill_fields": ("fill_fields", "Fill the form"),
+    "fill_sign": ("fill_sign", "Signature"),
+    "fill_image": ("fill_image", "Insert image"),
+    "fill_flatten": ("fill_flatten", "Finish"),
+}
+
+# The TOP-LEVEL editing modes, shown as a distinct button cluster at the very top
+# of the rail (their own exclusive group + ``topModeSelected``). "Edit" is the
+# Document/default mode (selected on open); the two form modes carry icons. Ids
+# match page_view's TOP_DOCUMENT/TOP_FORM_FIELDS/TOP_FILL_FORM strings, so the
+# window can route them straight to its existing _on_top_mode_selected slot.
+_MODES = (
+    ("document", "mode_edit", "Edit", "Edit the document (Ctrl+1)"),
+    ("form_fields", "mode_form_fields", "Fields", "Form Fields (Ctrl+2)"),
+    ("fill_form", "mode_fill_form", "Fill", "Fill in the form (Ctrl+3)"),
 )
 
 # Rail ACTION buttons, pinned at the bottom below a divider. Unlike modes, these
@@ -67,6 +114,9 @@ class LeftPanel(QWidget):
     toolSelected = Signal(str)
     # A one-shot rail action ("image"|"signature"); the window triggers the action.
     actionRequested = Signal(str)
+    # Top mode picked in the rail ("document"|"form_fields"|"fill_form"); the
+    # window routes it to the same _on_top_mode_selected the old menu items used.
+    topModeSelected = Signal(str)
 
     def __init__(self, inspector, icon_factory, parent=None):
         super().__init__(parent)
@@ -94,10 +144,45 @@ class LeftPanel(QWidget):
         rl.setContentsMargins(8, 8, 8, 10)
         rl.setSpacing(2)
 
+        rail_font = theme.ui_font(theme.UI_FONT_RAIL, medium=True)
+
+        # --- Top-level MODE cluster (Edit / Fields / Fill) ---------------
+        # A distinct exclusive group at the very top of the rail, above a
+        # divider, so the three editing modes read as the primary switch (they
+        # used to hide in the native View menu). "Edit" is checked by default.
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.setExclusive(True)
+        self._mode_buttons: dict[str, QToolButton] = {}
+        for mode_id, icon_name, label, tip in _MODES:
+            btn = QToolButton()
+            btn.setObjectName("RailButton")
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tip)
+            btn.setText(label)
+            btn.setFont(rail_font)
+            btn.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+            btn.setIconSize(QSize(theme.ICON_SIZE, theme.ICON_SIZE))
+            btn.setMinimumHeight(theme.RAIL_BUTTON)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding,
+                              QSizePolicy.Policy.Fixed)
+            btn.setIcon(icon_factory(icon_name) if icon_factory else QIcon())
+            btn.clicked.connect(
+                lambda _checked=False, m=mode_id: self._on_mode_clicked(m))
+            self._mode_group.addButton(btn)
+            self._mode_buttons[mode_id] = btn
+            rl.addWidget(btn)
+        self._mode_buttons["document"].setChecked(True)   # Edit is the default
+        mode_divider = QFrame()
+        mode_divider.setObjectName("RailDivider")
+        mode_divider.setFrameShape(QFrame.HLine)
+        mode_divider.setFixedHeight(1)
+        rl.addWidget(mode_divider)
+
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
-        rail_font = theme.ui_font(theme.UI_FONT_RAIL, medium=True)
-        for tool_id, icon_name, label, tip in _TOOLS:
+        for tool_id, (icon_name, label, tip) in _CATEGORIES.items():
             btn = QToolButton()
             btn.setObjectName("RailButton")
             btn.setCheckable(True)
@@ -117,6 +202,9 @@ class LeftPanel(QWidget):
                 lambda _checked=False, t=tool_id: self._on_tool_clicked(t))
             self._group.addButton(btn)
             self._buttons[tool_id] = btn
+            # Only the Document-mode categories show until a mode sets otherwise
+            # (set_mode swaps the visible set); the rest are built once, hidden.
+            btn.setVisible(tool_id in _MODE_TOOLS["document"])
             rl.addWidget(btn)
 
         # Push the one-shot action buttons (Image / Sign) to the bottom of the
@@ -192,6 +280,11 @@ class LeftPanel(QWidget):
         self._comments_panel = None              # installed lazily by the window
         self._bookmark_panel = None              # installed lazily by the window
         self._markup_panel = None                # installed lazily by the window
+        self._forms_panel = None                 # installed lazily by the window
+        # Mode-adaptive category panels (Add / Fields / Fill / Sign / Image /
+        # Finish), keyed by ``_TOOL_PANEL`` panel key. The window installs each
+        # via ``install_named_panel``; ``_sync_content`` swaps to them.
+        self._named: dict = {}
         col.addWidget(self._stack, 1)
 
     # --- public API ------------------------------------------------------
@@ -244,10 +337,27 @@ class LeftPanel(QWidget):
         if panel is not None:
             self._stack.addWidget(panel)
 
+    def install_forms_panel(self, panel) -> None:
+        """Mount the Forms builder panel as a stack page (the window builds it
+        with its injected callables). Shown while the top mode is FORM FIELDS.
+        Idempotent."""
+        if self._forms_panel is panel:
+            return
+        if self._forms_panel is not None:
+            self._stack.removeWidget(self._forms_panel)
+        self._forms_panel = panel
+        if panel is not None:
+            self._stack.addWidget(panel)
+
     def show_find_panel(self) -> None:
         """Swap the content area to the Find panel (if installed)."""
         if self._find_panel is not None:
             self._stack.setCurrentWidget(self._find_panel)
+
+    def show_forms_panel(self) -> None:
+        """Swap the content area to the Forms builder panel (if installed)."""
+        if self._forms_panel is not None:
+            self._stack.setCurrentWidget(self._forms_panel)
 
     def show_markup_panel(self) -> None:
         """Swap the content area to the Markup tools palette (if installed)."""
@@ -267,6 +377,36 @@ class LeftPanel(QWidget):
     def show_format_panel(self) -> None:
         """Swap the content area back to the Format/Inspector panel."""
         self._stack.setCurrentWidget(self._inspector)
+
+    def install_named_panel(self, key: str, panel) -> None:
+        """Mount a mode-adaptive category panel under ``key`` (one of the
+        ``_TOOL_PANEL`` panel keys: forms_add / forms_list / fill_fields /
+        fill_sign / fill_image / fill_flatten). Idempotent."""
+        if self._named.get(key) is panel:
+            return
+        old = self._named.get(key)
+        if old is not None:
+            self._stack.removeWidget(old)
+        self._named[key] = panel
+        if panel is not None:
+            self._stack.addWidget(panel)
+
+    def show_named_panel(self, key: str) -> None:
+        panel = self._named.get(key)
+        if panel is not None:
+            self._stack.setCurrentWidget(panel)
+
+    def set_mode(self, mode: str) -> None:
+        """Show only the current top mode's rail categories + select that mode's
+        default category (three-mode adaptive rail). The one-shot Image/Sign
+        actions at the rail's foot belong to Document mode; in Fill Form they
+        reappear as their own categories."""
+        tools = _MODE_TOOLS.get(mode, _MODE_TOOLS["document"])
+        for tool_id, btn in self._buttons.items():
+            btn.setVisible(tool_id in tools)
+        for btn in getattr(self, "_action_buttons", {}).values():
+            btn.setVisible(mode == "document")
+        self.set_active_tool(_MODE_DEFAULT_TOOL.get(mode, "select"))
 
     def find_panel(self):
         return self._find_panel
@@ -293,21 +433,27 @@ class LeftPanel(QWidget):
         self._sync_content(tool_id)
 
     def _sync_content(self, tool_id: str) -> None:
-        if tool_id == "markup":
-            self.show_markup_panel()
-            self._header_label.setText("Markup")
-        elif tool_id == "find":
-            self.show_find_panel()
-            self._header_label.setText("Find & Replace")
-        elif tool_id == "comments":
-            self.show_comments_panel()
-            self._header_label.setText("Comments")
-        elif tool_id == "bookmarks":
-            self.show_bookmark_panel()
-            self._header_label.setText("Bookmarks")
-        else:
+        entry = _TOOL_PANEL.get(tool_id)
+        if entry is None:                      # select / text_edit -> Format
             self.show_format_panel()
             self._header_label.setText("Format")
+            return
+        key, header = entry
+        self._header_label.setText(header)
+        # The four Document-mode panels keep their dedicated slots; the new
+        # mode-adaptive categories live in the ``_named`` stack pages.
+        builtin = {
+            "markup": self.show_markup_panel,
+            "find": self.show_find_panel,
+            "comments": self.show_comments_panel,
+            "bookmarks": self.show_bookmark_panel,
+        }.get(key)
+        if builtin is not None:
+            builtin()
+        elif key in self._named:
+            self.show_named_panel(key)
+        else:
+            self.show_format_panel()           # panel not installed yet
 
     def active_tool(self) -> str:
         for tool_id, btn in self._buttons.items():
@@ -320,6 +466,34 @@ class LeftPanel(QWidget):
         for btn in self._buttons.values():
             btn.setEnabled(on)
         for btn in getattr(self, "_action_buttons", {}).values():
+            btn.setEnabled(on)
+        for btn in getattr(self, "_mode_buttons", {}).values():
+            btn.setEnabled(on)
+
+    # --- top-mode cluster ------------------------------------------------
+    def _on_mode_clicked(self, mode_id: str) -> None:
+        if self._syncing:
+            return
+        self.topModeSelected.emit(mode_id)
+
+    def set_active_mode(self, mode_id: str) -> None:
+        """Check the given mode button WITHOUT emitting ``topModeSelected`` --
+        used to follow a mode change driven from elsewhere (Ctrl+1/2/3, a tab
+        switch restoring a doc's stored mode, or a programmatic bounce)."""
+        btn = self._mode_buttons.get(mode_id)
+        if btn is None:
+            return
+        self._syncing = True
+        try:
+            btn.setChecked(True)
+        finally:
+            self._syncing = False
+
+    def set_mode_enabled(self, mode_id: str, on: bool) -> None:
+        """Enable/disable one mode button (Fill Form is only available on a doc
+        that actually has a form)."""
+        btn = self._mode_buttons.get(mode_id)
+        if btn is not None:
             btn.setEnabled(on)
 
     # --- internal --------------------------------------------------------

@@ -104,76 +104,30 @@ _FIDELITY_PIPS = {TIER_EMBEDDED: 3, TIER_SYSTEM: 2, TIER_BASE14: 1}
 
 
 class _FidelityCard(QFrame):
-    """The font-fidelity status card -- the product's core trust signal, built
-    out (not a one-liner): a colored swatch with a check, the tier word + a
-    family-specific subtitle, a plain-language consequence sentence, and a
-    3-pip ladder labelled Embedded / System match / Substitute so you can see
-    at a glance how faithfully the saved PDF reproduces the font."""
+    """Compact font-fidelity CHIP (demoted from the old full card so the live
+    caret style is the panel's focus): a tier-colored dot + a one-line status
+    word ("Embedded" / "Embeds on save" / "Substitute font"). The full
+    consequence sentence moves to the tooltip. ``set_state(tier, family)`` /
+    ``clear()`` are unchanged so ``_refresh_fidelity`` still drives it."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("InspectorFidelity")
         self._last_state = None
         theme.events.changed.connect(self._restyle)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(13, 13, 13, 13)
-        lay.setSpacing(10)
-
-        top = QHBoxLayout()
-        top.setSpacing(10)
-        self._swatch = QLabel("✓")
-        self._swatch.setObjectName("FidelitySwatch")
-        self._swatch.setFixedSize(30, 30)
-        self._swatch.setAlignment(Qt.AlignCenter)
-        sf = theme.ui_font(15, semibold=True)
-        self._swatch.setFont(sf)
-        tcol = QVBoxLayout()
-        tcol.setSpacing(1)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(10, 6, 10, 6)
+        row.setSpacing(8)
+        self._dot = QLabel()
+        self._dot.setObjectName("FidelitySwatch")
+        self._dot.setFixedSize(9, 9)
         self._tier = QLabel()
-        self._tier.setFont(theme.ui_font(13, semibold=True))
+        self._tier.setFont(theme.ui_font(11, semibold=True))
         self._sub = QLabel()
         self._sub.setFont(theme.ui_font(11, medium=True))
-        self._sub.setWordWrap(True)
-        tcol.addWidget(self._tier)
-        tcol.addWidget(self._sub)
-        top.addWidget(self._swatch, 0, Qt.AlignTop)
-        top.addLayout(tcol, 1)
-        lay.addLayout(top)
-
-        self._desc = QLabel()
-        self._desc.setWordWrap(True)
-        self._desc.setFont(theme.ui_font(11, medium=True))
-        lay.addWidget(self._desc)
-
-        ladder = QHBoxLayout()
-        ladder.setSpacing(4)
-        self._pips = []
-        for _ in range(3):
-            pip = QFrame()
-            pip.setObjectName("FidelityPip")
-            pip.setFixedHeight(4)
-            pip.setSizePolicy(QSizePolicy.Policy.Expanding,
-                              QSizePolicy.Policy.Fixed)
-            self._pips.append(pip)
-            ladder.addWidget(pip)
-        lay.addLayout(ladder)
-
-        # The ladder is a SCALE: best (Embedded) on the left, fallback
-        # (Substitute) on the right. Only the two ends are labelled -- the
-        # current tier is already the coloured headline + the lit pips, so a
-        # third middle label was redundant AND overflowed the narrow panel.
-        lrow = QHBoxLayout()
-        self._tier_labels = {
-            TIER_EMBEDDED: QLabel("Embedded"),
-            TIER_BASE14: QLabel("Substitute"),
-        }
-        small = theme.ui_font(10, medium=True)
-        for lbl in self._tier_labels.values():
-            lbl.setFont(small)
-        lrow.addWidget(self._tier_labels[TIER_EMBEDDED])
-        lrow.addStretch(1)
-        lrow.addWidget(self._tier_labels[TIER_BASE14])
-        lay.addLayout(lrow)
+        row.addWidget(self._dot, 0, Qt.AlignVCenter)
+        row.addWidget(self._tier, 0, Qt.AlignVCenter)
+        row.addWidget(self._sub, 1, Qt.AlignVCenter)
 
     def _consequence(self, tier: int, family: str) -> tuple[str, str]:
         """(subtitle, description) woven with the resolved family name."""
@@ -205,33 +159,17 @@ class _FidelityCard(QFrame):
             tier, _FIDELITY_BLOCK[TIER_BASE14])
         border = self._FIDELITY_BORDER.get(tier, self._FIDELITY_BORDER[TIER_BASE14])
         sub, desc = self._consequence(tier, family)
-        # Per-tier tinted card (over the base QSS) + a soft same-hue hairline.
         self.setStyleSheet(
             f"QFrame#InspectorFidelity {{ background:{bg}; "
-            f"border:1px solid {border}; border-radius:11px; }}"
+            f"border:1px solid {border}; border-radius:9px; }}"
             f"QLabel#InspectorFidelity {{ background:transparent; }}")
-        self._swatch.setStyleSheet(
-            f"background:{color}; border-radius:8px; color:#FFFFFF;")
+        self._dot.setStyleSheet(f"background:{color}; border-radius:4px;")
         self._tier.setText(word)
         self._tier.setStyleSheet(f"color:{color}; background:transparent;")
         self._sub.setText(sub)
-        self._sub.setStyleSheet(f"color:{theme.TEXT_SECONDARY}; background:transparent;")
-        self._desc.setText(desc)
-        self._desc.setStyleSheet(f"color:{theme.TEXT_SECONDARY}; background:transparent;")
-        on = _FIDELITY_PIPS.get(tier, 1)
-        for i, pip in enumerate(self._pips):
-            fill = color if i < on else "rgba(255,255,255,.13)"
-            pip.setStyleSheet(f"background:{fill}; border-radius:2px;")
-        tier_color = {
-            TIER_EMBEDDED: theme.FIDELITY_GREEN,
-            TIER_SYSTEM: theme.FIDELITY_BLUE,
-            TIER_BASE14: theme.FIDELITY_AMBER,
-        }
-        for t, lbl in self._tier_labels.items():
-            active = (t == tier)
-            lbl.setStyleSheet(
-                f"color:{tier_color[t]}; background:transparent;"
-                f"{'font-weight:700;' if active else ''}")
+        self._sub.setStyleSheet(
+            f"color:{theme.TEXT_SECONDARY}; background:transparent;")
+        self.setToolTip(desc)               # the full consequence sentence
         self.setVisible(True)
 
     def clear(self) -> None:
@@ -534,11 +472,9 @@ class Inspector(QWidget):
         # stretch) so it reads as the font row's resolution status adjacent to the
         # font/size/color controls, instead of a lone stranded line at the panel
         # bottom (review minor). Full panel width so it never wraps/clips.
-        self._fidelity_header = QLabel("FONT FIDELITY")
-        self._fidelity_header.setObjectName("InspectorSectionHeader")
-        self._fidelity_header.setFont(theme.caps_header_font())
-        outer.addSpacing(8)
-        outer.addWidget(self._fidelity_header)
+        # Demoted to a compact chip (no "FONT FIDELITY" section header): it sits
+        # just under the style controls as a quiet one-line status, so the live
+        # caret readout above is the panel's focus. Full detail is its tooltip.
         self.fidelity_label = _FidelityCard()
         outer.addSpacing(6)
         outer.addWidget(self.fidelity_label)
@@ -700,13 +636,20 @@ class Inspector(QWidget):
     # =====================================================================
     # Public API (BUILD_SPEC §4.1)
     # =====================================================================
-    def set_target(self, box, style: dict | None) -> None:
+    def set_target(self, box, style: dict | None,
+                   mixed: frozenset = frozenset()) -> None:
         """Populate every control from ``style`` (the dict from
         ``document.effective_style(...)``) WITHOUT emitting ``styleEdited``.
         ``box=None`` disables the panel (empty state). Any annot target is
         dropped: the text and ANNOTATION sections are mutually exclusive
         (annotations & markup §5.5). Restores the DEFAULT placeholder copy;
-        an image selection sets its own via ``set_hint`` afterwards."""
+        an image selection sets its own via ``set_hint`` afterwards.
+
+        ``mixed`` names the style fields that vary across a multi-style text
+        SELECTION (bold/italic/underline/strike/font_family); each is shown
+        indeterminate (a muted #SegButton or a blank family) instead of a
+        misleading definite value."""
+        mixed = mixed or style.get("mixed", frozenset()) if style else frozenset()
         self._empty_hint.setText(self._DEFAULT_HINT)
         self._target = box
         self._annot_target = None
@@ -747,8 +690,29 @@ class Inspector(QWidget):
             if is_para:
                 self.spacing_spin.setValue(
                     float(style.get("line_spacing", 1.0) or 1.0))
+            self._apply_mixed(mixed)
         self._set_enabled(True)
         self._refresh_fidelity()
+
+    def _apply_mixed(self, mixed: frozenset) -> None:
+        """Render the fields in ``mixed`` indeterminate: B/I/U/S go unchecked
+        with a muted ``mixed`` look (QSS #SegButton[mixed]); the family reads
+        'Multiple'. Called INSIDE ``_loaded()`` so nothing echoes as an edit.
+        Always re-polishes so a field that is no longer mixed clears the look."""
+        btns = {"bold": self.bold_button, "italic": self.italic_button,
+                "underline": self.underline_button, "strike": self.strike_button}
+        for key, b in btns.items():
+            on = key in mixed
+            if on:
+                b.setChecked(False)
+            want = "true" if on else None
+            if b.property("mixed") != want:
+                b.setProperty("mixed", want)
+                b.style().unpolish(b)
+                b.style().polish(b)
+        if "font_family" in mixed:
+            self.family_combo.setCurrentText("")
+            self.family_combo.lineEdit().setPlaceholderText("Multiple")
 
     def set_hint(self, text: str | None) -> None:
         """Override the empty-state placeholder (e.g. while an IMAGE is
@@ -1097,7 +1061,9 @@ class Inspector(QWidget):
         if idx < 0:
             return
         try:
-            f = QFont(family)
+            # A picker label like "Calibri" renders its real bundled clone
+            # (Carlito) as the live specimen, not the OS's absent/real Calibri.
+            f = QFont(FontEngine.real_family_for(family))
             f.setPointSize(13)
             self.family_combo.setItemData(idx, f, Qt.FontRole)
         except Exception:

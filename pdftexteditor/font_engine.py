@@ -254,35 +254,46 @@ def detect_ttf_style(path: str, face_index: int = 0) -> "tuple[str, bool, bool]"
 def _alias_candidates(base_norm: str, raw_norm: str, flags: int) -> list[str]:
     """Map a normalized family to an ordered list of installed family names."""
     n = base_norm
+    # The five common Microsoft families are aliased to their metric-compatible
+    # open clones, which ship WITH the app (see _BUNDLED_FONT_DIR) and register
+    # with both Qt (register_bundled_fonts) and fitz (the bundled dir is in
+    # _SYSTEM_FONT_DIRS). The clone is listed FIRST so it wins on every OS --
+    # the app holds the fonts, so the live editor and the saved bake resolve to
+    # the identical face whether or not the real MS font is installed. Metric
+    # compatibility means the substitute keeps the original's widths/positions,
+    # so lines never reflow. Clones: Carlito=Calibri, Caladea=Cambria,
+    # Arimo=Arial, Tinos=Times New Roman, Cousine=Courier New.
     table: list[tuple[tuple[str, ...], list[str]]] = [
-        (("arial",), ["Arial"]),
-        (("timesnew", "timesnewroman", "times"), ["Times New Roman", "Times"]),
-        (("helvetica",), ["Helvetica"]),
-        (("couriernew", "courier"), ["Courier New", "Courier"]),
-        (("calibri",), ["Calibri", "Helvetica Neue"]),
+        (("arial",), ["Arimo", "Arial"]),
+        (("timesnew", "timesnewroman", "times"),
+         ["Tinos", "Times New Roman", "Times"]),
+        (("helvetica",), ["Arimo", "Helvetica"]),
+        (("couriernew", "courier"), ["Cousine", "Courier New", "Courier"]),
+        (("calibri",), ["Carlito", "Calibri"]),
+        (("cambria",), ["Caladea", "Cambria"]),
         (("georgia",), ["Georgia"]),
         (("comicsansms", "comicsans"), ["Comic Sans MS"]),
-        (("consolas", "menlo"), ["Menlo", "Consolas"]),
-        # The free DejaVu family ships WITH the app (see _BUNDLED_FONT_DIR), so
-        # edits to a PDF set in it -- the default for mPDF/matplotlib/many
-        # web-to-PDF tools -- render and save in the real face on any machine,
-        # never a substitute. Mono before Sans so "DejaVu Sans Mono" never
-        # matches the Sans key.
+        (("consolas", "menlo"), ["Cousine", "Menlo", "Consolas"]),
+        # The free DejaVu family also ships with the app, so edits to a PDF set
+        # in it -- the default for mPDF/matplotlib/many web-to-PDF tools --
+        # render and save in the real face on any machine. Mono before Sans so
+        # "DejaVu Sans Mono" never matches the Sans key.
         (("dejavusansmono", "dejavumono"), ["DejaVu Sans Mono"]),
         (("dejavusans", "dejavu"), ["DejaVu Sans"]),
     ]
     for keys, fams in table:
         if n in keys:
             return fams
-    # token-based families
+    # token-based families. The bundled clone leads each list so an unmatched
+    # family still resolves to an app-held face (not a maybe-missing OS one).
     if "garamond" in raw_norm or n.startswith("cmr") or n.startswith("nimbusrom"):
-        return ["Times New Roman", "Times"]
+        return ["Tinos", "Times New Roman", "Times"]
     # 'monotype' is the known false positive: the bare 'mono' hint matches
     # script faces like 'Monotype Corsiva', so exclude it from that match.
     mono_hint = ("mono" in raw_norm and "monotype" not in raw_norm) or any(
         t in raw_norm for t in ("consol", "menlo"))
     if (flags & FLAG_MONO) or mono_hint:
-        return ["Menlo", "Courier New"]
+        return ["Cousine", "Menlo", "Courier New"]
     # If the bare family name itself is an installed family, try it directly
     # first (e.g. "Georgia", "Verdana"), then fall back on style heuristics.
     direct = _titlecase_family(base_norm, raw_norm)
@@ -294,12 +305,12 @@ def _alias_candidates(base_norm: str, raw_norm: str, flags: int) -> list[str]:
     # reports DejaVuSans etc. with the serif flag set despite being sans), so a
     # "sans" name always falls back to a sans family rather than to Times.
     if any(t in raw_norm for t in _SANS_TOKENS):
-        out += ["Helvetica", "Arial"]
+        out += ["Arimo", "Helvetica", "Arial"]
     elif (flags & FLAG_SERIF) or any(
             t in raw_norm for t in ("serif", "times", "georgia", "roman")):
-        out.append("Times New Roman")
+        out += ["Tinos", "Times New Roman"]
     else:
-        out.append("Helvetica")
+        out += ["Arimo", "Helvetica"]
     return out
 
 
@@ -335,6 +346,22 @@ class FontEngine:
     # exact face is not found by name in the scanned index (they map to a
     # base-14 floor that is always glyph-safe + embeddable).
     _BASE14_DISPLAY_FAMILIES = ("Helvetica", "Times New Roman", "Courier New")
+
+    # UI display aliases: the bundled metric-compatible clones are LABELED with
+    # the familiar Microsoft names in the picker (nominative use -- we render and
+    # embed the clone, we only show the name the user already knows).
+    # available_families substitutes these into the list; display_name_for shows
+    # them for a clone-stored span; resolve()/resolve_family map the name back to
+    # the clone so a picked "Calibri" embeds Carlito. Saved PDFs still carry the
+    # clone's true /BaseFont ("Carlito"), so nothing in the output is mislabeled.
+    _MS_DISPLAY_ALIASES = {
+        "Carlito": "Calibri",
+        "Caladea": "Cambria",
+        "Arimo": "Arial",
+        "Tinos": "Times New Roman",
+        "Cousine": "Courier New",
+    }
+    _MS_DISPLAY_REVERSE = {v: k for k, v in _MS_DISPLAY_ALIASES.items()}
 
     def __init__(self, doc: fitz.Document) -> None:
         self.doc = doc
@@ -677,9 +704,18 @@ class FontEngine:
         families. Hidden system names ('.SF Numeric') are de-dotted."""
         real = cls._custom_qt_family.get(family)
         if real and real != family:
-            real = real.lstrip(".").strip()
-            return real or family
-        return family
+            real = real.lstrip(".").strip() or family
+        else:
+            real = family
+        # Show the familiar Microsoft name for a bundled metric-compatible clone.
+        return cls._MS_DISPLAY_ALIASES.get(real, real)
+
+    @classmethod
+    def real_family_for(cls, display_name: str) -> str:
+        """Reverse of the MS display alias: the actual bundled clone family to
+        build a QFont / embed for a picker LABEL like 'Calibri' -> 'Carlito'.
+        Returns the name unchanged for any non-aliased family."""
+        return cls._MS_DISPLAY_REVERSE.get(display_name, display_name)
 
     @classmethod
     def is_scan_alias(cls, family: str) -> bool:
@@ -755,7 +791,10 @@ class FontEngine:
             # the picker lists only genuinely pickable families.
             if cls.is_scan_alias(fam):
                 continue
-            names.add(fam)
+            # Label the bundled clones with the familiar Microsoft names; the
+            # set dedupes so a real OS "Arial" and the Arimo->"Arial" alias
+            # collapse to one entry.
+            names.add(cls._MS_DISPLAY_ALIASES.get(fam, fam))
         cls._available_families = sorted(names, key=str.casefold)
         return cls._available_families
 
@@ -793,6 +832,10 @@ class FontEngine:
 
         Pure + deterministic + cached on (family, bold, italic, glyph_key), like
         ``resolve``, so the live editor and save_as agree."""
+        # A picker LABEL like "Calibri" maps to its bundled clone so the picked
+        # family embeds Carlito -- exactly as resolve() aliases existing text.
+        # No-op for any non-aliased family. Saved /BaseFont is the clone's.
+        family = self._MS_DISPLAY_REVERSE.get(family, family)
         glyph_key = tuple(sorted(set(text)))
         cache_key = ("FAMILY", family, bold, italic, glyph_key)
         cached = self._resolve_cache.get(cache_key)

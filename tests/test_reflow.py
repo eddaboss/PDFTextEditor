@@ -338,7 +338,7 @@ def test_reflow_reflows(failures):
         d = PDFDocument(PARAGRAPHS)
         p = the_para(d, "quarterly operations")
         d.stage_edit(0, p, text)
-        edit = d._edits[(0, p.key)]
+        edit = d._edits[d._span_edit_key(0, p)]
         res = PDFDocument._wrap_for_edit(d.font_engine, 0, p, edit)
         n = len(res.lines)
         maxw = max((l.width for l in res.lines), default=0.0)
@@ -425,7 +425,7 @@ def test_align_spacing_layout(failures):
         d.stage_edit(0, p, base + " x")
         if align is not None or spacing is not None:
             d.set_style(0, p, alignment=align, line_spacing=spacing)
-        edit = d._edits[(0, p.key)]
+        edit = d._edits[d._span_edit_key(0, p)]
         res = PDFDocument._wrap_for_edit(d.font_engine, 0, p, edit)
         d.close()
         return res

@@ -71,7 +71,10 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFrame,
+    QListWidget,
+    QListWidgetItem,
     QCheckBox,
+    QComboBox,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -114,6 +117,7 @@ from ..workspace import Workspace
 from . import theme
 from .bookmark_panel import BookmarkPanel
 from .comments_panel import CommentsPanel
+from .forms_panel import FormsPanel
 from .doc_dialogs import (
     ExportImagesOptions,
     HeaderFooterOptions,
@@ -130,7 +134,7 @@ from .find_panel import FindReplacePanel
 from .inspector import Inspector
 from .thumbnail_cache import ThumbnailLoader
 from .left_panel import LeftPanel
-from .page_view import PageView
+from .page_view import PageView, TOP_DOCUMENT, TOP_FORM_FIELDS, TOP_FILL_FORM
 from .shortcuts_dialog import AboutDialog, ShortcutsDialog
 from .signature_dialog import SignatureDialog, signature_menu_icon
 from .thumbnail_sidebar import PageThumbnailSidebar
@@ -557,6 +561,82 @@ class FormFieldCommand(_ModelCommand):
         return None
 
     def _repaint(self) -> None:
+        fn = getattr(self._view, "repaint_page", None)
+        if callable(fn):
+            try:
+                fn(self._page_index)
+                return
+            except (TypeError, RuntimeError):
+                pass
+        super()._repaint()
+
+
+# The authored-field op -> document mutator name (three-modes §authoring). The
+# view emits (op, args); the command below dispatches through this map so a new
+# op is one line, not a new class.
+_OP_MAP = {
+    "add": "add_form_field",
+    "move": "move_form_field",
+    "resize": "resize_form_field",
+    "delete": "delete_form_field",
+    "rename": "rename_form_field",
+    "set_kind": "set_form_field_kind",
+    "set_fontsize": "set_form_field_fontsize",
+    "set_align": "set_form_field_alignment",
+}
+
+
+class FormFieldAuthorCommand(_ModelCommand):
+    """One authored-form-field mutation (three-modes §authoring), the same
+    lockstep shape as ``FormFieldCommand``: ``_apply`` runs EXACTLY one
+    document mutator (add/move/resize/delete/rename/set_kind), each of which
+    stages one model ``_push_annot_command``, so authoring interleaves with
+    text/box/annot/fills on the ONE shared undo stack. ``op`` selects the
+    method via ``_OP_MAP``; ``args`` carries its kwargs. Repaint is BY PAGE
+    (the AnnotCommand/FormFieldCommand precedent): the field has no text box,
+    the whole page's baked pixmap changed. An ``add`` remembers the created
+    spec so the window can open the props popup on it."""
+
+    def __init__(self, document, view, op: str, args: dict):
+        ref = args.get("ref")
+        page = args.get("page_index")
+        if page is None:
+            # ref is a FormField view (has page_index) or an identity tuple
+            # whose first element is the page -- either way, resolve the page so
+            # a move/delete on page N repaints page N, not page 0.
+            if isinstance(ref, tuple) and ref:
+                page = ref[0]
+            else:
+                page = getattr(ref, "page_index", 0)
+        super().__init__(document, view, int(page), None)
+        self._op = op
+        self._args = dict(args)
+        self._created = None
+        self.setText({
+            "add": "Add form field",
+            "move": "Move form field",
+            "resize": "Resize form field",
+            "delete": "Delete form field",
+            "rename": "Rename form field",
+            "set_kind": "Change field type",
+            "set_fontsize": "Set field font size",
+        }.get(op, "Edit form field"))
+
+    def _apply(self):
+        res = getattr(self._doc, _OP_MAP[self._op])(**self._args)
+        if self._op == "add":
+            self._created = res
+        return None
+
+    def _repaint(self) -> None:
+        # A batch operation (Align-all snaps every field at once) sets this flag
+        # so the N commands don't each dematerialize/re-materialize the page's
+        # QGraphicsRectItem hotspots -- that rapid churn freed a Python wrapper
+        # still live in the scene and the next paint crashed (macOS 27 beta:
+        # paint -> Shiboken getOverride -> func_dealloc). The batch repaints the
+        # affected pages ONCE when it's done.
+        if getattr(self._view, "_suspend_field_repaint", False):
+            return
         fn = getattr(self._view, "repaint_page", None)
         if callable(fn):
             try:
@@ -2000,6 +2080,32 @@ class MainWindow(QMainWindow):
         self.act_delete = mk("Delete Box", QKeySequence.Delete,
                              self._delete_selected, icon="delete")
 
+        # Three-modes switcher (three-modes §UI): Document / Form Fields /
+        # Fill Form as mutually-exclusive checkable actions in ONE
+        # QActionGroup (the exclusive-group idiom already used for Appearance).
+        # Document is the default; Fill Form is gated on has_form in
+        # _sync_actions. Each triggered routes through _on_top_mode_selected ->
+        # view.set_top_mode; the view bounces topModeChanged back to
+        # _sync_top_mode_ui (guarded by _syncing_top_mode).
+        from PySide6.QtGui import QActionGroup
+        self.act_mode_document = QAction("Document", self)
+        self.act_mode_form_fields = QAction("Form Fields", self)
+        self.act_mode_fill_form = QAction("Fill Form", self)
+        self._syncing_top_mode = False
+        self._top_mode_group = QActionGroup(self)
+        self._top_mode_group.setExclusive(True)
+        for act, mode, key in (
+            (self.act_mode_document, TOP_DOCUMENT, "Ctrl+1"),
+            (self.act_mode_form_fields, TOP_FORM_FIELDS, "Ctrl+2"),
+            (self.act_mode_fill_form, TOP_FILL_FORM, "Ctrl+3"),
+        ):
+            act.setCheckable(True)
+            act.setShortcut(QKeySequence(key))
+            self._top_mode_group.addAction(act)
+            act.triggered.connect(
+                lambda _checked=False, m=mode: self._on_top_mode_selected(m))
+        self.act_mode_document.setChecked(True)
+
         # Find & Replace (REFLOW_SPEC §R5.1): a window action so Cmd+F works
         # regardless of focus. It activates the Find tool in the left strip,
         # which the window maps to the (placeholder) Find panel for now.
@@ -2070,6 +2176,8 @@ class MainWindow(QMainWindow):
         # All actions live on the window so shortcuts fire regardless of focus.
         for act in (self.act_open, self.act_save, self.act_save_as, self.act_close,
                     self.act_undo, self.act_redo, self.act_add_text, self.act_delete,
+                    self.act_mode_document, self.act_mode_form_fields,
+                    self.act_mode_fill_form,
                     self.act_find, self.act_prev, self.act_next,
                     self.act_goto, self.act_first, self.act_last, self.act_zoom_in,
                     self.act_zoom_out, self.act_actual_size, self.act_fit_page,
@@ -2201,6 +2309,7 @@ class MainWindow(QMainWindow):
         # the selection, the window mirrors the record to gate Delete
         # Annotation and to anchor the popup.
         self._selected_annot = None
+        self._selected_field = None
         self._note_popup: NotePopup | None = None
         self.act_delete_annot = self._make_action(
             "Delete Annotation", None, self._delete_selected_annot)
@@ -2671,6 +2780,10 @@ class MainWindow(QMainWindow):
         bar.addWidget(lead)
         bar.addWidget(home_btn)
         bar.addWidget(titlewrap)
+
+        # The editing-mode switcher (Document / Form Fields / Fill Form) lives in
+        # the native menu bar (View menu, Ctrl+1/2/3), not in this in-app bar --
+        # every other app setting lives in the native bar, so the mode does too.
 
         # Right spacer.
         right_spacer = QWidget()
@@ -3347,6 +3460,10 @@ class MainWindow(QMainWindow):
 
     def _build_menu_view(self, bar: QMenuBar) -> QMenu:
         m = bar.addMenu("View")
+        # Editing mode (Document / Form Fields / Fill Form) now lives in the LEFT
+        # RAIL's mode cluster (LeftPanel._MODES), not the menu. The QActions stay
+        # registered on the window so Ctrl+1/2/3 keep working; they're just no
+        # longer shown here.
         m.addAction(self.act_toggle_pages)
         # Show Bookmarks before the view_panels anchor (the ws7 §M2 registry
         # row); other panel toggles (comments, …) insert AT the anchor.
@@ -3616,6 +3733,11 @@ class MainWindow(QMainWindow):
         self.left_panel.toolSelected.connect(self._on_tool_selected)
         # The rail's one-shot action buttons (Image / Sign) trigger their actions.
         self.left_panel.actionRequested.connect(self._on_rail_action)
+        # The rail's top-mode cluster (Edit / Fields / Fill) routes to the SAME
+        # slot the old View-menu items used -- the whole mode state machine
+        # (set_top_mode -> topModeChanged -> _sync_top_mode_ui, Ctrl+1/2/3) is
+        # unchanged; the rail is just an additional trigger surface.
+        self.left_panel.topModeSelected.connect(self._on_top_mode_selected)
         # When the view's mode flips (e.g. ESC exits add-text, or a commit returns
         # to select), reflect it in the strip so the highlighted tool is correct.
         self._connect_signal("modeChanged", self._on_view_mode_changed)
@@ -3626,7 +3748,11 @@ class MainWindow(QMainWindow):
         trigger the existing action."""
         act = {"image": getattr(self, "act_insert_image", None),
                "signature": getattr(self, "act_draw_signature", None)}.get(name)
-        if act is not None:
+        # Only fire when the action is actually enabled: Insert Image / Draw
+        # Signature are Document-mode-only (disabled in Form Fields / Fill Form),
+        # but Qt's act.trigger() runs even on a disabled action -- which placed
+        # an image in the wrong mode. Respect the enabled state the rail shows.
+        if act is not None and act.isEnabled():
             act.trigger()
 
     def _on_tool_selected(self, tool_id: str) -> None:
@@ -3638,6 +3764,13 @@ class MainWindow(QMainWindow):
         # early returns).
         self._sync_show_comments_check()
         self._sync_show_bookmarks_check()
+        # Mode-adaptive form / fill categories are panel-only: LeftPanel already
+        # swapped to the category's panel (which carries its own action buttons).
+        # Skip the Document-mode tool routing below -- it would tear down the
+        # active form mode (exit_add_text / exit_annot etc.).
+        if tool_id in ("field_build", "fill_fields",
+                       "fill_sign", "fill_image", "fill_flatten"):
+            return
         if tool_id == "add_text":
             # Drive the existing Add Text action so its checked state, the view's
             # add mode, and the strip all stay in lockstep.
@@ -4131,6 +4264,45 @@ class MainWindow(QMainWindow):
         self.markup_panel = self._build_markup_panel()
         self.left_panel.install_markup_panel(self.markup_panel)
 
+        # The Forms BUILDER: one always-on surface for FORM FIELDS mode (the
+        # Acrobat "prepare form" panel) -- a field-type PALETTE, the FIELDS
+        # list, and the SELECTED FIELD properties (name/type/size) in one panel
+        # so nothing hides when you select a field. Pure chrome: the window
+        # injects the callables; all model + undo coupling stays here. Selecting
+        # a field shows its props in-bar (apply_props -> _commit_field_props);
+        # the old FieldPropsPopup is gone.
+        self.forms_panel = FormsPanel(
+            list_fields=self._list_all_form_fields,
+            arm_add=lambda kind: self.view.set_add_field_kind(kind),
+            jump=self._jump_to_form_field,
+            edit=self._jump_to_form_field,          # "Edit" == select -> in-bar props
+            delete=self._delete_form_field_from_panel,
+            align=self._snap_all_fields_to_boxes,
+            apply_props=self._apply_field_props,
+            show_add=True, show_list=True,
+            icon_factory=make_icon,
+        )
+        self.left_panel.install_named_panel("forms_build", self.forms_panel)
+
+        # Fill Form categories: a fields-to-fill list + Sign / Image / Finish
+        # action panels (their buttons drive the existing actions).
+        self.fill_fields_panel = self._build_fill_fields_panel()
+        self.left_panel.install_named_panel("fill_fields", self.fill_fields_panel)
+        self.left_panel.install_named_panel("fill_sign", self._build_fill_action_panel(
+            "SIGN THE DOCUMENT",
+            "Draw a signature or place one you saved, then drop it on the page.",
+            [self.act_draw_signature,
+             getattr(self, "act_signature_from_file", None)]))
+        self.left_panel.install_named_panel("fill_image", self._build_fill_action_panel(
+            "PLACE AN IMAGE",
+            "Insert a photo or scan (an ID, a stamp) and position it on the page.",
+            [self.act_insert_image]))
+        self.left_panel.install_named_panel("fill_flatten", self._build_fill_action_panel(
+            "FINISH",
+            "Export a flattened copy: the fields, signature and images bake into "
+            "the page so the form can't be edited further.",
+            [self.act_flatten]))
+
         dock = QDockWidget("Tools", self)
         dock.setObjectName("LeftToolDock")
         dock.setFeatures(QDockWidget.NoDockWidgetFeatures)   # fixed, no close/float
@@ -4206,6 +4378,91 @@ class MainWindow(QMainWindow):
                 lay.addWidget(btn, 0, Qt.AlignLeft)
         lay.addStretch(1)
         return panel
+
+    def _build_fill_action_panel(self, title: str, help_text: str,
+                                 actions: list) -> QWidget:
+        """A Fill-Form category panel (Sign / Image / Finish): a caps header, a
+        line of help, and one QToolButton per action bound via setDefaultAction
+        so the icon/label/enabled-state and undo coupling all stay in the
+        existing action handlers (the _build_markup_panel pattern)."""
+        panel = QWidget()
+        panel.setObjectName("MarkupPanel")      # reuse the palette styling
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(8)
+        head = QLabel(title)
+        head.setObjectName("InspectorSectionHeader")
+        head.setFont(theme.caps_header_font())
+        lay.addWidget(head)
+        help_lbl = QLabel(help_text)
+        help_lbl.setObjectName("InspectorEmptyHint")
+        help_lbl.setWordWrap(True)
+        help_lbl.setFont(theme.ui_font(12))
+        lay.addWidget(help_lbl)
+        lay.addSpacing(4)
+        for act in actions:
+            if act is None:
+                continue
+            btn = QToolButton()
+            btn.setObjectName("MarkupToolButton")
+            btn.setDefaultAction(act)
+            btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            btn.setIconSize(QSize(theme.ICON_SIZE, theme.ICON_SIZE))
+            btn.setCursor(Qt.PointingHandCursor)
+            lay.addWidget(btn, 0, Qt.AlignLeft)
+        lay.addStretch(1)
+        return panel
+
+    def _build_fill_fields_panel(self) -> QWidget:
+        """The Fill-Form "Fill" category: a jump list of the form's fields. A
+        click scrolls to the field and focuses it so the user fills it on the
+        page. Populated by _refresh_fill_list."""
+        panel = QWidget()
+        panel.setObjectName("FormsPanel")
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        head = QLabel("FILL THE FORM")
+        head.setObjectName("InspectorSectionHeader")
+        head.setFont(theme.caps_header_font())
+        lay.addWidget(head)
+        hint = QLabel("Click a field to jump to it, then type or tick it on "
+                      "the page.")
+        hint.setObjectName("InspectorEmptyHint")
+        hint.setWordWrap(True)
+        hint.setFont(theme.ui_font(12))
+        lay.addWidget(hint)
+        self._fill_list = QListWidget()
+        self._fill_list.setObjectName("FormsList")
+        self._fill_list.setFont(theme.ui_font(12))
+        self._fill_list.setWordWrap(False)
+        self._fill_list.setFrameShape(QFrame.NoFrame)
+        self._fill_list.itemClicked.connect(
+            lambda item: self._jump_to_form_field(item.data(Qt.UserRole)))
+        lay.addWidget(self._fill_list, 1)
+        return panel
+
+    def _refresh_fill_list(self) -> None:
+        """Repopulate the Fill panel's jump list (called on entering Fill Form
+        and after any field change). A model read must not crash chrome."""
+        lst = getattr(self, "_fill_list", None)
+        if lst is None:
+            return
+        try:
+            fields = [f for f in (self._list_all_form_fields() or [])
+                      if getattr(f, "fillable", True)]
+        except Exception:  # noqa: BLE001 - a model read must not crash chrome
+            fields = []
+        fields.sort(key=lambda f: (int(getattr(f, "page_index", 0)),
+                                   (getattr(f, "rect", None) or (0, 0, 0, 0))[1]))
+        lst.clear()
+        for f in fields:
+            name = (getattr(f, "name", "") or "").strip() or "Field"
+            page = int(getattr(f, "page_index", 0))
+            item = QListWidgetItem(f"{name}    p.{page + 1}")
+            item.setData(Qt.UserRole, getattr(f, "identity", None))
+            lst.addItem(item)
 
     # ===================================================================
     # Status bar (BUILD_SPEC §6.6)
@@ -4303,6 +4560,13 @@ class MainWindow(QMainWindow):
         # gesture; the window funnels it into ONE FormFieldCommand.
         self._connect_signal("formCommandRequested",
                              self._on_form_command_requested)
+        # Three-modes (three-modes §UI/§authoring): the mode switcher's
+        # sync-back and the authored-field mutation route.
+        self._connect_signal("topModeChanged", self._sync_top_mode_ui)
+        self._connect_signal("fieldAuthorRequested",
+                             self._on_field_author_requested)
+        self._connect_signal("fieldSelectionChanged",
+                             self._on_field_selection_changed)
         self._connect_signal("statusMessage", self._toast)
         self._connect_signal("boxAdded", self._on_box_added)
         self._connect_signal("styleApplied", self._on_style_applied)
@@ -4325,6 +4589,10 @@ class MainWindow(QMainWindow):
         self.undo_stack.canUndoChanged.connect(self._on_can_undo_changed)
         self.undo_stack.canRedoChanged.connect(self._on_can_redo_changed)
         self.undo_stack.cleanChanged.connect(self._on_clean_changed)
+        # Keep the Forms panel's field list live across add/delete/rename and
+        # their undo/redo (each moves the stack index); guarded so it only
+        # rebuilds while the Forms panel is the visible left panel.
+        self.undo_stack.indexChanged.connect(self._refresh_forms)
         self.undo_stack.undoTextChanged.connect(self._refresh_undo_tooltips)
         self.undo_stack.redoTextChanged.connect(self._refresh_undo_tooltips)
 
@@ -4403,9 +4671,10 @@ class MainWindow(QMainWindow):
             style = dict(self.document.effective_style(page, box))
         except Exception:  # noqa: BLE001 - stale box must not crash chrome
             style = {}
+        mixed = cstyle.get("mixed", frozenset())
         style.update(cstyle)
         try:
-            self.inspector.set_target(box, style)
+            self.inspector.set_target(box, style, mixed=mixed)
         except (TypeError, RuntimeError):
             pass
         finally:
@@ -4681,6 +4950,254 @@ class MainWindow(QMainWindow):
         self._sync_status()
         self._sync_actions()
 
+    # -- three modes: switcher + authored-field commands -----------------
+    def _on_top_mode_selected(self, mode: str) -> None:
+        """A mode button / shortcut fired: drive the canvas transition. The
+        view stores the mode on the document and re-materializes the scene
+        graph; topModeChanged bounces back to _sync_top_mode_ui (guarded)."""
+        self.view.set_top_mode(mode)
+
+    def _sync_top_mode_ui(self, mode: str) -> None:
+        """Reflect a document's top mode in the switcher -- called from
+        view.topModeChanged AND _activate_document (so a tab switch moves the
+        radio to that doc's mode). Guarded against the re-entrant
+        toggle->set_top_mode->topModeChanged loop. If the mode is Fill Form
+        but the doc no longer has a form (last authored field undone/deleted),
+        bounce back to Document."""
+        if self._syncing_top_mode:
+            return
+        has_form = self.document is not None and getattr(
+            self.document, "has_form", False)
+        if mode == TOP_FILL_FORM and not has_form:
+            self.view.set_top_mode(TOP_DOCUMENT)   # re-emits topModeChanged
+            return
+        act = {
+            TOP_DOCUMENT: self.act_mode_document,
+            TOP_FORM_FIELDS: self.act_mode_form_fields,
+            TOP_FILL_FORM: self.act_mode_fill_form,
+        }.get(mode)
+        self._syncing_top_mode = True
+        self._top_mode_group.blockSignals(True)
+        try:
+            if act is not None:
+                act.setChecked(True)
+        finally:
+            self._top_mode_group.blockSignals(False)
+            self._syncing_top_mode = False
+        self._sync_actions()
+        lp = getattr(self, "left_panel", None)
+        if lp is not None:
+            # Follow the mode in the rail's mode cluster (no re-emit), and mirror
+            # the Fill-Form availability (only on a doc that has a form).
+            lp.set_active_mode(mode)
+            lp.set_mode_enabled(TOP_FILL_FORM, has_form)
+            # Swap the rail's category set + default panel to this mode
+            # (three-mode adaptive rail): Edit keeps the document tools, Form
+            # Fields shows Add / Fields, Fill Form shows Fill / Sign / Image /
+            # Finish. Refresh whichever field list the new mode surfaces.
+            lp.set_mode(mode)
+            if mode == TOP_FORM_FIELDS:
+                self._refresh_forms()
+            elif mode == TOP_FILL_FORM:
+                self._refresh_fill_list()
+
+    def _snap_all_fields_to_boxes(self) -> None:
+        """Align EVERY form field onto the box drawn on its page (checkbox glyph
+        '□', vector outline, or underline cell) so fills clip consistently.
+        USER-TRIGGERED from the Forms-panel button, on a fully-painted idle scene
+        (auto-align-on-open was reverted: its churn segfaulted). One undo step,
+        one repaint; toasts the count."""
+        doc = self.document
+        if doc is None or not getattr(doc, "has_form", False):
+            return
+        snaps: list = []
+        try:
+            for pi in range(doc.page_count):
+                for f in doc.form_fields(pi):
+                    if f.kind != "checkbox":
+                        continue      # checkboxes only (text fields blow up)
+                    snapped = doc.snap_field_rect(pi, tuple(f.rect),
+                                                  square_only=True)
+                    if snapped != tuple(f.rect):
+                        snaps.append((f, snapped))
+        except Exception:  # noqa: BLE001 - a snap pass must never crash chrome
+            snaps = []
+        if not snaps:
+            self._toast("Fields already line up with the boxes")
+            return
+        # Suppress the per-command page repaint: 58 dematerialize/re-materialize
+        # cycles in a tight loop freed a live-in-scene hotspot wrapper and the
+        # next paint crashed (macOS 27 beta). Apply all resizes, then repaint the
+        # touched pages ONCE -- the same single churn as any normal edit.
+        pages = {f.page_index for f, _ in snaps}
+        self.view._suspend_field_repaint = True
+        self.undo_stack.beginMacro(f"Align {len(snaps)} field(s) to boxes")
+        try:
+            for f, rect in snaps:
+                self._on_field_author_requested("resize",
+                                                {"ref": f, "rect": rect})
+        finally:
+            self.undo_stack.endMacro()
+            self.view._suspend_field_repaint = False
+        for pi in sorted(pages):
+            self.view.repaint_page(pi)
+        self._toast(f"Aligned {len(snaps)} field"
+                    f"{'s' if len(snaps) != 1 else ''} to the boxes")
+
+    def _on_field_author_requested(self, op: str, args: dict) -> None:
+        """The canvas asks for an authored-field mutation (three-modes
+        §authoring): wrap it in ONE FormFieldAuthorCommand and push -- the
+        single authoring route onto the shared undo stack (pattern:
+        _on_form_command_requested). A first 'add' flips has_form true, so
+        re-sync the actions (enables Fill Form) and open the props popup on the
+        new field so it can be named / retyped."""
+        if self.document is None or not op:
+            return
+        cmd = FormFieldAuthorCommand(self.document, self.view, op,
+                                     dict(args or {}))
+        try:
+            self.undo_stack.push(cmd)
+        except ValueError as exc:
+            # add/rename reject a duplicate or empty /T (document raises). The
+            # push's first redo surfaced it before anything committed; toast
+            # and drop it. ponytail: bounded to the dup-name edge; richer
+            # collision UX is deferred (three-modes DEFERRED §5).
+            self._toast(str(exc) or "Could not update the form field.")
+            return
+        self._sync_status()
+        self._sync_actions()
+        created = getattr(cmd, "_created", None)
+        if op == "add" and created is not None:
+            # Select the new field so its props show in the bar (no popup). The
+            # spec identity (page,'formfield',id) differs from the enumerated
+            # FormField identity (page,'form',name,xref) the selection + props
+            # use, so resolve by name to the live field and select by ITS id.
+            fld = next((f for f in self.document.form_fields(created.page_index)
+                        if f.name == created.name), None)
+            if fld is not None:
+                try:
+                    self.view._set_author_selected(fld.identity)
+                except Exception:  # noqa: BLE001 - selection is best-effort
+                    pass
+
+    # --- Forms panel injected callables (three-mode authoring §UI) -------
+    def _refresh_forms(self) -> None:
+        """Re-list the Forms panel while it is the visible left panel (top mode
+        FORM FIELDS). Wired to undo_stack.indexChanged (add/delete/rename and
+        their undo/redo all move the index) AND _sync_all (tab switch /
+        structural / mode entry). Cheap + guarded, so a text edit that also
+        moves the index costs nothing while the panel is hidden."""
+        panel = getattr(self, "forms_panel", None)
+        if panel is None:
+            return
+        try:
+            top = self.view.top_mode()
+        except Exception:  # noqa: BLE001
+            top = TOP_DOCUMENT
+        if top == TOP_FORM_FIELDS:
+            panel.refresh()
+        elif top == TOP_FILL_FORM:
+            self._refresh_fill_list()      # keep the Fill jump list current
+
+    def _list_all_form_fields(self) -> list:
+        """Every form field in the document (all pages) for the Forms panel:
+        pre-existing file widgets AND authored specs. Read-only; panel sorts."""
+        if self.document is None:
+            return []
+        out: list = []
+        for page in range(self.document.page_count):
+            try:
+                out.extend(self.document.form_fields(page))
+            except Exception:  # noqa: BLE001 - a model read must not crash chrome
+                continue
+        return out
+
+    def _form_field_from_identity(self, identity):
+        """The live FormField view for a panel row's identity, or None."""
+        if self.document is None or identity is None:
+            return None
+        try:
+            return self.view._form_field_by_identity(identity)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _jump_to_form_field(self, identity) -> None:
+        """Scroll the field's page into view and select it on the canvas (works
+        for authored + pre-existing fields, both now editable on the page)."""
+        if not isinstance(identity, tuple) or not identity:
+            return
+        self._set_view_page(int(identity[0]))
+        sel = getattr(self.view, "_set_author_selected", None)
+        if callable(sel):
+            try:
+                sel(identity)               # by identity, not the object
+            except Exception:  # noqa: BLE001 - selection is best-effort
+                pass
+
+    def _delete_form_field_from_panel(self, identity) -> None:
+        """Delete a field via one FormFieldAuthorCommand -- authored OR a
+        pre-existing widget (the model stages a widget-delete for the latter)."""
+        field = self._form_field_from_identity(identity)
+        if field is not None:
+            self._on_field_author_requested("delete", {"ref": field})
+
+    def _on_field_selection_changed(self, field) -> None:
+        """The canvas field selection changed (three-mode authoring): point the
+        Forms panel's in-bar SELECTED FIELD properties at it (name/type/size),
+        or hide them on clear. This REPLACES the FieldPropsPopup -- mirrors
+        _on_annot_selection_changed."""
+        self._selected_field = field
+        panel = getattr(self, "forms_panel", None)
+        if panel is not None:
+            try:
+                panel.set_field_target(field)
+            except Exception:  # noqa: BLE001 - a chrome update must not crash
+                pass
+
+    def _apply_field_props(self, identity, name: str, kind: str,
+                           size: float, align: int = 0) -> None:
+        """The in-bar SELECTED FIELD section committed a control: resolve the
+        identity to the live FormField and push whatever changed through the
+        existing diff engine (rename / set_kind / set_fontsize / set_align)."""
+        field = self._form_field_from_identity(identity)
+        if field is None:
+            return
+        page = int(getattr(field, "page_index", 0))
+        self._commit_field_props(field, page, name, kind, size, align)
+        # A rename changes the field's IDENTITY (it embeds the /T name), so
+        # re-select the field by its new name to keep the in-bar props pointed
+        # at it -- otherwise the next edit would use the stale identity.
+        target = name or getattr(field, "name", "")
+        fresh = next((f for f in self.document.form_fields(page)
+                      if f.name == target), None)
+        if fresh is not None and fresh.identity != identity:
+            try:
+                self.view._set_author_selected(fresh.identity)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _commit_field_props(self, ref, page_index: int, name: str, kind: str,
+                            size: float = 0.0, align: int | None = None) -> None:
+        """Push a rename / set_kind / set_fontsize / set_align command for
+        whatever actually changed (each is one FormFieldAuthorCommand == one
+        model op). An empty name is ignored (keeps the current /T); font size +
+        alignment apply to the TEXT family (text / date) only."""
+        if self.document is None:
+            return
+        if name and name != getattr(ref, "name", None):
+            self._on_field_author_requested("rename", {"ref": ref, "name": name})
+        if kind and kind != getattr(ref, "kind", None):
+            self._on_field_author_requested("set_kind", {"ref": ref, "kind": kind})
+        if kind in ("text", "date"):
+            cur = float(getattr(ref, "text_fontsize", 0.0) or 0.0)
+            if abs(size - cur) > 0.01:
+                self._on_field_author_requested(
+                    "set_fontsize", {"ref": ref, "size": size})
+            if align is not None \
+                    and int(align) != int(getattr(ref, "align", 0) or 0):
+                self._on_field_author_requested(
+                    "set_align", {"ref": ref, "align": int(align)})
+
     def _on_annot_selection_changed(self, record) -> None:
         """The canvas annot selection changed (annotations & markup §4.3):
         mirror the record, gate Delete Annotation on it, and point the
@@ -4898,6 +5415,12 @@ class MainWindow(QMainWindow):
             if callable(sel_fn):
                 try:
                     if sel_fn(overrides):
+                        # The selection is now uniform for this field: re-read it
+                        # so a formerly-mixed control drops the indeterminate look
+                        # (the apply stays in the editor and never re-emits itself).
+                        r = getattr(self.view, "refresh_caret_style", None)
+                        if callable(r):
+                            r()
                         return
                 except (TypeError, RuntimeError):
                     pass
@@ -5219,6 +5742,12 @@ class MainWindow(QMainWindow):
                 f"{n} form field{'s' if n != 1 else ''} detected. "
                 "Click a field to fill it.", 4000
             )
+            # NOTE: auto-align-on-open was reverted. Snapping 58 fields on open
+            # churned the QGraphicsRectItem hotspots and left a freed Python
+            # wrapper in the scene, which the next paint dereferenced ->
+            # SIGSEGV on macOS 27 beta + Qt 6.11 (paint -> Shiboken getOverride
+            # -> func_dealloc). The align is now MANUAL via the Forms panel
+            # button, which repaints ONCE (see _snap_all_fields_to_boxes).
         elif (self.document is not None
               and not restored
               and not getattr(self, "_ocr_running", False)
@@ -5638,9 +6167,11 @@ class MainWindow(QMainWindow):
         model's own history + structural undo persist."""
         self.workspace.switch(idx)
         document = self.workspace.active
-        # A note popup must not survive a document swap: its ref belongs to
-        # the OLD doc's annot maps (cancel -- never commit across docs).
+        # A note / field-props popup must not survive a document swap: its ref
+        # belongs to the OLD doc's maps (cancel -- never commit across docs).
         self.close_note_editor()
+        if hasattr(self, "forms_panel"):
+            self.forms_panel.set_field_target(None)   # hide the in-bar props
         self.undo_stack.clear()
         self.undo_stack.setClean()
         if document is None:
@@ -5652,6 +6183,14 @@ class MainWindow(QMainWindow):
             self._kick_persist()
             return
         self._hide_empty_state()   # returning to a tab leaves the start page
+        # Snap pre-existing form widgets onto the printed boxes ONCE, now --
+        # BEFORE set_document builds the scene, so the hotspots materialize
+        # already-aligned with zero repaint churn (the repaint-driven versions
+        # segfaulted; autosnap_existing_widgets is a pure model op, idempotent).
+        try:
+            document.autosnap_existing_widgets()
+        except Exception:  # noqa: BLE001 - a snap pass must never block open
+            pass
         self.view.set_document(document)
         self.sidebar.set_document(document)
         self.sidebar.set_current_page(self.view_page_index())
@@ -5665,6 +6204,8 @@ class MainWindow(QMainWindow):
         self._sync_structural_undo_stack()
         self.tab_bar.sync(self.workspace)
         self._sync_all()
+        # Move the mode switcher to THIS doc's stored top mode (per-tab).
+        self._sync_top_mode_ui(getattr(document, "top_mode", TOP_DOCUMENT))
         self._kick_persist()
 
     def save_pdf(self) -> None:
@@ -7242,6 +7783,7 @@ class MainWindow(QMainWindow):
         # _refresh_after_structural_undo).
         self._refresh_comments()
         self._refresh_bookmarks()
+        self._refresh_forms()
         # Window chrome (navigation M2): the macOS proxy icon follows the
         # active doc via windowFilePath (set BEFORE the title -- Qt derives a
         # title from the path, and the explicit setWindowTitle must win);
@@ -7404,9 +7946,40 @@ class MainWindow(QMainWindow):
                 has_doc and getattr(self.document, "has_form", False))
         has_selection = has_doc and self._current_selection() is not None
         self.act_delete.setEnabled(has_selection)
-        if not has_doc and self.act_add_text.isChecked():
+        # Three-modes gating (three-modes §UI): Fill Form only on a form-
+        # bearing doc; Form Fields + Document whenever a doc is open (Form
+        # Fields can CREATE the first field -> has_form flips -> next
+        # _sync_actions enables Fill Form). The DOCUMENT sub-tools are enabled
+        # ONLY in Document mode so a wrong-mode tool cannot be armed -- this
+        # (plus the structural hotspot gating in page_view) is what kills the
+        # text-edit / form-fill overlap.
+        has_form = has_doc and getattr(self.document, "has_form", False)
+        top_mode = self.view.top_mode() if has_doc else TOP_DOCUMENT
+        in_document = has_doc and top_mode == TOP_DOCUMENT
+        self.act_mode_document.setEnabled(has_doc)
+        self.act_mode_form_fields.setEnabled(has_doc)
+        self.act_mode_fill_form.setEnabled(has_form)
+        doc_tools = [self.act_add_text, self.act_crop]
+        doc_tools += list(getattr(self, "_markup_actions", {}).values())
+        for act in doc_tools:
+            act.setEnabled(in_document)
+        # Insert Image / Draw Signature are BOTH document-editing AND form-
+        # filling tools (signing/placing on a form is a fill action -- they are
+        # the Fill Form rail's Sign / Image categories), so enable them in
+        # Document OR Fill Form mode.
+        in_fill = has_doc and top_mode == TOP_FILL_FORM
+        place_tools = []
+        if hasattr(self, "act_insert_image"):
+            place_tools.append(self.act_insert_image)
+        if hasattr(self, "act_draw_signature"):
+            place_tools += [self.act_draw_signature, self.act_signature_from_file]
+        for act in place_tools:
+            act.setEnabled(in_document or in_fill)
+        # Leaving Document mode disarms the two checkable canvas tools (Add
+        # Text / Crop) -- not just the empty state.
+        if not in_document and self.act_add_text.isChecked():
             self.act_add_text.setChecked(False)
-        if not has_doc and self.act_crop.isChecked():
+        if not in_document and self.act_crop.isChecked():
             self.act_crop.setChecked(False)
         self._sync_save_enabled()
 

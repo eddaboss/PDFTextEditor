@@ -233,6 +233,11 @@ def open_window(path: str) -> MainWindow:
     if getattr(w, "empty_state", None) is not None:
         w.empty_state.hide()
     pump(2)
+    # Fills live in FILL FORM mode (three-mode feature): enter it so the
+    # fillable-field hotspots materialize. No-op on a form-free doc.
+    from pdftexteditor.ui.page_view import TOP_FILL_FORM
+    w.view.set_top_mode(TOP_FILL_FORM)
+    pump(3)
     return w
 
 
