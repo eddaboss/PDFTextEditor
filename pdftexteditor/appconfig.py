@@ -16,7 +16,11 @@ except Exception:
 CHANNEL = _BAKED or os.environ.get("PDFTE_BUILD_CHANNEL", "dev")
 IS_DEV = CHANNEL != "stable"
 
-_PROD_API = "https://pdftexteditor.up.railway.app"
+# Direct Railway service origins (NOT the Cloudflare-proxied pdf-for-free.com):
+# the app talks straight to Railway for accounts + update metadata, same as the
+# publish upload does, so nothing here is subject to Cloudflare's 100 MB body
+# cap. The old prod value (pdftexteditor.up.railway.app) was never bound and 404'd.
+_PROD_API = "https://api-production-5c32.up.railway.app"
 _DEV_API = "https://pdftexteditor-dev.up.railway.app"
 
 import sys

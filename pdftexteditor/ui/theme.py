@@ -824,6 +824,15 @@ def global_stylesheet() -> str:
     QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
     QLineEdit:disabled {{ background: {CONTROL_FILL_DISABLED}; color: {TOOLBAR_ICON_DISABLED}; }}
     QComboBox::drop-down {{ border: none; width: 20px; }}
+    /* A visible dropdown caret so a combo reads as a dropdown, not a text field
+       (a CSS triangle -- no image asset needed). */
+    QComboBox::down-arrow {{
+        image: none; width: 0; height: 0;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 5px solid {TEXT_SECONDARY};
+        margin-right: 7px;
+    }}
     QComboBox QAbstractItemView {{
         background: {CHROME_BG}; color: {TEXT_PRIMARY};
         border: 1px solid {BORDER_STRONG}; border-radius: 10px; padding: 4px; outline: none;
@@ -1028,6 +1037,13 @@ def global_stylesheet() -> str:
         background: {ACCENT_ACTIVE_WASH};
         color: {ACCENT_TEXT};
     }}
+    /* Indeterminate: the selection mixes this style (some bold, some not). A
+       dashed muted chip -- neither on nor off -- reads as "varies". */
+    QToolButton#SegButton[mixed="true"] {{
+        background: {WASH_HOVER};
+        color: {TEXT_SECONDARY};
+        border: 1px dashed {TEXT_SECONDARY};
+    }}
     QToolButton#SegButton:disabled {{ color: {TOOLBAR_ICON_DISABLED}; }}
 
     /* Color chip: a swatch + hex readout sharing the size row. */
@@ -1052,6 +1068,60 @@ def global_stylesheet() -> str:
         color: {ACCENT_TEXT};
     }}
     QLabel#SelChipTitle {{ color: {TEXT_PRIMARY}; }}
+
+    /* Forms builder panel (three-mode authoring §UI): field rows match the
+       Bookmark tree's row treatment; the row-action buttons are the app's
+       secondary outline style. Everything else in the panel reuses the
+       Inspector eyebrow / segmented-control / empty-hint QSS. */
+    QWidget#FormsPanel {{ background: {PANEL_BG}; }}
+    QLabel#FormsArmedHint {{ color: {ACCENT_TEXT}; background: transparent; }}
+    QListWidget#FormsList {{
+        background: transparent;
+        border: none;
+        outline: none;
+        color: {TEXT_PRIMARY};
+    }}
+    QListWidget#FormsList::item {{
+        border-radius: 6px;
+        padding: 7px 8px;
+        margin: 1px 0;
+    }}
+    QListWidget#FormsList::item:hover {{ background: {WASH_HOVER}; }}
+    QListWidget#FormsList::item:selected {{
+        background: {ACCENT_HOVER};
+        color: {TEXT_PRIMARY};
+    }}
+    QPushButton#FormsRowBtn {{
+        background: transparent;
+        border: 1px solid {BORDER_STRONG};
+        border-radius: {BUTTON_RADIUS}px;
+        padding: 6px 12px;
+        color: {TEXT_PRIMARY};
+    }}
+    QPushButton#FormsRowBtn:hover {{
+        background: {WASH_HOVER};
+        border: 1px solid {ACCENT_BORDER};
+    }}
+    QPushButton#FormsRowBtn:disabled {{
+        color: {TOOLBAR_ICON_DISABLED};
+        border: 1px solid {CHROME_BORDER};
+    }}
+    /* Field-type palette buttons: clean icon+label rows; the armed type reads
+       as a light accent-tinted card (no loud accent text). */
+    QToolButton#FieldTypeBtn {{
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: {BUTTON_RADIUS}px;
+        padding: 7px 10px;
+        color: {TEXT_PRIMARY};
+    }}
+    QToolButton#FieldTypeBtn:hover {{ background: {WASH_HOVER}; }}
+    QToolButton#FieldTypeBtn:checked {{
+        background: {ACCENT_ACTIVE_WASH};
+        border: 1px solid {ACCENT_BORDER};
+        color: {TEXT_PRIMARY};
+        font-weight: 600;
+    }}
     QLabel#SelChipSub {{ color: {TEXT_SECONDARY}; }}
     /* Line-spacing spin (the only remaining paragraph-only control). */
     QDoubleSpinBox#InspectorLineSpacing {{

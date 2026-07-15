@@ -199,6 +199,20 @@ MODE_SELECT = "select"
 MODE_ADD_TEXT = "add_text"
 MODE_TEXT_EDIT = "text_edit"
 MODE_SELECT_TEXT = "select_text"
+# Three mutually-exclusive TOP modes (three-modes feature): the whole page
+# behaves as a Document editor, a Form-Fields author, or a Form filler. The
+# top mode lives on the PDFDocument (per-tab for free), not the shared view;
+# ``PageView.top_mode()`` reads it. DOCUMENT hotspots, FILL_FORM field
+# hotspots, and FORM_FIELDS author hotspots are gated at CONSTRUCTION so a
+# wrong-mode hotspot never exists (the overlap dies structurally). The raw
+# string values are mirrored by document.py's ``top_mode`` default.
+TOP_DOCUMENT = "document"
+TOP_FORM_FIELDS = "form_fields"
+TOP_FILL_FORM = "fill_form"
+# FORM_FIELDS sub-tool: drag-to-create a new authored field. Armed while the
+# view is in FORM_FIELDS (idle FORM_FIELDS clicks still select/move existing
+# authored fields, whose hotspots claim their own presses).
+MODE_ADD_FIELD = "add_field"
 # Text-markup tool modes (annotations & markup §4.2): one mode per kind,
 # ``"markup_" + kind``; the kind is the model's AnnotSpec.kind. All register
 # in ``_mode_handlers`` (perf foundation M4c) -- no inline press branches.
@@ -250,6 +264,32 @@ _IMAGE_MIN_RESIZE_PX = 8.0
 _WORD_SNAP_LINE_HEIGHTS = 1.2
 # Triple-click promote distance (scene px), mirroring the editor's §2.2 rule.
 _TRIPLE_CLICK_SLOP_PX = 4.0
+
+
+def _paint_never_raises(paint):
+    """Wrap a QGraphicsItem ``paint`` override so an exception can NEVER escape.
+
+    An exception raised inside a Qt VIRTUAL override does not propagate as a
+    normal Python error -- it unwinds into the C++ paint machinery and crashes
+    the process (Shiboken ``getOverride`` -> ``func_dealloc`` SIGSEGV on
+    macOS 27 / PySide 6.11). That single failure mode took the app down THREE
+    times pre-1.0 (the last: ``is_edit_unsaved`` raising AttributeError on an
+    annotation command mid-paint -- "the highlighter crashes the app"). Root
+    causes are fixed at the source; this is the class-wide backstop so any
+    future paint bug degrades to ONE missed frame + a debug line, never a crash.
+    """
+    def _wrapped(self, painter, option, widget=None):
+        try:
+            return paint(self, painter, option, widget)
+        except Exception:  # noqa: BLE001 - a paint override must not crash Qt
+            try:
+                dlog("PAINT", "override_raised", cls=type(self).__name__)
+            except Exception:
+                pass
+            return None
+    _wrapped.__name__ = getattr(paint, "__name__", "paint")
+    _wrapped.__doc__ = getattr(paint, "__doc__", None)
+    return _wrapped
 
 
 class SpanHotspot(QGraphicsRectItem):
@@ -309,6 +349,7 @@ class SpanHotspot(QGraphicsRectItem):
             return
         super().mouseDoubleClickEvent(event)
 
+    @_paint_never_raises
     def paint(self, painter: QPainter, option, widget=None):
         # While THIS box is being edited, draw nothing (the editor is the visual
         # focus). A SELECTED box also draws nothing here (the selection overlay
@@ -327,21 +368,23 @@ class SpanHotspot(QGraphicsRectItem):
         if edited and len(getattr(box, "cover", ()) or ()) == 7 \
                 and getattr(box, "render_mode", 0) == 3:
             edited = False
-        # PERSISTENT AFFORDANCE: every editable OCR overlay carries a thin,
-        # SEE-THROUGH clay border at rest, so you can see at a glance where the
-        # editable boxes are. Half alpha makes it read as a UI hint, NOT a line
-        # that belongs to the scanned page. The edited tint + hover wash below
-        # still paint ON TOP, so an unsaved edit still stands out.
-        if len(getattr(box, "cover", ()) or ()) == 7:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            bcol = QColor(theme.color_accent())
-            bcol.setAlphaF(0.5)
-            bpen = QPen(bcol)
-            bpen.setWidthF(1.0)
-            bpen.setCosmetic(True)                # constant on-screen width at any zoom
-            painter.setPen(bpen)
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(self.rect(), 2.0, 2.0)
+        # PERSISTENT AFFORDANCE: EVERY editable box -- vector text spans AND OCR
+        # overlays -- carries a thin, SEE-THROUGH clay border at rest, so you can
+        # see at a glance where the editable boxes are, not only on hover. Half
+        # alpha makes it read as a UI hint, NOT a line that belongs to the page.
+        # The edited tint + hover wash below still paint ON TOP, so an unsaved
+        # edit still stands out. (Was gated to cover==7 / OCR only.)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        bcol = QColor(theme.color_accent())
+        # 0.5 alpha reads on a gray scan but nearly vanishes on the WHITE
+        # document page, so vector boxes need more contrast to show at a glance.
+        bcol.setAlphaF(0.85 if len(getattr(box, "cover", ()) or ()) != 7 else 0.5)
+        bpen = QPen(bcol)
+        bpen.setWidthF(1.0)
+        bpen.setCosmetic(True)                # constant on-screen width at any zoom
+        painter.setPen(bpen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(self.rect(), 2.0, 2.0)
         # An UNSAVED edit carries a PERSISTENT ochre mark on the white page -- a
         # faint tint + a thin baseline underline -- so pending changes stay
         # visible at rest, not only on hover (the in-place edit signature). The
@@ -428,7 +471,7 @@ class ImageHotspot(QGraphicsRectItem):
         self.setPen(QPen(Qt.NoPen))
         self.setBrush(QBrush(Qt.transparent))
         self.setZValue(Z_IMAGE_HOTSPOT)
-        self.setCursor(Qt.SizeAllCursor)
+        self.setCursor(Qt.OpenHandCursor)
 
     @property
     def box(self):
@@ -509,6 +552,7 @@ class FieldHotspot(QGraphicsRectItem):
             return
         super().mousePressEvent(event)
 
+    @_paint_never_raises
     def paint(self, painter: QPainter, option, widget=None):
         # While THIS field's inline editor is mounted, draw nothing (the
         # editor + its white cover are the visual focus).
@@ -529,6 +573,131 @@ class FieldHotspot(QGraphicsRectItem):
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(self.rect())
+
+
+class FieldAuthorHotspot(QGraphicsRectItem):
+    """An overlay over ONE authored form field while the view is in
+    FORM_FIELDS (three-modes feature). Unlike the transparent fill/text
+    hotspots it PAINTS a dashed accent outline plus a small name/kind caption
+    so authored fields are visible and directly manipulable; the selected one
+    gets a solid outline. Built only for authored specs (synthetic negative
+    ``xref``) by ``_field_author_hotspot_factory`` and freed via
+    ``layer.extra_items``. Sits above ``Z_FORM_HOTSPOT`` so its presses win.
+    The view owns all authoring routing -- the hotspot only forwards its
+    press (select / move / resize) and double-click (edit props)."""
+
+    _AFFORD = 10.0                      # size of the resize / delete affordances
+
+    def __init__(self, rect: QRectF, field, view: "PageView"):
+        super().__init__(rect)
+        self.field = field                 # the (frozen) authored FormField view
+        self.identity = field.identity     # (page, negative xref): stable per spec
+        self.page_index = field.page_index
+        self._view = view
+        self.setAcceptHoverEvents(True)
+        self.setZValue(Z_FORM_HOTSPOT + 1)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def _selected(self) -> bool:
+        return self._view._author_selected == self.identity
+
+    def affordances_shown(self) -> bool:
+        """Whether the field is big enough to carry on-canvas resize/delete
+        controls without them overlapping (tiny fields like checkboxes stay
+        clean -- move + Delete-key + panel handle them)."""
+        r = self.rect()
+        return r.width() > 3 * self._AFFORD and r.height() > 2 * self._AFFORD
+
+    def _delete_rect(self) -> QRectF:
+        """The delete-'x' hit box (top-RIGHT corner; clears the top-left
+        caption). Shown only while selected."""
+        a = self._AFFORD
+        r = self.rect()
+        return QRectF(r.right() - a, r.top(), a, a)
+
+    def _resize_rect(self) -> QRectF:
+        """The SE resize-handle hit box (bottom-right corner)."""
+        a = self._AFFORD
+        r = self.rect()
+        return QRectF(r.right() - a, r.bottom() - a, a, a)
+
+    def mousePressEvent(self, event):
+        # A press on the delete 'x' removes the field -- hit-test it FIRST, then
+        # emit and RETURN without touching self (the delete repaints the page and
+        # frees this item; anything after would run on a freed object -> crash).
+        if event.button() == Qt.LeftButton and self._selected() \
+                and self.affordances_shown() \
+                and self._delete_rect().contains(event.pos()):
+            event.accept()
+            self._view._on_author_field_delete(self.identity)
+            return
+        if event.button() == Qt.LeftButton and self._view._on_author_field_press(
+            self, event.scenePos()
+        ):
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._view._on_author_field_double_click(
+            self
+        ):
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    @_paint_never_raises
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        selected = self._view._author_selected == self.identity
+        wash = QColor(theme.color_accent())
+        wash.setAlpha(30 if selected else 14)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(wash))
+        painter.drawRect(self.rect())
+        pen = QPen(theme.color_accent())
+        pen.setWidthF(1.5 if selected else 1.0)
+        pen.setCosmetic(True)
+        if not selected:
+            pen.setStyle(Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self.rect())
+        # Name/kind caption in the top-left corner (clipped to the rect).
+        caption = "%s (%s)" % (getattr(self.field, "name", "") or "field",
+                               getattr(self.field, "kind", "text"))
+        painter.setPen(QPen(theme.color_accent()))
+        f = painter.font()
+        f.setPixelSize(9)
+        painter.setFont(f)
+        painter.drawText(self.rect().adjusted(2, 1, -2, -1),
+                         Qt.AlignTop | Qt.AlignLeft, caption)
+        if selected and self.affordances_shown():
+            self._paint_affordances(painter)
+
+    def _paint_affordances(self, painter: QPainter) -> None:
+        """The selected field's on-canvas controls: a filled SE resize handle
+        (drag to size) and a red delete 'x' in the NE corner (click to remove).
+        Cosmetic squares in scene space so they track zoom."""
+        # SE resize handle -- a filled accent square (matches the SE grab zone).
+        hr = self._resize_rect()
+        painter.setPen(QPen(theme.color_selection_halo()))
+        painter.setBrush(QBrush(theme.color_accent()))
+        painter.drawRect(hr)
+        # NE delete affordance -- a danger disc with a white x.
+        dr = self._delete_rect()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(theme.color_danger()))
+        painter.drawEllipse(dr)
+        pen = QPen(QColor("#FFFFFF"))
+        pen.setWidthF(1.4)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        m = dr.width() * 0.30
+        painter.drawLine(dr.left() + m, dr.top() + m,
+                         dr.right() - m, dr.bottom() - m)
+        painter.drawLine(dr.left() + m, dr.bottom() - m,
+                         dr.right() - m, dr.top() + m)
 
 
 class _ResizeHandle(QGraphicsRectItem):
@@ -556,7 +725,7 @@ class _ResizeHandle(QGraphicsRectItem):
         # scene units, so it ballooned at high zoom and (worse) crowded a small
         # box at low zoom -- making move-vs-resize hit targets ambiguous.
         self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-        self.setCursor(_HANDLE_CURSORS.get(handle_id, Qt.SizeAllCursor))
+        self.setCursor(_HANDLE_CURSORS.get(handle_id, Qt.OpenHandCursor))
 
     def set_compact(self, compact: bool) -> None:
         """Resize the handle square for compact mode (text-editing UX §3.3a):
@@ -579,11 +748,16 @@ class _ResizeHandle(QGraphicsRectItem):
 
 
 # Per-handle resize cursors (EDITOR_SPEC §6: hit-test order handles before body).
+# NATIVE cursors only: the directional Size* shapes (SizeFDiag/BDiag/Ver/Hor,
+# like SizeAll) have no native NSCursor, so Qt renders them from a bitmap and
+# QImage::toCGImage SIGTRAPs on the macOS 27 beta the moment a handle is hovered
+# -- the crash behind "the highlighter crashes" (handles show on ANY selection).
+# OpenHandCursor is native (grab shape) and matches the migration already applied
+# to ImageHotspot and the _ResizeHandle default. The handle squares stay visible,
+# so the grab affordance is intact even without a directional hint.
 _HANDLE_CURSORS = {
-    "nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor,
-    "ne": Qt.SizeBDiagCursor, "sw": Qt.SizeBDiagCursor,
-    "n": Qt.SizeVerCursor, "s": Qt.SizeVerCursor,
-    "e": Qt.SizeHorCursor, "w": Qt.SizeHorCursor,
+    hid: Qt.OpenHandCursor
+    for hid in ("nw", "se", "ne", "sw", "n", "s", "e", "w")
 }
 
 
@@ -684,7 +858,16 @@ class InlineRunEditor(QGraphicsTextItem):
                 return
             event.ignore()
             return
+        _cur = self.textCursor()
+        _had_sel = _cur.hasSelection()
+        _sel_len = len(_cur.selectedText()) if _had_sel else 0
         super().keyPressEvent(event)
+        # Per-keystroke TEXT trace (the debuglog category was designed for this
+        # but never wired): captures exactly what Delete/Backspace/typing did to
+        # the editor text -- e.g. a Backspace on a 10-char selection that leaves
+        # an empty box is a delete bug. Dev-only + truncated by the logger.
+        dlog("TEXT", "keypress", key=key, had_sel=_had_sel, sel_len=_sel_len,
+             text=self.toPlainText())
         self._view._position_caret_item()         # arrows / home / end / typing move it
 
     def _cursor_style_flag(self, prop: str) -> bool:
@@ -837,6 +1020,7 @@ class InlineRunEditor(QGraphicsTextItem):
         cursor.select(QTextCursor.LineUnderCursor)
         self.setTextCursor(cursor)
 
+    @_paint_never_raises
     def paint(self, painter: QPainter, option, widget=None):
         # SCAN-PRESERVE: the glyphs the user sees ARE the scanned pixels underneath,
         # and the live composite shows the edited run. Draw ONLY the caret -- never the
@@ -1003,8 +1187,14 @@ class FormFieldEditor(QGraphicsTextItem):
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
+        # A form field is left ONLY by Escape (cancel), Return (commit), or a
+        # click OUTSIDE it (committed in PageView.mousePressEvent) -- NEVER by a
+        # focus steal (a mouse move/hover, a repaint, the panel, the window
+        # deactivating), which used to commit + tear the editor down mid-fill
+        # ("the boxes kick you out too easily"). Re-assert focus on the next
+        # tick instead, mirroring InlineRunEditor's no-kickout rule.
         if not self._cancelled:
-            self._view.commit_form_editor()
+            self._view._reassert_form_editor_focus(self)
 
 
 class SelectionOverlay(QGraphicsItem):
@@ -1109,6 +1299,7 @@ class SelectionOverlay(QGraphicsItem):
         return self._rect.adjusted(-_OUTLINE_INFLATE - 2, -_OUTLINE_INFLATE - 2,
                                    _OUTLINE_INFLATE + 2, _OUTLINE_INFLATE + 2)
 
+    @_paint_never_raises
     def paint(self, painter: QPainter, option, widget=None):
         if self._rect.isNull():
             return
@@ -1513,6 +1704,19 @@ class PageView(QGraphicsView):
     # The window wraps it in ONE FormFieldCommand -- the view NEVER stages
     # a fill itself.
     formCommandRequested = Signal(object, dict)
+    # The active TOP mode changed (three-modes feature): the window syncs its
+    # exclusive mode switcher + sub-tool gating off this.
+    topModeChanged = Signal(str)
+    # A form-field AUTHORING intent (three-modes feature), the mirror of
+    # formCommandRequested for the FORM_FIELDS author: (op, args) where op is
+    # one of add/move/resize/delete/rename/set_kind and args carries the
+    # target ref + parameters. The window wraps it in ONE
+    # FormFieldAuthorCommand -- the view NEVER stages an author edit itself.
+    fieldAuthorRequested = Signal(str, object)
+    # The selected authored/existing form field changed (three-mode authoring):
+    # emits the FormField (or None on clear). The window drives the in-bar
+    # SELECTED FIELD properties from this -- it REPLACES the old FieldPropsPopup.
+    fieldSelectionChanged = Signal(object)
     # A transient user-facing note (e.g. "No text under selection"); the
     # window routes it to its toast slot.
     statusMessage = Signal(str)
@@ -1783,6 +1987,14 @@ class PageView(QGraphicsView):
         self._mode_handlers[MODE_PLACE_IMAGE] = {
             "press": self._press_place_image, "key": self._key_place_image,
         }
+        # Form-field authoring (three-modes feature): the FORM_FIELDS drag-to-
+        # create sub-tool. Empty-canvas press-drag rubber-bands a new field
+        # rect; presses on an existing author hotspot are claimed by that item
+        # (select/move), never this handler. Delete/Backspace removes the
+        # selected field, Esc aborts an in-flight rubber.
+        self._mode_handlers[MODE_ADD_FIELD] = {
+            "press": self._press_add_field, "key": self._key_add_field,
+        }
         # Page-item factories (perf foundation M4b): callables
         # ``factory(layer, view) -> list[QGraphicsItem]`` run at the end of
         # every page materialize so later workstreams (annotation/form
@@ -1800,6 +2012,11 @@ class PageView(QGraphicsView):
         # ``layer.extra_items``. On a form-free document the factory
         # contributes zero items, so the default scene census is unchanged.
         self.register_page_item_factory(self._field_hotspot_factory)
+        # Authored-field hotspots ride the same seam (three-modes feature):
+        # one FieldAuthorHotspot per AUTHORED field (synthetic negative xref),
+        # only while the view is in FORM_FIELDS. Zero items in every other
+        # mode, so the default scene census is unchanged.
+        self.register_page_item_factory(self._field_author_hotspot_factory)
         # OCR progress overlay: a single translucent widget ON TOP of the
         # viewport (NOT a scene item) that frosts each page being recognized and
         # animates its bar. Kept out of the scene so its animation never repaints
@@ -1863,6 +2080,22 @@ class PageView(QGraphicsView):
         self._crop_page: int | None = None
         self._crop_anchor: QPointF | None = None
         self._crop_rubber: QGraphicsRectItem | None = None
+        # --- Form-field authoring state (three-modes feature) --------------
+        # The in-flight drag-to-CREATE rubber (mirrors crop): pressed page +
+        # sheet-clamped anchor + dashed rect item. None = no add drag.
+        self._author_page: int | None = None
+        self._author_anchor: QPointF | None = None
+        self._author_rubber: QGraphicsRectItem | None = None
+        # The currently SELECTED authored field's identity (for delete / the
+        # solid outline), or None.
+        self._author_selected = None
+        # The in-flight MOVE/RESIZE drag of a selected authored field:
+        # {"ref", "page", "start", "armed", "start_rect", "hotspot", "mode"}
+        # where mode is "move" or "resize". None = no such drag.
+        self._author_drag: dict | None = None
+        # Which kind the next drag-to-create places (FORM FIELDS palette drives
+        # it via set_add_field_kind); 'text' | 'checkbox' (add_form_field's set).
+        self._add_field_kind = "text"
         # Second-click-to-edit (REFLOW_SPEC: single click SELECTS, a second
         # click on the ALREADY-selected box starts text editing with the caret
         # where clicked). Set on a press that lands on the current selection;
@@ -1954,6 +2187,8 @@ class PageView(QGraphicsView):
         self._image_place_rubber = None    # item dies with the reload
         self._drag_image_preview = None
         self._end_crop_drag()              # before reload() clears the scene
+        self._end_author_drag()            # authoring drag state is per-doc
+        self._author_selected = None
         self._mode = MODE_SELECT
         self.reload()
         # Apply the fit-to-width default now that the layers (and their sizes)
@@ -2005,6 +2240,11 @@ class PageView(QGraphicsView):
         self._crop_rubber = None           # dies with scene.clear() below
         self._crop_page = None
         self._crop_anchor = None
+        self._author_rubber = None         # dies with scene.clear() below
+        self._author_page = None
+        self._author_anchor = None
+        self._author_drag = None
+        self._author_selected = None
         self._mode = MODE_SELECT
         self.scene().clear()
         self.scene().setSceneRect(QRectF())
@@ -2460,6 +2700,13 @@ class PageView(QGraphicsView):
         self._crop_rubber = None
         self._crop_page = None
         self._crop_anchor = None
+        # Same for an in-flight authored-field create rubber / move-resize
+        # (three-modes feature): the geometry it anchored on is gone. The
+        # author SELECTION survives -- it is rebound by identity below.
+        self._author_rubber = None
+        self._author_page = None
+        self._author_anchor = None
+        self._author_drag = None
         # Same for an in-flight image placement rubber / resize preview
         # (images & signatures §3): the items died with scene.clear(); the
         # armed payload survives so the user can still click to place.
@@ -2799,16 +3046,26 @@ class PageView(QGraphicsView):
                 and not self._is_full_page_image(x)]
         layer.boxes = list(spans) + list(news) + list(images) + xims
         layer.hotspots = []
-        for box in layer.boxes:
-            if self._is_image_box(box):
-                hotspot = ImageHotspot(self._image_scene_rect(box), box, self)
-            else:
-                rect = self._span_scene_rect(box)
-                baseline_y = self._scene_point(
-                    *box.origin, page_index=box.page_index).y()
-                hotspot = SpanHotspot(rect, box, baseline_y, self)
-            scene.addItem(hotspot)
-            layer.hotspots.append(hotspot)
+        # DOCUMENT top mode only (three-modes feature): outside it the box
+        # hotspots do not exist, so text-edit/select/move are structurally
+        # unreachable in FORM_FIELDS / FILL_FORM. ``layer.boxes`` still holds
+        # the fresh box objects so a selection rebind after a repaint works.
+        if self.top_mode() == TOP_DOCUMENT:
+            for box in layer.boxes:
+                if self._is_image_box(box):
+                    hotspot = ImageHotspot(self._image_scene_rect(box), box, self)
+                else:
+                    rect = self._span_scene_rect(box)
+                    baseline_y = self._scene_point(
+                        *box.origin, page_index=box.page_index).y()
+                    hotspot = SpanHotspot(rect, box, baseline_y, self)
+                    dlog("BOX", "span",
+                         para=bool(getattr(box, "is_paragraph", False)),
+                         bbox=tuple(round(float(v), 1)
+                                    for v in (getattr(box, "bbox", ()) or ())),
+                         text=getattr(box, "text", "") or getattr(box, "ocr_text", ""))
+                scene.addItem(hotspot)
+                layer.hotspots.append(hotspot)
 
         # Registered page-item factories run LAST (perf foundation M4b), after
         # the page's pixmap/sheet/hotspots exist, so a factory can read the
@@ -3074,9 +3331,11 @@ class PageView(QGraphicsView):
     def _add_multi_overlay(self, box) -> None:
         ov = SelectionOverlay(self)
         self.scene().addItem(ov)
+        # Track before set_box_rect can raise (same store-after-raise hole as
+        # _install_overlay) so _clear_multi / _rebuild_multi_overlays can reap it.
+        self._multi_overlays.append(ov)
         ov.set_box_rect(self._span_scene_rect(box))
         ov.set_handles_visible(False)          # extras are outline-only
-        self._multi_overlays.append(ov)
 
     def _rebuild_multi_overlays(self) -> None:
         for ov in self._multi_overlays:
@@ -3119,10 +3378,17 @@ class PageView(QGraphicsView):
         else:
             overlay = SelectionOverlay(self)
         self.scene().addItem(overlay)
+        # Store the tracking ref BEFORE attach_handles / set_box_rect: both add
+        # scene-owned items whose only Python refs live on the overlay, and both
+        # can raise (set_box_rect -> _span_scene_rect -> effective_bbox -> wrap
+        # engine). If self._overlay were assigned only after a raise, the overlay
+        # plus its _ResizeHandles would orphan (C++ in the scene, wrappers
+        # dealloc'd) into a zombie-repaint SIGSEGV; tracked first, the next
+        # _remove_overlay reaps them.
+        self._overlay = overlay
         if not self._is_existing_image(box):
             overlay.attach_handles(self.scene())
         overlay.set_box_rect(self._span_scene_rect(box))
-        self._overlay = overlay
         self._update_overflow_cue(box)
 
     def _update_overflow_cue(self, box) -> None:
@@ -3158,6 +3424,48 @@ class PageView(QGraphicsView):
     # =====================================================================
     # Add-text mode (EDITOR_SPEC §3.2 / §3.5)
     # =====================================================================
+    def top_mode(self) -> str:
+        """The active TOP mode (three-modes feature). Stored on the document
+        so it is per-tab for free; defaults to DOCUMENT with no document."""
+        return getattr(self.document, "top_mode", TOP_DOCUMENT) \
+            if self.document is not None else TOP_DOCUMENT
+
+    def set_top_mode(self, mode: str) -> None:
+        """The single TOP-mode transition choke point (three-modes feature).
+        Commits both open editors, drops every selection/focus, stores the
+        new mode on the document, and reloads so the scene graph flips to
+        exactly one live hotspot layer. FILL_FORM is gated on ``has_form``.
+        Leaves ``self._mode`` at SELECT (DOCUMENT select + FILL_FORM field
+        presses both require it); FORM_FIELDS additionally arms the
+        drag-to-create sub-tool. Does NOT touch the Qt undo stack -- a
+        within-tab mode switch preserves undo depth."""
+        if self.document is None or mode == self.top_mode():
+            return
+        if mode == TOP_FILL_FORM and not getattr(self.document, "has_form",
+                                                 False):
+            return                         # fill only on a form
+        self._flush_editor()               # commits text AND form editors
+        self._cancel_drag()
+        self._end_author_drag()
+        self._mode = MODE_SELECT
+        self.clear_selection()
+        self.clear_annot_selection()
+        self._set_focused_field(None)
+        self._set_author_selected(None)
+        self.document.top_mode = mode
+        # FORM_FIELDS arms drag-to-create; existing author hotspots still
+        # claim their own presses (select/move), so idle FORM_FIELDS edits.
+        if mode == TOP_FORM_FIELDS:
+            self._mode = MODE_ADD_FIELD
+        self.reload()                      # re-materializes -> swaps the layer
+        self.topModeChanged.emit(mode)
+
+    def set_add_field_kind(self, kind: str) -> None:
+        """Choose which field kind the next placement drops (the Forms-panel
+        palette drives this). ``add_form_field`` is the authority on valid kinds
+        and toasts on reject, so accept any string here and let it validate."""
+        self._add_field_kind = kind
+
     def enter_add_text_mode(self) -> None:
         """Arm ADD_TEXT: crosshair cursor; the next empty-canvas click adds a
         box using the inspector's current style."""
@@ -4168,6 +4476,289 @@ class PageView(QGraphicsView):
         self._crop_anchor = None
 
     # =====================================================================
+    # Form-field AUTHORING (three-modes feature) -- chrome only: the view
+    # draws the create rubber / move-resize preview and emits ONE
+    # ``fieldAuthorRequested(op, args)`` per gesture; the WINDOW owns the
+    # FormFieldAuthorCommand on the undo stack (the view never mutates the
+    # model). Authored fields ride the staged annotation machinery, so a
+    # created field is immediately fillable in FILL_FORM the same session.
+    # =====================================================================
+    def _field_author_hotspot_factory(self, layer, _view) -> list:
+        """The registered page-item factory (three-modes feature): one
+        FieldAuthorHotspot per field on the page (BOTH authored fields and
+        pre-existing baked widgets), ONLY while the view is in FORM_FIELDS, so
+        the whole form is visible and directly editable -- move/resize/delete
+        work on either; rename/retype is authored-only (v1). Zero items in
+        every other top mode."""
+        if self.document is None or self.top_mode() != TOP_FORM_FIELDS:
+            return []
+        try:
+            fields = self.document.form_fields(layer.page_index)
+        except Exception:  # noqa: BLE001 - a field read must not break render
+            return []
+        return [FieldAuthorHotspot(self._form_scene_rect(f), f, self)
+                for f in fields]
+
+    def _set_author_selected(self, identity) -> None:
+        """Select (or clear, ``None``) the authored field by identity and
+        repaint the author hotspots so exactly one carries the solid
+        outline."""
+        if identity == self._author_selected:
+            return
+        self._author_selected = identity
+        for layer in self._layers:
+            for it in layer.extra_items:
+                if isinstance(it, FieldAuthorHotspot):
+                    it.update()
+        # Drive the in-bar SELECTED FIELD properties (replaces the pop-up): one
+        # emit here covers press-select, panel-jump, double-click AND every
+        # clear path (delete / Esc / mode swap), so the props auto-hide on clear.
+        field = (self._form_field_by_identity(identity)
+                 if identity is not None else None)
+        self.fieldSelectionChanged.emit(field)
+
+    def _on_author_field_press(self, hotspot: "FieldAuthorHotspot",
+                               scene_pos: QPointF) -> bool:
+        """A press landed on an authored-field hotspot (three-modes feature).
+        FORM_FIELDS only: select the field, then arm a body-drag MOVE (or a
+        RESIZE when the press lands within a handle's reach of the SE corner)
+        that promotes past the move slop. A pure click just selects."""
+        if self.document is None or self.top_mode() != TOP_FORM_FIELDS:
+            return False
+        self._flush_editor()
+        field = self._form_field_by_identity(hotspot.identity)
+        if field is None:
+            return False
+        self.clear_selection()
+        self.clear_annot_selection()
+        self._set_author_selected(field.identity)
+        self.setFocus(Qt.MouseFocusReason)
+        rect = self._form_scene_rect(field)
+        br = rect.bottomRight()
+        # A press within a handle's reach of the SE corner resizes; else move.
+        # Only when the field is big enough that a corner zone leaves room to
+        # grab the body too, so tiny fields stay movable.
+        # ponytail: SE-corner grab, not the 8 box handles -- upgrade to
+        # _ResizeHandle children if edge/other-corner resize is wanted.
+        near_se = (abs(scene_pos.x() - br.x()) <= _HANDLE_PX
+                   and abs(scene_pos.y() - br.y()) <= _HANDLE_PX)
+        # Resize only where the visible SE handle is shown, so the grab zone
+        # matches the drawn affordance and tiny fields stay pure-move.
+        mode = "resize" if (near_se and hotspot.affordances_shown()) else "move"
+        self._author_drag = {
+            "ref": field.identity, "page": field.page_index,
+            "start": QPointF(scene_pos), "armed": False,
+            "start_rect": QRectF(rect), "hotspot": hotspot, "mode": mode,
+        }
+        return True
+
+    def _on_author_field_delete(self, identity) -> None:
+        """Delete the field behind its on-canvas 'x'. Clears the selection FIRST,
+        then emits the delete intent -- the window's command repaints the page
+        and frees this hotspot, so nothing may touch it afterward (mirrors the
+        Delete-key path in _key_add_field). Works for authored + pre-existing."""
+        if self.document is None or self.top_mode() != TOP_FORM_FIELDS:
+            return
+        self._author_drag = None
+        self._set_author_selected(None)
+        self.fieldAuthorRequested.emit("delete", {"ref": identity})
+
+    def _on_author_field_double_click(self,
+                                      hotspot: "FieldAuthorHotspot") -> bool:
+        """Double-click a field -> just SELECT it (the in-bar SELECTED FIELD
+        properties then show its name / type / size). A pre-existing widget is
+        selectable too; the props section disables name/type for it."""
+        if self.document is None or self.top_mode() != TOP_FORM_FIELDS:
+            return False
+        field = self._form_field_by_identity(hotspot.identity)
+        if field is None:
+            return False
+        self._author_drag = None       # the first press armed a move; drop it
+        self._set_author_selected(field.identity)
+        return True
+
+    def _update_author_drag(self, scene_pos: QPointF) -> None:
+        """Live authored-field move/resize: arm past the 3px slop, then ride
+        the hotspot's own rect with the cursor (a floored SE corner for
+        resize so it can never invert); the page repaints once on release."""
+        st = self._author_drag
+        if st is None:
+            return
+        delta = scene_pos - st["start"]
+        if not st["armed"]:
+            if abs(delta.x()) < _MIN_DRAG_PX and abs(delta.y()) < _MIN_DRAG_PX:
+                return
+            st["armed"] = True
+        hs = st["hotspot"]
+        if hs is None or hs.scene() is None:
+            return
+        hs.prepareGeometryChange()
+        if st["mode"] == "move":
+            hs.setRect(st["start_rect"].translated(delta))
+        else:
+            r = QRectF(st["start_rect"])
+            r.setRight(max(r.left() + _IMAGE_MIN_RESIZE_PX,
+                           r.right() + delta.x()))
+            r.setBottom(max(r.top() + _IMAGE_MIN_RESIZE_PX,
+                            r.bottom() + delta.y()))
+            hs.setRect(r)
+        hs.update()
+
+    def _finish_author_drag(self, scene_pos: QPointF) -> None:
+        """Release: an armed move emits ONE 'move' intent (delta in PDF
+        points), an armed resize emits ONE 'resize' intent (the new rect in
+        PDF text space); an unarmed press was just the select. The window's
+        command repaints, replacing the live rect with the committed one."""
+        st = self._author_drag
+        self._author_drag = None
+        if st is None or not st["armed"]:
+            return
+        page = st["page"]
+        if st["mode"] == "move":
+            dx, dy = self._scene_delta_to_pdf(scene_pos - st["start"], page)
+            if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+                self.repaint_page(page)    # snap the live rect back
+                return
+            self.fieldAuthorRequested.emit(
+                "move", {"ref": st["ref"], "dx": dx, "dy": dy})
+        else:
+            hs = st["hotspot"]
+            rect = (hs.rect() if (hs is not None and hs.scene() is not None)
+                    else st["start_rect"])
+            x0, y0 = self._pdf_point(rect.topLeft(), page)
+            x1, y1 = self._pdf_point(rect.bottomRight(), page)
+            nx0, nx1 = sorted((x0, x1))
+            ny0, ny1 = sorted((y0, y1))
+            self.fieldAuthorRequested.emit(
+                "resize", {"ref": st["ref"], "rect": (nx0, ny0, nx1, ny1)})
+
+    def _abort_author_drag(self) -> None:
+        """Esc during a live authored-field move/resize: snap the rect back
+        to the committed geometry, no command."""
+        st = self._author_drag
+        self._author_drag = None
+        if st is not None:
+            self.repaint_page(st["page"])
+
+    def _press_add_field(self, event) -> bool:
+        """MODE_ADD_FIELD press (three-modes feature): an empty-canvas press
+        starts the drag-to-create rubber, mirroring the crop tool. A press on
+        an existing authored field never reaches here (its hotspot claims
+        it), so this only ever anchors a NEW field."""
+        if self.document is None:
+            return False
+        scene_pos = self.mapToScene(event.position().toPoint())
+        event.accept()
+        page = self._page_at_scene_y(scene_pos.y())
+        self._set_author_selected(None)
+        self._author_page = page
+        self._author_anchor = self._clamp_to_sheet(scene_pos, page)
+        self._update_author_rubber(scene_pos)
+        return True
+
+    def _key_add_field(self, event: QKeyEvent) -> bool:
+        """MODE_ADD_FIELD keys (three-modes feature): Escape aborts an
+        in-flight create rubber / move-resize drag, else drops the selection;
+        Delete/Backspace removes the selected authored field."""
+        key = event.key()
+        if key == Qt.Key_Escape:
+            event.accept()
+            if self._author_drag is not None:
+                self._abort_author_drag()
+            elif self._author_page is not None:
+                self._end_author_rubber()
+            else:
+                self._set_author_selected(None)
+            return True
+        if key in (Qt.Key_Delete, Qt.Key_Backspace) \
+                and self._author_selected is not None:
+            event.accept()
+            ref = self._author_selected
+            self._set_author_selected(None)
+            self.fieldAuthorRequested.emit("delete", {"ref": ref})
+            return True
+        return False
+
+    def _update_author_rubber(self, scene_pos: QPointF) -> None:
+        """Grow the dashed accent create-rubber from the anchor to the
+        (sheet-clamped) cursor, lazily created at ``Z_DRAG_PREVIEW`` and
+        mouse-transparent -- mirrors the crop rubber."""
+        if self._author_page is None or self._author_anchor is None:
+            return
+        pos = self._clamp_to_sheet(scene_pos, self._author_page)
+        if self._author_rubber is None:
+            item = QGraphicsRectItem()
+            pen = QPen(theme.color_accent())
+            pen.setStyle(Qt.DashLine)
+            pen.setWidthF(1.0)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            wash = theme.color_accent()
+            wash.setAlpha(26)
+            item.setBrush(QBrush(wash))
+            item.setZValue(Z_DRAG_PREVIEW)
+            item.setAcceptedMouseButtons(Qt.NoButton)
+            self.scene().addItem(item)
+            self._author_rubber = item
+        self._author_rubber.setRect(
+            QRectF(self._author_anchor, pos).normalized())
+
+    def _finish_author_rubber(self, scene_pos: QPointF) -> None:
+        """Release: map both corners through ``_pdf_point`` to unrotated text
+        space and emit ONE 'add' intent (default kind 'text'). A degenerate
+        drag (< ``_CROP_MIN_DRAG_PT`` a side) is a stray click, dropped."""
+        page = self._author_page
+        anchor = self._author_anchor
+        self._end_author_rubber()
+        if page is None or anchor is None:
+            return
+        pos = self._clamp_to_sheet(scene_pos, page)
+        ax, ay = self._pdf_point(anchor, page)
+        bx, by = self._pdf_point(pos, page)
+        x0, x1 = sorted((ax, bx))
+        y0, y1 = sorted((ay, by))
+        if (x1 - x0) < _CROP_MIN_DRAG_PT or (y1 - y0) < _CROP_MIN_DRAG_PT:
+            # A CLICK, not a drag: DROP a default-sized field at the click point
+            # (Acrobat-style click-to-place) instead of discarding it -- placing
+            # a field must never require dragging out a box. Centered on the
+            # clicked row; the user then nudges/resizes with the field handles.
+            fw, fh = {
+                "checkbox": (14.0, 14.0),
+                "signature": (170.0, 44.0),
+                "text": (150.0, 20.0),
+                "date": (110.0, 20.0),
+            }.get(self._add_field_kind, (150.0, 20.0))
+            x0, y0, x1, y1 = ax, ay - fh / 2.0, ax + fw, ay + fh / 2.0
+        rect = (x0, y0, x1, y1)
+        # Snap the drawn field onto the box already on the sheet (checkbox
+        # outline / cell / underline) so it clips exactly; no-op when the drag
+        # doesn't land on a drawn box.
+        snap = getattr(self.document, "snap_field_rect", None)
+        if callable(snap):
+            try:
+                rect = snap(page, rect)
+            except Exception:  # noqa: BLE001 - snapping must not block authoring
+                pass
+        self.fieldAuthorRequested.emit("add", {
+            "page_index": page, "rect": rect, "kind": self._add_field_kind})
+
+    def _end_author_rubber(self) -> None:
+        """Remove the create rubber + clear its drag state."""
+        if self._author_rubber is not None \
+                and self._author_rubber.scene() is not None:
+            self.scene().removeItem(self._author_rubber)
+        self._author_rubber = None
+        self._author_page = None
+        self._author_anchor = None
+
+    def _end_author_drag(self) -> None:
+        """Clear ALL authoring drag state (mode switch / document swap): the
+        create rubber and any in-flight move/resize. The rubber item dies
+        with the scene on reload."""
+        self._end_author_rubber()
+        self._author_drag = None
+
+    # =====================================================================
     # Image placement (images & signatures §3) -- chrome only: the view
     # draws the aspect-locked rubber rect and emits ONE
     # ``boxCommandRequested("img_add", ...)`` per gesture; the window owns
@@ -4383,8 +4974,12 @@ class PageView(QGraphicsView):
         # char format (the glyph-run bake persists bold/italic; u/s show while
         # editing). They only apply with an open editor, handled here.
         if getattr(self._editor_box, "box_id", None) is not None \
-                and set(overrides) <= {"bold", "italic"} and not scan:
+                and set(overrides) <= {"bold", "italic", "underline", "strike"} \
+                and not scan:
             return False              # plain NewBox: uniform bold/italic only
+            # (underline/strike can't persist in the plain-NewBox bake, so decline
+            #  the whole non-scan set here rather than show a phantom u/s that is
+            #  lost on commit)
         cursor = self._editor.textCursor()
         had_selection = cursor.hasSelection()
         fmt = QTextCharFormat()
@@ -4750,8 +5345,15 @@ class PageView(QGraphicsView):
         """Move the caret item to the current cursor index and make it solid + restart
         the blink (a real caret is solid right after it moves, then blinks)."""
         ed = self._editor
-        if ed is None or not self._caret_measure:
+        if ed is None:
             return
+        # Push the caret's local style to the Format panel for BOTH editor kinds
+        # (deferred + coalesced, so re-entrancy-safe). A born-digital box has no
+        # custom scan caret item to move, but the panel must still track it -- so
+        # emit BEFORE the scan-only caret-item positioning below.
+        self._emit_caret_style()
+        if not self._caret_measure:
+            return                # vector box: Qt draws its own caret, no item
         seg = self._scan_caret_scene(ed.textCursor().position(), ed.toPlainText())
         it = self._ensure_caret_item()
         if seg is None:
@@ -4763,7 +5365,6 @@ class PageView(QGraphicsView):
         it.setVisible(ed.hasFocus())
         self._caret_blink.start()
         self._position_selection_item()           # keep the highlight band in sync
-        self._emit_caret_style()                  # push the caret's local style to the format bar
 
     def _emit_caret_style(self) -> None:
         """Schedule a format-bar update for the caret's local style. DEFERRED to the
@@ -4783,7 +5384,11 @@ class PageView(QGraphicsView):
         _emit_caret_style); bails if the edit ended in the meantime."""
         self._caret_style_pending = False
         ed = self._editor
-        if ed is None or self._editor_box is None or not self._editor_scan_preserve \
+        # Runs for BOTH born-digital and scanned boxes now: the Qt char-format
+        # read below is engine-agnostic, so a normal PDF's Format panel finally
+        # tracks the caret too (previously scan-only). The per-glyph page-font-map
+        # block stays scan-gated (it reads the OCR super-res map).
+        if ed is None or self._editor_box is None \
                 or self._committing or self._closing_editor:
             return
         try:
@@ -4822,7 +5427,8 @@ class PageView(QGraphicsView):
             # what is actually under the caret -- a bold label vs a regular number in the
             # SAME box read differently, like a real text editor. Skips when the user has
             # explicitly picked a family (font_picked), so their choice is not overridden.
-            if not getattr(self._editor_box, "font_picked", False):
+            if self._editor_scan_preserve \
+                    and not getattr(self._editor_box, "font_picked", False):
                 try:
                     pi = getattr(self._editor_box, "page_index", self._page_index)
                     pfm = self.document._page_font_map(pi)
@@ -4837,9 +5443,66 @@ class PageView(QGraphicsView):
                                 style["italic"] = bool(i2)
                 except Exception:
                     pass
+            # A SELECTION spanning more than one style shows an INDETERMINATE
+            # state, not a wrong-but-definite one (the "B lights up for a mixed
+            # bold/regular selection" bug). Flag every field whose value is not
+            # uniform across the selected fragments so the inspector can blank /
+            # tri-state it. Char-format read == engine-agnostic (vector + scan).
+            if cur.hasSelection():
+                mixed = self._selection_mixed_fields(cur, base)
+                if mixed:
+                    style["mixed"] = mixed
             self.caretStyleChanged.emit(self._editor_box, style)
         except (RuntimeError, AttributeError):
             pass
+
+    def _selection_mixed_fields(self, cur, base) -> frozenset:
+        """The style fields (bold/italic/underline/strike/font_family) whose
+        value is NOT uniform across the editor selection. A fragment with no
+        explicit property inherits the editor base -- same resolution rule as
+        the caret read (_do_emit_caret_style) and the commit path
+        (_extract_editor_runs), so a fully-bold box never reads as 'mixed'."""
+        doc = cur.document()
+        lo, hi = cur.selectionStart(), cur.selectionEnd()
+        seen = {"bold": set(), "italic": set(), "underline": set(),
+                "strike": set(), "font_family": set()}
+        blk = doc.findBlock(lo)
+        while blk.isValid() and blk.position() < hi:
+            it = blk.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    fs = frag.position()
+                    if fs + frag.length() > lo and fs < hi:   # overlaps selection
+                        cf = frag.charFormat()
+                        seen["bold"].add(
+                            cf.fontWeight() >= QFont.DemiBold
+                            if cf.hasProperty(QTextFormat.FontWeight)
+                            else base.bold())
+                        seen["italic"].add(
+                            cf.fontItalic()
+                            if cf.hasProperty(QTextFormat.FontItalic)
+                            else base.italic())
+                        seen["underline"].add(
+                            bool(cf.fontUnderline()) or base.underline())
+                        seen["strike"].add(
+                            bool(cf.fontStrikeOut()) or base.strikeOut())
+                        fam = base.family()
+                        if cf.hasProperty(QTextFormat.FontFamilies):
+                            fams = cf.fontFamilies()
+                            fam = (fams[0] if isinstance(fams, (list, tuple)) and fams
+                                   else fams if isinstance(fams, str) else fam)
+                        seen["font_family"].add(fam)
+                it += 1
+            blk = blk.next()
+        return frozenset(k for k, v in seen.items() if len(v) > 1)
+
+    def refresh_caret_style(self) -> None:
+        """Re-push the caret/selection style to the format bar after a
+        PROGRAMMATIC restyle (apply_style_to_selection stays inside the editor
+        and never routes through the key/mouse emit), so a mixed selection that
+        the user just made uniform stops showing the indeterminate state."""
+        self._emit_caret_style()
 
     def _ensure_selection_item(self):
         """The translucent clay band that shows the text selection while editing a
@@ -4942,10 +5605,6 @@ class PageView(QGraphicsView):
                 or self._committing or self._closing_editor \
                 or self._editor_box is None:
             return
-        if self._editor_preview is not None:
-            if self._editor_preview.scene() is not None:
-                self.scene().removeItem(self._editor_preview)
-            self._editor_preview = None
         text = self._editor.toPlainText()
         box = self._editor_box
         dlog("RENDER", "compose_preview", box=id(box), text=text,
@@ -5001,6 +5660,14 @@ class PageView(QGraphicsView):
         item.setScale((disp[2] - disp[0]) * z / max(pm.width(), 1))
         item.setZValue(Z_COVER)                 # above the page, below the caret
         self.scene().addItem(item)
+        # Remove the OLD preview only now that the NEW tile is composed + on the
+        # scene: any early return above (e.g. compose returned None) leaves the
+        # prior preview on screen (one-frame stale at worst) instead of blanking
+        # the whole composite.
+        if self._editor_preview is not None:
+            if self._editor_preview.scene() is not None:
+                self.scene().removeItem(self._editor_preview)
+            self._editor_preview = None
         self._editor_preview = item
 
     # ----- DEBUG console: map overlay + inverted binary view ---------------
@@ -5402,6 +6069,8 @@ class PageView(QGraphicsView):
                 fmt.setForeground(QColor.fromRgbF(*rs.color))
             if rs is not None and getattr(rs, "underline", False):
                 fmt.setFontUnderline(True)
+            if rs is not None and getattr(rs, "strike", False):
+                fmt.setFontStrikeOut(True)
             cursor.mergeCharFormat(fmt)
             pos += len(text)
 
@@ -5440,6 +6109,7 @@ class PageView(QGraphicsView):
         base_bold, base_italic = base.bold(), base.italic()
         base_family = base.family()
         base_underline = base.underline()
+        base_strike = base.strikeOut()
         runs: list = []
         block = editor.document().begin()
         while block.isValid():
@@ -5472,6 +6142,7 @@ class PageView(QGraphicsView):
                     # whose hasProperty() is always False), so read it via fontUnderline();
                     # an unset fragment reports False, so only user-underlined runs carry it.
                     underline = bool(cf.fontUnderline()) or base_underline
+                    strike = bool(cf.fontStrikeOut()) or base_strike
                     color = family = None
                     if rich:
                         if cf.hasProperty(QTextFormat.ForegroundBrush):
@@ -5484,8 +6155,9 @@ class PageView(QGraphicsView):
                                    else fams if isinstance(fams, str) else None)
                             if fam and fam != base_family:
                                 family = fam
-                    rs = (RunStyle(font_family=family, color=color, underline=underline)
-                          if (underline or color is not None or family is not None)
+                    rs = (RunStyle(font_family=family, color=color, underline=underline,
+                                   strike=strike)
+                          if (underline or strike or color is not None or family is not None)
                           else None)
                     runs.append((text, bold, italic, rs) if rs is not None
                                 else (text, bold, italic))
@@ -6131,6 +6803,17 @@ class PageView(QGraphicsView):
                 self._remove_annot_overlay()
                 self._annot_selection = None
                 self.annotSelectionChanged.emit(None)
+        # Re-bind the FILL_FORM focused field + the FORM_FIELDS author
+        # selection by identity (three-modes feature): undoing an authored-add
+        # rebuilds the fields, so a vanished target must drop its ring/select
+        # instead of leaving a stale ref.
+        if self._focused_field is not None:
+            fresh = self._form_field_by_identity(
+                getattr(self._focused_field, "identity", None))
+            self._set_focused_field(fresh)
+        if self._author_selected is not None \
+                and self._form_field_by_identity(self._author_selected) is None:
+            self._set_author_selected(None)
         self._sync_current_page_mirror()
 
     # =====================================================================
@@ -6147,12 +6830,16 @@ class PageView(QGraphicsView):
         (``FormField.fillable``); a form-free document contributes zero
         items, so the default scene census is unchanged."""
         doc = self.document
-        if doc is None or not getattr(doc, "has_form", False):
+        if doc is None or not getattr(doc, "has_form", False) \
+                or self.top_mode() != TOP_FILL_FORM:
             return []
         try:
             fields = doc.form_fields(layer.page_index)
         except Exception:  # noqa: BLE001 - widget read must not break render
             return []
+        for f in fields:
+            dlog("BOX", "field", kind=f.kind, fillable=bool(f.fillable),
+                 rect=tuple(round(float(v), 1) for v in f.rect))
         return [FieldHotspot(self._form_scene_rect(f), f, self)
                 for f in fields if f.fillable]
 
@@ -6198,7 +6885,7 @@ class PageView(QGraphicsView):
         the FIELD), then routes by kind: checkbox toggles, a radio kid
         picks its on-state (no toggle-off), a combo pops its options menu,
         a text field mounts the inline FormFieldEditor."""
-        if self.document is None or self._mode != MODE_SELECT:
+        if self.document is None or self.top_mode() != TOP_FILL_FORM:
             return False
         self._flush_editor()               # commits BOTH open editors
         self._cancel_drag()
@@ -6279,26 +6966,18 @@ class PageView(QGraphicsView):
         self._form_editor_cover = cover
 
         editor = FormFieldEditor(field, text, self)
-        font = QFont("Helvetica")
-        # Pixel sizing per the font_engine.py precedent: widget fontsize is
-        # in PDF points, scene px = points * zoom (0 = auto-size -> 11pt).
-        font.setPixelSize(max(1, round((field.text_fontsize or 11.0)
-                                       * self._zoom)))
-        editor.setFont(font)
-        editor.document().setDefaultFont(font)
         editor.setDefaultTextColor(QColor("#000000"))
         if field.multiline:
             # Soft-wrap to the field's width so typing reads like the
             # regenerated appearance will (MuPDF re-wraps at bake).
             editor.setTextWidth(max(1.0, rect.width()))
-        # Anchor at the field's UNROTATED top-left corner mapped through
-        # ``_scene_point`` and rotate with the page, mirroring
-        # ``_place_text_item`` so typing flows along the displayed axes.
-        editor.setRotation(float(self._rotation_for(page) % 360))
-        editor.setPos(self._scene_point(field.rect[0], field.rect[1],
-                                        page_index=page))
         self.scene().addItem(editor)
         self._form_editor = editor
+        # WYSIWYG: match the point size AND vertical placement the value will
+        # BAKE at, re-applied as the text changes (auto-size shrinks + recentres
+        # as a width-limited field fills). See _relayout_form_editor.
+        editor.document().contentsChanged.connect(self._relayout_form_editor)
+        self._relayout_form_editor()
         self._form_editor_seed = text
         self._form_editor_hotspot = hotspot
         if hotspot is not None:
@@ -6310,6 +6989,47 @@ class PageView(QGraphicsView):
         cursor = editor.textCursor()
         cursor.select(QTextCursor.Document)
         editor.setTextCursor(cursor)
+
+    def _relayout_form_editor(self) -> None:
+        """Size + place the inline form editor so it matches what the value will
+        BAKE to (WYSIWYG): the point size MuPDF auto-sizes to, and its VERTICAL
+        placement -- MuPDF centres the font's ascent+descent box in the field, so
+        a sub-height font sits lower than a naive top-align. Re-applied on every
+        text change (a width-limited field shrinks + recentres as it fills). The
+        font is only re-set when the size actually changes, so it can't recurse
+        through ``contentsChanged``."""
+        ed = self._form_editor
+        if ed is None or self.document is None:
+            return
+        field = ed.field
+        page = field.page_index
+        try:
+            pts = self.document.form_field_render_fontsize(
+                field, ed.toPlainText())
+        except Exception:  # noqa: BLE001 - a metric miss must not break typing
+            return
+        px = max(1, round(pts * self._zoom))
+        f = ed.font()
+        if f.pixelSize() != px:
+            f.setPixelSize(px)
+            ed.setFont(f)
+            ed.document().setDefaultFont(f)
+        # Placement to match the bake (offsets in PDF points; _scene_point maps
+        # them through page rotation). Horizontal: MuPDF insets the text ~2pt.
+        # Vertical: MuPDF centres the font box, so the BASELINE lands at
+        # ~fieldheight/2 + 0.30*fontsize (empirical, Helvetica) -- align the
+        # editor's baseline there (cancels Qt's larger ascent-leading, which a
+        # naive font-box centre got wrong for tall fonts).
+        fm = QFontMetricsF(f)
+        fh = field.rect[3] - field.rect[1]
+        pad_x = 2.0
+        gap_y = 0.0
+        if not field.multiline and self._zoom > 0:
+            baseline = fh / 2.0 + 0.30 * pts
+            gap_y = baseline - fm.ascent() / self._zoom
+        ed.setRotation(float(self._rotation_for(page) % 360))
+        ed.setPos(self._scene_point(field.rect[0] + pad_x,
+                                    field.rect[1] + gap_y, page_index=page))
 
     def commit_form_editor(self) -> None:
         """Commit the open form editor (Return / focus-out / flush): tear it
@@ -6410,7 +7130,7 @@ class PageView(QGraphicsView):
         the last). Returns True when a field took focus (key consumed)."""
         doc = self.document
         if doc is None or not getattr(doc, "has_form", False) \
-                or self._mode != MODE_SELECT:
+                or self.top_mode() != TOP_FILL_FORM:
             return False
         current = self._form_editor.field if self._form_editor is not None \
             else self._focused_field
@@ -6460,7 +7180,7 @@ class PageView(QGraphicsView):
         normal widget focus chain."""
         if self.document is not None \
                 and getattr(self.document, "has_form", False) \
-                and self._mode == MODE_SELECT:
+                and self.top_mode() == TOP_FILL_FORM:
             return False
         return super().focusNextPrevChild(next)
 
@@ -6475,6 +7195,10 @@ class PageView(QGraphicsView):
         mode: select the box (commit/flush any open editor first), and arm a
         potential body-drag MOVE that promotes on the first real mouse move."""
         if self.document is None:
+            return False
+        # DOCUMENT top mode only (three-modes feature): boxes are inert in the
+        # form modes (their hotspots aren't even built, this is belt-and-suspenders).
+        if self.top_mode() != TOP_DOCUMENT:
             return False
         # TEXT SELECT / CROP / PLACE_IMAGE modes (§5.2 / doc tools §2.6 /
         # images §3): hotspots pass presses through -- the words under the
@@ -6528,10 +7252,11 @@ class PageView(QGraphicsView):
         """Double-click a box -> edit its text (EDITOR_SPEC §3.3). Declines
         while ADD_TEXT, TEXT SELECT, CROP, PLACE_IMAGE, or an ANNOT tool is
         armed (the armed tool owns the canvas; never begin_edit)."""
-        if self.document is None or self._mode in (MODE_ADD_TEXT,
-                                                   MODE_SELECT_TEXT,
-                                                   MODE_CROP,
-                                                   MODE_PLACE_IMAGE) \
+        if self.document is None or self.top_mode() != TOP_DOCUMENT \
+                or self._mode in (MODE_ADD_TEXT,
+                                  MODE_SELECT_TEXT,
+                                  MODE_CROP,
+                                  MODE_PLACE_IMAGE) \
                 or self._annot_tool_armed():
             return False
         self._cancel_drag()
@@ -6606,6 +7331,26 @@ class PageView(QGraphicsView):
             if not inside:
                 dlog("EDITOR", "commit_click_outside", x=scene_pt.x(), y=scene_pt.y())
                 self.commit_edit()
+        # Same EXIT RULE for an open FORM editor (forms §3): focus-out no longer
+        # commits it, so a click clearly OUTSIDE the field commits here. A press
+        # inside the field (or on its cover) keeps the fill open; a press on
+        # ANOTHER field is handled by that field's hotspot (which flushes first).
+        if (event.button() == Qt.LeftButton and self._form_editor is not None
+                and not self._form_committing and not self._closing_form_editor):
+            scene_pt = self.mapToScene(event.position().toPoint())
+            field = self._form_editor.field
+            PAD = 8.0
+            rects = [self._form_editor.sceneBoundingRect()
+                     .adjusted(-PAD, -PAD, PAD, PAD),
+                     self._form_scene_rect(field).adjusted(-PAD, -PAD, PAD, PAD)]
+            if self._form_editor_cover is not None:
+                rects.append(self._form_editor_cover.sceneBoundingRect()
+                             .adjusted(-PAD, -PAD, PAD, PAD))
+            hit = self.items(event.position().toPoint())
+            inside = any(r.contains(scene_pt) for r in rects) \
+                or self._form_editor in hit
+            if not inside:
+                self.commit_form_editor()
         # Items (hotspots/handles) accept their own presses first; this fires
         # only for presses on EMPTY canvas (sheet/gutter). The per-mode press
         # handler from ``self._mode_handlers`` owns the deselect / add-on-empty
@@ -6644,7 +7389,7 @@ class PageView(QGraphicsView):
             handled_by_box = isinstance(
                 item, (SpanHotspot, ImageHotspot, _ResizeHandle,
                        SelectionOverlay, AnnotHotspot, AnnotSelectionOverlay,
-                       FieldHotspot))
+                       FieldHotspot, FieldAuthorHotspot))
             # TEXT SELECT, CROP, and PLACE_IMAGE claim presses even over a
             # box hotspot (§5.2 / doc tools §2.6 / images §3): the hotspot
             # declines them too (_on_box_press returns False in these
@@ -6727,6 +7472,19 @@ class PageView(QGraphicsView):
                 self.mapToScene(event.position().toPoint()))
             event.accept()
             return
+        # A live authored-field CREATE rubber (three-modes feature); exclusive
+        # with the others by mode/state.
+        if self._author_page is not None:
+            self._update_author_rubber(
+                self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        # A live authored-field MOVE/RESIZE drag (three-modes feature).
+        if self._author_drag is not None:
+            self._update_author_drag(
+                self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
         # A live image placement drag grows the aspect-locked rubber rect
         # (images & signatures §3); exclusive with the others by mode.
         if self._image_place_drag is not None:
@@ -6768,6 +7526,16 @@ class PageView(QGraphicsView):
             return
         if self._crop_page is not None and event.button() == Qt.LeftButton:
             self._finish_crop_drag(
+                self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        if self._author_page is not None and event.button() == Qt.LeftButton:
+            self._finish_author_rubber(
+                self.mapToScene(event.position().toPoint()))
+            event.accept()
+            return
+        if self._author_drag is not None and event.button() == Qt.LeftButton:
+            self._finish_author_drag(
                 self.mapToScene(event.position().toPoint()))
             event.accept()
             return
@@ -7634,24 +8402,6 @@ class PageView(QGraphicsView):
                                  if self._editor_scan_ctx
                                  else self.document._edit_font_file(
                                      getattr(box, "font_family", "")))
-            try:                                 # TEMP gap diagnostic (no PHI: counts only)
-                import re as _re
-                _lns = (self._caret_measure or {}).get("lines") or []
-                with open("/tmp/pdfte_gap.log", "a") as _fh:
-                    _fh.write("=== OPENED box: %d line(s) ===\n" % len(_lns))
-                    for _li, _ln in enumerate(_lns):
-                        if not _ln:
-                            _fh.write("  line%d: (none)\n" % _li); continue
-                        _ctx = _ln.get("ctx") or {}
-                        _cb = (_ctx.get("geom") or {}).get("char_boxes")
-                        _ot = _ctx.get("orig_text", "")
-                        _runs = [len(m.group()) for m in _re.finditer(r"  +", _ot)]
-                        _fh.write("  line%d: chars=%d char_boxes=%s multispace_runs=%s edges=%d\n"
-                                  % (_li, len(_ot),
-                                     ("%d" % len(_cb)) if (_cb and len(_cb) == len(_ot)) else "NONE",
-                                     _runs, len(_ln.get("edges", []))))
-            except Exception:
-                pass
         else:
             cover = self._make_cover(box)
             cover.setZValue(Z_COVER)
@@ -7788,6 +8538,16 @@ class PageView(QGraphicsView):
 
         ascent = QFontMetricsF(font).ascent()
         self._place_text_item(editor, box, ascent)
+        dlog("EDITOR", "mount_geom", pdf_font=getattr(box, "font", ""),
+             qt=getattr(resolved, "qt_family", "?"),
+             tier=getattr(resolved, "tier", "?"),
+             eff_size=eff_size, px=round(float(pixel_size), 1),
+             ascent=round(float(ascent), 1),
+             pos=(round(editor.pos().x(), 1), round(editor.pos().y(), 1)),
+             origin=tuple(round(float(v), 1) for v in (box.origin or ())),
+             bbox=tuple(round(float(v), 1)
+                        for v in (getattr(box, "bbox", ()) or ())),
+             para=self._editor_multiline)
         # The soft-wrap fallback uses a FIXED line height taller than the font's
         # natural box, whose surplus sits ABOVE the first baseline -- lift the
         # editor so the first baseline still lands on the box origin. The
@@ -8216,6 +8976,22 @@ class PageView(QGraphicsView):
                 editor.setFocus(Qt.OtherFocusReason)
         QTimer.singleShot(0, _regrab)
 
+    def _reassert_form_editor_focus(self, editor) -> None:
+        """Keep an open FORM editor focused after a spurious focus steal -- the
+        form-field mirror of ``_reassert_editor_focus``, enforcing that a fill
+        is left ONLY by Escape or a click outside the field. No-ops once the
+        editor genuinely closed (commit/cancel) or another window took over."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+
+        def _regrab():
+            if (self._form_editor is editor and not self._form_committing
+                    and not self._closing_form_editor
+                    and editor.scene() is not None and not editor.hasFocus()
+                    and QApplication.activeWindow() is self.window()):
+                editor.setFocus(Qt.OtherFocusReason)
+        QTimer.singleShot(0, _regrab)
+
     def is_edited(self, box) -> bool:
         """True when ``box`` carries staged text changes (the edited-hover
         affordance). Consults the edit maps for the box's OWN page (§2.7d) --
@@ -8251,7 +9027,14 @@ class PageView(QGraphicsView):
         if not self.document or box is None:
             return False
         page = getattr(box, "page_index", self._page_index)
-        return self.document.is_edit_unsaved(page, box)
+        # This is called from SpanHotspot.paint. An exception escaping a Qt
+        # virtual override (paint) does not raise into Python -- it crashes the
+        # process (getOverride -> func_dealloc SIGSEGV on macOS 27 / PySide 6.11).
+        # So a model hiccup here must degrade to "not flagged", never propagate.
+        try:
+            return self.document.is_edit_unsaved(page, box)
+        except Exception:  # noqa: BLE001 - a paint-time model read must not crash
+            return False
 
     # =====================================================================
     # Keyboard (view-level, depends on selection/editor state, §3.3/§5.5)
@@ -8477,7 +9260,8 @@ class PageView(QGraphicsView):
         if page is None:
             page = getattr(box, "page_index", self._page_index)
         from ..document import StyleOverride  # local: avoid a top-level cycle
-        edit = self.document._edits.get((page, box.key))
+        edit = self.document._edits.get(
+            self.document._span_edit_key(page, box))
         style = edit.style if edit is not None else StyleOverride()
         # A staged family or weight/slant override means the run is being
         # re-typed in a user-picked face -> resolve_family (embeddable). Otherwise
@@ -8595,7 +9379,21 @@ class PageView(QGraphicsView):
         if page is None:
             page = self._page_index
         if self.document is not None:
-            x0, y0, x1, y1 = self.document.effective_bbox(page, box)
+            try:
+                x0, y0, x1, y1 = self.document.effective_bbox(page, box)
+            except Exception:  # noqa: BLE001 - a STAGED-measurement hiccup (the
+                # wrap/font engine on a mid-reflow box) must never crash the
+                # chrome: it flows through _install_overlay, which added the
+                # overlay + _ResizeHandles to the scene but has not yet stored
+                # self._overlay -- an exception here orphaned those scene-owned
+                # items into a zombie-repaint SIGSEGV. Degrade to the immutable
+                # original bbox (the overlay re-refreshes on the next reflow
+                # tick), exactly like _update_overflow_cue guards its sibling
+                # measurement. Logged so a genuine effective_bbox bug stays
+                # visible instead of silently swallowed.
+                dlog("OVERLAY", "effective_bbox_raised", box=id(box), page=page)
+                x0, y0, x1, y1 = (getattr(box, "bbox", None)
+                                  or getattr(box, "rect", (0.0, 0.0, 0.0, 0.0)))
         else:
             x0, y0, x1, y1 = box.bbox
         corners = [self._display_point(cx, cy, page)
@@ -8689,9 +9487,7 @@ class PageView(QGraphicsView):
             item.setPos(baseline.x(), baseline.y() - ascent)
             return
         rad = math.radians(rot)
-        dx = ascent * math.sin(rad)
-        dy = -ascent * math.cos(rad)
-        item.setPos(baseline.x() - dx, baseline.y() - dy)
+        item.setPos(baseline.x() + ascent * math.sin(rad), baseline.y() - ascent * math.cos(rad))
 
     def _make_cover(self, box) -> QGraphicsRectItem:
         """A rect covering a box's bbox (hides the rasterized original under the

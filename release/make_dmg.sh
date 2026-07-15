@@ -4,7 +4,7 @@
 set -euo pipefail
 APP="$1"
 OUT="$2"
-VOLNAME="${3:-PDF Text Editor}"
+VOLNAME="${3:-PDF for Free}"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"

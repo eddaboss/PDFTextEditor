@@ -1173,7 +1173,7 @@ header.scrolled{box-shadow:0 6px 24px -14px var(--shadow);
     email.style.display='none';pw.hidden=true;forgot.style.display='none';go.style.display='none';
     codebox.innerHTML='<div style="font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--clay-press);margin-bottom:8px">Your app sign-in code</div>'
       +'<div style="display:flex;gap:10px;align-items:center"><code id=dlcv style="font-family:ui-monospace,Menlo,monospace;font-size:22px;font-weight:700;letter-spacing:.08em;background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 12px;flex:1;text-align:center"></code><button type=button id=dlcp class=btn style="padding:10px 14px">Copy</button></div>'
-      +'<div style="font-size:13px;color:var(--ink2);margin-top:10px">Open PDF Text Editor and enter this on the first screen. It expires in an hour.</div>';
+      +'<div style="font-size:13px;color:var(--ink2);margin-top:10px">Open PDF for Free and enter this on the first screen. It expires in an hour.</div>';
     codebox.querySelector('#dlcv').textContent=code;codebox.hidden=false;
     document.getElementById('dlcp').addEventListener('click',function(){var b=this;try{navigator.clipboard.writeText(code);}catch(e){}b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);});
   }
@@ -1722,7 +1722,7 @@ def home() -> str:
     mac, win = info.get("mac"), info.get("windows")
     chan = "" if CHANNEL == "stable" else f'<span class="chan">{CHANNEL}</span>'
     # The Mac app (and so the quarantine command path) is named per channel.
-    app_name = "PDF Text Editor (Dev)" if CHANNEL != "stable" else "PDF Text Editor"
+    app_name = "PDF for Free (Dev)" if CHANNEL != "stable" else "PDF for Free"
 
     def btn(label: str, fname, icon=""):
         if not fname:

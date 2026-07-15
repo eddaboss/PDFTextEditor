@@ -159,4 +159,12 @@ def restore_layer(document) -> int:
                 p.get("centers", []), groups, gp)
         except Exception:
             continue
+
+    # Advance the box-id counter past every restored OCR box, so a later
+    # add_box can't reuse a saved box_id and collide edit_keys (silently
+    # overwriting a restored box on the same page).
+    document._next_box_id = max(
+        document._next_box_id,
+        max((b.box_id for b in document._new_boxes.values()
+             if b.edit_key[1] == "new"), default=-1) + 1)
     return restored

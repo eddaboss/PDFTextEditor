@@ -104,6 +104,9 @@ _PARA_FIRST_GAP_LO = 0.5     # before body_lead is seeded: gap >= this * size
 _PARA_FIRST_GAP_HI = 2.2     # ...and gap <= this * size (single..~2x leading)
 # A bold/italic/serif/mono change breaks the paragraph (heading vs body, callout).
 _STYLE_BITS = FLAG_BOLD | FLAG_ITALIC | FLAG_SERIF | FLAG_MONO
+# Same-line fragment merge: adjacent same-style runs within this many word-spaces
+# fuse into one box; a real column gap (label|value, tab) is far wider.
+_FRAG_GAP = 0.6              # max horizontal gap as a fraction of font size
 
 # Space-variant characters that a user types/reads as a plain space. PDF text
 # extraction frequently yields a NO-BREAK SPACE (U+00A0) where the visible glyph
@@ -312,11 +315,12 @@ class RunStyle:
     font_family: str | None = None
     color: tuple | None = None          # (r, g, b) 0..1
     underline: bool = False             # per-run underline (vector text-layer spans)
+    strike: bool = False                # per-run strikethrough (vector text-layer spans)
 
     @property
     def is_empty(self) -> bool:
         return (self.font_family is None and self.color is None
-                and not self.underline)
+                and not self.underline and not self.strike)
 
 
 @dataclass(frozen=True)
@@ -523,6 +527,12 @@ class NewBox:
 # when their before/after state is the unstaged baseline (forms §2).
 _FORM_UNSET = object()
 
+# Empty box glyphs a form uses to DRAW a checkbox as text (so an authored /
+# existing field can snap onto it). Filled/checked variants (■ ☑ ☒) are
+# excluded -- they are the "checked" state, not an empty target box.
+_CHECKBOX_GLYPHS = set("□☐▢◻◽⬜⬚"
+                       "❏❐❑❒▫◼")
+
 # fitz widget type -> this model's form-field kind string (forms §0 constants).
 _WIDGET_KIND_BY_TYPE = {
     fitz.PDF_WIDGET_TYPE_TEXT: "text",
@@ -566,6 +576,7 @@ class FormField:
     readonly: bool = False              # PDF_FIELD_IS_READ_ONLY
     text_fontsize: float = 0.0          # 0 = auto-size
     max_len: int = 0                    # 0 = unlimited
+    align: int = 0                      # text /Q: 0 left, 1 center, 2 right
 
     @property
     def identity(self) -> tuple:
@@ -584,6 +595,40 @@ class FormField:
         ONE registry for both gates -- readonly/button/signature/listbox
         widgets stay invisible to interaction (their appearance is baked)."""
         return not self.readonly and self.kind in _FILLABLE_FORM_KINDS
+
+
+# The field kinds the builder can AUTHOR (three-mode authoring). 'text' +
+# 'checkbox' are the originals; 'date' is a labelled text field; 'signature' is
+# an empty signature placeholder box. Combo/listbox (choice kinds) arrive in a
+# later slice; radio/button are deferred (they need field-tree / action models).
+_AUTHORED_FIELD_KINDS = ("text", "date", "checkbox", "signature")
+
+
+@dataclass
+class FormFieldSpec:
+    """One AUTHORED form field staged in ``_form_authoring`` (three-mode
+    authoring). Mirrors AnnotSpec: ``self.working`` is never mutated -- the
+    field becomes a real widget only on the fresh copy every bake seam opens
+    (``_apply_form_authoring`` -> ``page.add_widget``), so screen == file.
+    ``rect`` is UNROTATED text space (the same space FormField.rect lives in);
+    v1 kinds are 'text' | 'checkbox'. Rides the ONE shared undo history via
+    _AnnotCommand under a 3-tuple ``(page, 'formfield', field_id)`` key."""
+
+    page_index: int
+    field_id: int              # from self._form_field_id_counter
+    kind: str                  # v1: 'text' | 'checkbox'
+    rect: tuple                # (x0, y0, x1, y1) UNROTATED text space
+    name: str                  # the PDF field name (/T)
+    value: object = ''         # '' for text, False for checkbox
+    text_fontsize: float = 0.0  # text display /DA size; 0 = auto-size to fit
+    align: int = 0              # text /Q: 0 left, 1 center, 2 right
+
+    @property
+    def identity(self) -> tuple:
+        return (self.page_index, "formfield", self.field_id)
+
+    def with_changes(self, **kw) -> "FormFieldSpec":
+        return replace(self, **kw)
 
 
 @dataclass
@@ -958,6 +1003,15 @@ class PDFDocument:
             raise PasswordRequired(
                 f"{os.path.basename(path)} is password protected")
         self._open_password = password if self.original_encrypted else None
+        # Read the once-ever field-alignment marker from /Root NOW -- insert_pdf
+        # below copies pages only and drops catalog-level keys (the same reason
+        # metadata + TOC are carried manually). Stashed so autosnap skips a doc a
+        # prior session already aligned and the user has since hand-edited.
+        try:
+            _mt, _mv = src.xref_get_key(src.pdf_catalog(), self._ALIGNED_MARKER)
+            self._loaded_aligned = _mt not in (None, "null")
+        except Exception:  # noqa: BLE001 - a missing marker must not break open
+            self._loaded_aligned = False
         self.working = fitz.open()
         self.working.insert_pdf(src)
         # Metadata + TOC carry (doc-tools M1): ``insert_pdf`` copies pages
@@ -1090,6 +1144,30 @@ class PDFDocument:
         # _invalidate_caches (working-doc changed); staged values live in
         # ``_form_edits`` and never affect the enumeration.
         self._form_fields_cache: dict[int, list] = {}
+        # page_index -> [rect,...]: rectangles DRAWN on the sheet (checkbox
+        # outlines, cells, underline cells) an authored field snaps to. Depends
+        # only on the page content, so it clears with the working doc.
+        self._snap_boxes_cache: dict[int, list] = {}
+        # AUTHORED form fields (three-mode authoring): (page, "formfield", id)
+        # -> FormFieldSpec. Staged exactly like fills/annots -- ``self.working``
+        # is never mutated; specs bake into real widgets on the fresh copy
+        # (``_apply_form_authoring``) BEFORE fills, so an authored-and-filled
+        # field gets its value. Widens has_form / form_fields.
+        self._form_authoring: dict[tuple, "FormFieldSpec"] = {}
+        self._form_field_id_counter = itertools.count(1)
+        # EDITS to PRE-EXISTING baked widgets (three-mode authoring): (page,
+        # "widgetedit", xref) -> {"orig_name", "orig_rect", "rect", "name",
+        # "deleted"}. Like fills, ``self.working`` is never mutated -- the edit
+        # is replayed onto every fresh bake copy (``_apply_form_widget_edits``,
+        # matching the target widget by orig_name + orig_rect, then setting the
+        # new rect/name or deleting it). Lets the user move/resize/rename/delete
+        # a field the PDF already had, not just fields they authored.
+        self._form_widget_edits: dict[tuple, dict] = {}
+        self._autosnapped = False   # one-shot: existing widgets snapped to boxes
+        # Active top-level editing mode (three-mode UI): 'document' |
+        # 'form_fields' | 'fill_form'. Plain str so the model needs no import
+        # of the page_view consts; the view reads/writes it as the per-tab mode.
+        self.top_mode = "document"
         # Generalized undo/redo history (BUILD_SPEC §1.4): each entry captures
         # one box's complete before/after staged state, so replaying is uniform
         # across text/style/move/resize/delete/add.
@@ -5615,6 +5693,13 @@ class PDFDocument:
                        else self.scan_edit_context(box, cover_override=lc,
                                                    text_override=o, page_rgb=page_rgb))
                 if ctx is None:
+                    # A CHANGED line whose scan_edit_context failed cannot be
+                    # composed, but the canvas is seeded from the real scan crop,
+                    # so skipping it would silently keep the ORIGINAL text (lost
+                    # edit). Bail the whole block to the _scanned_paragraph_raster
+                    # fallback. Only an unchanged-but-styled line is safe to skip.
+                    if n != o:
+                        return None
                     continue
                 tile, disp = self.inplace_compose(ctx, n, lruns)
                 if tile is None:
@@ -5988,10 +6073,22 @@ class PDFDocument:
                     font_xref = self.font_engine.embedded_xref(
                         page_index, span["font"], span["flags"]
                     )
+                    # Trim the box WIDTH to the real glyph ink. rawdict's span
+                    # bbox is the ADVANCE CELL, so trailing/leading spaces add
+                    # their advance and the box overhangs the text (overlapping
+                    # neighbors, reading "wrong size"). Height stays full-em --
+                    # rawdict gives no glyph-ink height. Same advance-cell fact
+                    # the checkbox snap already corrects (_glyph_ink_box).
+                    ink = [c["bbox"] for c in span.get("chars", [])
+                           if c.get("c", "").strip()]
+                    bb = span["bbox"]
+                    bbox = ((min(cb[0] for cb in ink), bb[1],
+                             max(cb[2] for cb in ink), bb[3])
+                            if ink else tuple(bb))
                     out.append(
                         Span(
                             text=text,
-                            bbox=tuple(span["bbox"]),
+                            bbox=bbox,
                             origin=tuple(span["origin"]),
                             size=span["size"],
                             color=tuple(
@@ -6026,8 +6123,66 @@ class PDFDocument:
                            for o in out)
         out = [replace(sp, centered_line=_is_centered(sp)) for sp in out]
         merged = self._merge_overlapping(out)
+        merged = self._merge_line_fragments(merged)
         boxes = self._group_paragraphs(merged)
         return self._apply_manual_grouping(page_index, boxes, merged)
+
+    @staticmethod
+    def _merge_line_fragments(spans: list["Span"]) -> list["Span"]:
+        """Coalesce ADJACENT same-line, same-style runs the content stream split
+        into fragments ('visits' + 'are going to be made.') into ONE editable
+        box. The horizontal analog of paragraph grouping: only runs that share a
+        baseline, match family+style+size+color, and sit within one word-space
+        (<= _FRAG_GAP * size) fuse -- a real column gap (a label and its value, a
+        tab stop) is far wider, so distinct fields stay apart. Keeps the leftmost
+        run's identity/key and carries every member's redact box, so an unedited
+        merge bakes byte-identical. Crucially this runs BEFORE _group_paragraphs:
+        a wrap continuation split into fragments would otherwise look 'shared'
+        with itself on its row and block the paragraph from forming."""
+        horiz = [s for s in spans if s.is_horizontal]
+        other = [s for s in spans if not s.is_horizontal]
+        if len(horiz) < 2:
+            return list(spans)
+        order = sorted(horiz, key=lambda s: (round(s.origin[1], 1), s.bbox[0]))
+        out: list["Span"] = []
+        run: list["Span"] = [order[0]]
+
+        def _flush() -> None:
+            if len(run) == 1:
+                out.append(run[0])
+                return
+            run.sort(key=lambda s: s.bbox[0])
+            head = run[0]
+            text = "".join(s.text for s in run)
+            x0 = min(s.bbox[0] for s in run)
+            x1 = max(s.bbox[2] for s in run)
+            y0 = min(s.bbox[1] for s in run)
+            y1 = max(s.bbox[3] for s in run)
+            rb = tuple(b for s in run
+                       for b in (s.redact_bboxes or (s.bbox,)))
+            out.append(replace(head, text=text, bbox=(x0, y0, x1, y1),
+                               redact_bboxes=rb))
+
+        for s in order[1:]:
+            prev = run[-1]
+            sz = max(prev.size, 1e-6)
+            same_row = abs(s.origin[1] - prev.origin[1]) <= 0.3 * sz
+            gap = s.bbox[0] - prev.bbox[2]
+            same_style = (
+                abs(s.size - prev.size) <= _PARA_SIZE_TOL * sz
+                and FontEngine._family_norm(s.font)
+                == FontEngine._family_norm(prev.font)
+                and (s.flags & _STYLE_BITS) == (prev.flags & _STYLE_BITS)
+                and max(abs(a - b) for a, b in zip(s.color, prev.color))
+                <= _PARA_COLOR_TOL)
+            if same_row and same_style and -0.3 * sz <= gap <= _FRAG_GAP * sz:
+                run.append(s)
+            else:
+                _flush()
+                run = [s]
+        _flush()
+        out.extend(other)
+        return out
 
     @staticmethod
     def _merge_overlapping(spans: list["Span"]) -> list["Span"]:
@@ -6140,62 +6295,59 @@ class PDFDocument:
             return list(spans)
 
         order = sorted(candidates, key=lambda s: (round(s.bbox[1], 2), s.bbox[0]))
-        # A line that shares its baseline row with ANOTHER candidate (a label and
-        # its value, a bullet glyph and its text) is part of a multi-column row,
-        # not a free-flowing paragraph line: grouping it would merge across an
-        # unrelated column. Mark these so they never seed/extend a paragraph;
-        # they pass through as their own Spans.
-        row_shared: set[int] = set()
-        for a in range(len(order)):
-            ya = order[a].bbox[1]
-            ha = order[a].bbox[3] - order[a].bbox[1]
-            for b in range(a + 1, len(order)):
-                if order[b].bbox[1] - ya > 0.5 * max(ha, 1.0):
-                    break
-                # Same baseline row (vertical overlap), side by side horizontally.
-                if abs(order[b].origin[1] - order[a].origin[1]) <= 0.5 * max(ha, 1.0):
-                    row_shared.add(id(order[a]))
-                    row_shared.add(id(order[b]))
+        # A line blocked from EXTENDING a paragraph: one that has a CLOSE
+        # horizontal neighbour on its baseline row (a label and its value, a
+        # checkbox and its prompt -- same reading flow). A FAR neighbour is just
+        # another column that happens to align, NOT a same-flow sibling, so it
+        # does NOT block -- that is what lets a left-column wrap continuation group
+        # even when a right-column line sits on its row. Any line may still HEAD.
+        row_shared = self._flow_blocked_lines(order)
 
-        groups: list[list["Span"]] = []
-        current: list["Span"] = []
-        body_lead: float | None = None
+        # Column-aware walk: hold several OPEN paragraphs at once (one per column)
+        # and match each line against all of them, so an interleaved neighbouring
+        # column never breaks a run. Each open group is [lines, body_lead].
+        finished: list[list["Span"]] = []
+        open_groups: list[list] = []
 
-        def close() -> None:
-            nonlocal current, body_lead
-            if current:
-                groups.append(current)
-            current = []
-            body_lead = None
+        def _max_gap(grp) -> float:
+            head = grp[0][0]
+            return (_PARA_FIRST_GAP_HI * head.size if grp[1] is None
+                    else _PARA_LEAD_HI * grp[1])
 
         for s in order:
-            if id(s) in row_shared:
-                # A multi-column row line is never grouped: close any open group
-                # and emit this line as its own singleton group.
-                close()
-                groups.append([s])
-                continue
-            if not current:
-                current = [s]
-                body_lead = None
-                continue
-            prev = current[-1]
-            primary = current[0]
-            gap = s.bbox[1] - prev.bbox[1]
-            if self._para_continues(primary, prev, s, current, gap, body_lead):
-                if body_lead is None:
-                    body_lead = gap
-                current.append(s)
-            else:
-                close()
-                current = [s]
-                body_lead = None
-        close()
+            # Finalize any open group ``s`` has now dropped too far below to join.
+            live = []
+            for grp in open_groups:
+                if s.bbox[1] - grp[0][-1].bbox[1] > _max_gap(grp) + 1.0:
+                    finished.append(grp[0])
+                else:
+                    live.append(grp)
+            open_groups = live
+            extended = False
+            if id(s) not in row_shared:      # alone on its row -> may EXTEND
+                best = best_gap = None
+                for grp in open_groups:
+                    lines, lead = grp
+                    gap = s.bbox[1] - lines[-1].bbox[1]
+                    if self._para_continues(lines[0], lines[-1], s, lines,
+                                            gap, lead):
+                        dx = abs(s.bbox[0] - lines[-1].bbox[0])
+                        if best is None or dx < best[2]:
+                            best, best_gap = (grp, lines, dx), gap
+                if best is not None:
+                    grp = best[0]
+                    if grp[1] is None:
+                        grp[1] = best_gap
+                    grp[0].append(s)
+                    extended = True
+            if not extended:                 # start a new head (row_shared or not)
+                open_groups.append([[s], None])
+        finished.extend(grp[0] for grp in open_groups)
 
         # Build the output in reading order: a >=2-line group becomes a
         # ParagraphBox; everything else passes through as its member Span(s).
         out: list["Span | ParagraphBox"] = []
-        for grp in groups:
+        for grp in finished:
             if len(grp) >= 2:
                 out.append(self._build_paragraph(grp))
             else:
@@ -6204,6 +6356,28 @@ class PDFDocument:
         # Stable reading order across paragraphs + passthrough + singletons.
         out.sort(key=lambda b: (round(b.bbox[1], 2), b.bbox[0]))
         return out
+
+    @staticmethod
+    def _flow_blocked_lines(order: list["Span"]) -> set[int]:
+        """Lines that may NOT EXTEND a paragraph: any line that shares its
+        baseline row with another candidate (a label+value, a checkbox+prompt, a
+        table row's cells). A genuine wrap continuation sits ALONE on its row, so
+        it is never blocked. A line may still HEAD a paragraph even when blocked.
+        (Proximity-only blocking was tried and rejected: a wrap line coincidentally
+        aligning with a far column is indistinguishable from a real table cell,
+        so distance can't separate them without over-merging tables.)"""
+        blocked: set[int] = set()
+        for a in range(len(order)):
+            ra = order[a]
+            ha = ra.bbox[3] - ra.bbox[1]
+            for b in range(a + 1, len(order)):
+                rb = order[b]
+                if rb.bbox[1] - ra.bbox[1] > 0.5 * max(ha, 1.0):
+                    break                       # order is by y: past this row
+                if abs(rb.origin[1] - ra.origin[1]) <= 0.5 * max(ha, 1.0):
+                    blocked.add(id(ra))
+                    blocked.add(id(rb))
+        return blocked
 
     @staticmethod
     def _para_continues(primary: "Span", prev: "Span", s: "Span",
@@ -6588,12 +6762,20 @@ class PDFDocument:
     # Every staging method follows one rule (BUILD_SPEC §1.5): capture the
     # box's COMPLETE before-state, mutate staged state, push a _Command, clear
     # redo, set dirty. The private _command() helper does the snapshot + push so
-    # each mutator is a few lines. Existing spans key by (page, span.key);
+    # each mutator is a few lines. Existing spans key by (page, box.identity);
     # NewBoxes key by their edit_key.
+    #
+    # identity, NOT box.key: a ParagraphBox.key == its members[0] Span.key (both
+    # (block,line,span)), so on a dense form where a paragraph and an overlapping
+    # single line are both editable, keying _edits by box.key made their staged
+    # edits share ONE slot -- a commit on one clobbered the other and the edit
+    # reverted on reopen. identity is ("para",)-prefixed for a ParagraphBox so
+    # the two never collide. box.key is left untouched (redaction keys off the
+    # raw (block,line,span) via edited_keys, so it must stay the member indices).
 
     @staticmethod
     def _span_edit_key(page_index: int, span: Span) -> tuple:
-        return (page_index, span.key)
+        return (page_index, span.identity)
 
     def _span_state(self, key: tuple) -> _BoxState:
         """Snapshot an existing box's current staged state into a _BoxState."""
@@ -7716,6 +7898,28 @@ class PDFDocument:
         """Write one annot key's complete staged state back (None removes).
         The single choke point every annot mutation AND undo/redo replay
         passes through, so it owns dropping the page's records memo."""
+        # Authored form fields (three-mode authoring) ride the same history:
+        # a 3-tuple (page, "formfield", id) key writes/pops _form_authoring and
+        # drops that page's form_fields memo (enumeration changed). Handled
+        # before the annot branches; the tag never collides with (page, xref)
+        # or (page, "annot", id).
+        if len(key) == 3 and key[1] == "formfield":
+            self._form_fields_cache.pop(key[0], None)
+            if state is None:
+                self._form_authoring.pop(key, None)
+            else:
+                self._form_authoring[key] = state
+            return
+        # Edits to a pre-existing widget (move/resize/rename/delete): a 3-tuple
+        # (page, "widgetedit", xref) key writes/pops _form_widget_edits and
+        # drops that page's form_fields memo (the enumeration view changed).
+        if len(key) == 3 and key[1] == "widgetedit":
+            self._form_fields_cache.pop(key[0], None)
+            if state is None:
+                self._form_widget_edits.pop(key, None)
+            else:
+                self._form_widget_edits[key] = state
+            return
         self._annot_records_cache.pop(key[0], None)
         if len(key) == 3 and key[1] == "annot":
             if state is None:
@@ -7748,17 +7952,631 @@ class PDFDocument:
         return (any(s.page_index == page_index for s in self._annots.values())
                 or any(k[0] == page_index for k in self._annot_overrides))
 
+    # --- form field authoring (three-mode: staged, one shared history) ----
+    @staticmethod
+    def _form_field_key_for(ref) -> tuple:
+        """Normalize an authored-field reference (FormFieldSpec / FormField
+        view / identity tuple) to its map key ``(page, "formfield", id)``. v1
+        authors only NEW staged fields, so a FormField view of one carries the
+        SYNTHETIC negative xref (-field_id); existing baked widgets are not
+        authorable and never reach here."""
+        ident = getattr(ref, "identity", ref)
+        if isinstance(ident, tuple):
+            if len(ident) == 3 and ident[1] == "formfield":
+                return ident
+            # FormField view of an authored field: (page, "form", name, xref<0)
+            if (len(ident) == 4 and ident[1] == "form"
+                    and isinstance(ident[3], int) and ident[3] < 0):
+                return (ident[0], "formfield", -ident[3])
+        raise ValueError(f"not an authored form-field reference: {ref!r}")
+
+    def _form_field_names(self) -> set:
+        """Every /T in use -- working widgets (all pages) plus staged authored
+        specs -- so create/rename can reject a duplicate name."""
+        names = {s.name for s in self._form_authoring.values()}
+        for pi in range(self.page_count):
+            for w in self.working[pi].widgets():
+                if w.field_name:
+                    names.add(w.field_name)
+        return names
+
+    def _suggest_field_name(self) -> str:
+        """A unique default /T ('Field N') for a drag-created field, so the
+        canvas can author without prompting for a name first (it is renamed via
+        the props popup afterwards)."""
+        used = self._form_field_names()
+        i = 1
+        while f"Field {i}" in used:
+            i += 1
+        return f"Field {i}"
+
+    # --- edits to PRE-EXISTING widgets (move/resize/delete on the page) ------
+    @staticmethod
+    def _is_existing_widget_identity(ident) -> bool:
+        """True for a FormField identity of a PRE-EXISTING baked widget:
+        ``(page, "form", name, xref)`` with a real (non-synthetic) xref >= 0.
+        Authored fields carry a negative synthetic xref, so they fail this."""
+        return (isinstance(ident, tuple) and len(ident) == 4
+                and ident[1] == "form" and isinstance(ident[3], int)
+                and ident[3] >= 0)
+
+    def _field_view_for(self, ref):
+        """The live FormField view for a ref (view or identity tuple), or None.
+        Reads through ``form_fields`` so it reflects any staged widget edit."""
+        ident = getattr(ref, "identity", ref)
+        if not (isinstance(ident, tuple) and ident):
+            return None
+        for f in self.form_fields(int(ident[0])):
+            if f.identity == ident:
+                return f
+        return None
+
+    def _widget_edit_base(self, ref):
+        """``(key, base)`` for an existing-widget edit, or None when ``ref`` is
+        not a pre-existing widget. ``key`` is ``(page, "widgetedit", xref)``;
+        ``base`` is the current staged override, or a fresh baseline capturing
+        the widget's original name + rect (for bake-time matching)."""
+        ident = getattr(ref, "identity", ref)
+        if not self._is_existing_widget_identity(ident):
+            return None
+        page, _tag, _name, xref = ident
+        key = (page, "widgetedit", xref)
+        cur = self._form_widget_edits.get(key)
+        if cur is not None:
+            return key, cur
+        field = self._field_view_for(ident)
+        if field is None:
+            return None
+        return key, {"orig_name": field.name, "orig_rect": tuple(field.rect),
+                     "rect": None, "name": None, "fontsize": None,
+                     "align": None, "deleted": False}
+
+    @staticmethod
+    def _rects_close(a: tuple, b: tuple, tol: float = 0.5) -> bool:
+        return all(abs(x - y) <= tol for x, y in zip(a, b))
+
+    def _apply_form_widget_edits(self, target: "fitz.Document",
+                                 only_page: int | None = None) -> None:
+        """Replay every staged pre-existing-widget edit onto ``target``'s
+        widgets -- move/resize (``rect``), rename (``name``), or delete. Matches
+        the target widget by original name + rect (disambiguating same-named
+        radio kids), mirroring how ``_apply_form_values`` matches fills by name.
+        Pure MuPDF, no Qt.
+
+        A rect change writes ONLY the ``/Rect`` key (via the xref) and does NOT
+        call ``Widget.update()``: update() regenerates a checkbox's appearance as
+        a GENERIC checkmark, wiping the form's own mark (its real X). Rewriting
+        just /Rect keeps the existing /AP stream, which the viewer re-scales into
+        the new box -- so a snapped checkbox still shows the form's X, wrapped
+        onto the printed square."""
+        if not self._form_widget_edits:
+            return
+        by_page: dict[int, list] = {}
+        for (pi, _tag, _xref), ov in self._form_widget_edits.items():
+            if only_page is not None and pi != only_page:
+                continue
+            by_page.setdefault(pi, []).append(ov)
+        for pi, ovs in by_page.items():
+            page = target[pi]
+            ph = page.rect.height
+            # Snapshot (widget, name, rect) ONCE per page. page.widgets()
+            # re-parses the whole AcroForm on every call, so the old
+            # per-override call was O(overrides x full-parse) -- with 61 snapped
+            # widgets that was ~1.1s PER bake (every repaint), i.e. crazy lag.
+            # Match against the cached name/rect; apply via w / w.xref (stable
+            # across the other edits in this pass).
+            widgets = [(w, w.field_name, tuple(w.rect)) for w in page.widgets()]
+            for ov in ovs:
+                for w, wname, wrect in widgets:
+                    if wname != ov["orig_name"]:
+                        continue
+                    if not self._rects_close(wrect, ov["orig_rect"]):
+                        continue
+                    if ov.get("deleted"):
+                        page.delete_widget(w)
+                        break
+                    if ov.get("name"):
+                        w.field_name = ov["name"]
+                        w.update()            # a rename rewrites the field dict
+                    if ov.get("fontsize") is not None:
+                        # /DA size for a TEXT widget. update() is correct here
+                        # (unlike the /Rect branch that preserves a checkbox /AP)
+                        # -- it re-renders the value at the new size; runs BEFORE
+                        # _apply_form_values so a later fill inherits the /DA.
+                        w.text_fontsize = float(ov["fontsize"])
+                        w.update()
+                    if ov.get("align") is not None:
+                        # Text /Q alignment: write on the widget xref, then
+                        # update() re-renders the value aligned (TEXT widget only).
+                        target.xref_set_key(w.xref, "Q", str(int(ov["align"])))
+                        w.update()
+                    if ov.get("rect"):
+                        # /Rect only -> preserve + rescale the form's own /AP.
+                        # PDF space is bottom-left; flip y about page height
+                        # (unrotated -- snaps skip /Rotate pages).
+                        r = fitz.Rect(ov["rect"])
+                        target.xref_set_key(
+                            w.xref, "Rect",
+                            f"[{r.x0:.3f} {ph - r.y1:.3f} "
+                            f"{r.x1:.3f} {ph - r.y0:.3f}]")
+                    break
+
+    # --- snap authored fields to the boxes DRAWN on the sheet ---------------
+    def detect_snap_boxes(self, page_index: int) -> list:
+        """Rectangles DRAWN on the page an authored field can clip onto:
+        checkbox outlines / cell rects (``get_drawings`` 're' items) and a cell
+        sitting on a horizontal underline ('l' item). Cached per page;
+        UNROTATED page space (== widget-rect space). Empty on a /Rotate page
+        (the drawing coords would need the page-rotation map -- v1 ceiling)."""
+        cached = self._snap_boxes_cache.get(page_index)
+        if cached is not None:
+            return cached
+        boxes: list = []
+        try:
+            page = self.working[page_index]
+            if page.rotation % 360 == 0:
+                for dr in page.get_drawings():
+                    # Iterate the INDIVIDUAL path items -- get_drawings groups
+                    # every rect/line drawn in one op into ONE drawing whose
+                    # ``rect`` is their COMBINED bbox (wrong for a column of
+                    # checkboxes or a table grid). Each 're' item carries its own
+                    # rect; each 'l' item its two endpoints.
+                    for it in dr.get("items", ()):
+                        op = it[0]
+                        if op == "re":
+                            r = it[1]
+                            w, h = float(r.width), float(r.height)
+                            if 5.0 <= w <= 520.0 and 5.0 <= h <= 90.0:
+                                boxes.append((float(r.x0), float(r.y0),
+                                              float(r.x1), float(r.y1)))
+                        elif op == "l" and len(it) >= 3:
+                            p1, p2 = it[1], it[2]
+                            if abs(p1.y - p2.y) <= 2.0 \
+                                    and abs(p2.x - p1.x) >= 25.0:
+                                x0, x1 = sorted((float(p1.x), float(p2.x)))
+                                y = min(float(p1.y), float(p2.y))
+                                # a text cell rests ON the underline
+                                boxes.append((x0, y - 18.0, x1, y))
+                # Checkboxes drawn as a TEXT GLYPH (□ ☐ ...) rather than a vector
+                # rect -- very common in real forms (the box IS a character). The
+                # char bbox is the ADVANCE CELL (full leading tall, side bearings
+                # wide) -- e.g. an 18pt Calibri □ reports 10.9x18.0 while the drawn
+                # square is only ~8.4x8.2 centred in it. Snapping a field to the
+                # cell leaves it oversized and riding high above the printed box
+                # (the bug the user saw). Measure the glyph's real INK extent.
+                raw = page.get_text("rawdict")
+                for block in raw.get("blocks", []):
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            for ch in span.get("chars", []):
+                                if ch.get("c") not in _CHECKBOX_GLYPHS:
+                                    continue
+                                ink = self._glyph_ink_box(page, ch["bbox"])
+                                if ink is not None:
+                                    boxes.append(ink)
+        except Exception:  # noqa: BLE001 - detection must never break authoring
+            boxes = []
+        self._snap_boxes_cache[page_index] = boxes
+        return boxes
+
+    def _glyph_ink_box(self, page, cell: tuple) -> tuple | None:
+        """The tight VISUAL ink rectangle of a box glyph inside its advance cell.
+        ``cell`` is the char bbox -- advance width x full line height, far bigger
+        than the drawn square (side bearings + leading), so a field snapped to it
+        rides high and oversized. Render the cell to greyscale and return the
+        black-pixel extent (page space); None if the cell is blank. Rendering is
+        the only general way -- get_text / get_texttrace both report the cell, not
+        the ink, for every font."""
+        import numpy as np
+        x0, y0, x1, y1 = (float(v) for v in cell)
+        if x1 - x0 < 1.0 or y1 - y0 < 1.0:
+            return None
+        z = 8.0
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(z, z),
+                                  clip=fitz.Rect(x0, y0, x1, y1),
+                                  alpha=False, colorspace=fitz.csGRAY)
+            a = np.frombuffer(pix.samples, dtype=np.uint8)
+            a = a.reshape(pix.height, pix.stride)[:, :pix.width]
+        except Exception:  # noqa: BLE001 - a render failure just skips this glyph
+            return None
+        ys, xs = np.where(a < 128)
+        if xs.size == 0:
+            return None
+        return (x0 + float(xs.min()) / z, y0 + float(ys.min()) / z,
+                x0 + float(xs.max() + 1) / z, y0 + float(ys.max() + 1) / z)
+
+    def snap_field_rect(self, page_index: int, rect: tuple,
+                        square_only: bool = False) -> tuple:
+        """Snap an authored-field rect to the drawn box it best overlaps so the
+        field clips exactly onto the box on the sheet. Requires the drag's
+        CENTRE to fall inside a candidate box and a real overlap (IoU >= 0.15);
+        returns the box's rect on a match, else ``rect`` unchanged.
+
+        ``square_only`` (checkbox snapping) accepts only a roughly-square,
+        checkbox-sized box and picks the one whose CENTRE is nearest the field's
+        centre -- NOT by IoU, so a malformed sliver widget (1x6) still snaps to
+        the real box it sits in, and a wide table cell / underline strip that
+        merely contains the centre is rejected (it had stretched the mark)."""
+        x0, y0, x1, y1 = rect
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        ww, wh = (x1 - x0), (y1 - y0)
+        area = max(0.0, ww) * max(0.0, wh)
+        best, best_iou, best_dist = None, 0.15, 1e18
+        for bx0, by0, bx1, by1 in self.detect_snap_boxes(page_index):
+            if not (bx0 <= cx <= bx1 and by0 <= cy <= by1):
+                continue                       # centre must be inside the box
+            bw, bh = (bx1 - bx0), (by1 - by0)
+            if square_only:
+                # A checkbox mark clips ONLY a small square box (a '□' glyph or a
+                # small drawn square), bounded in ABSOLUTE points (mirrors
+                # detect_snap_boxes' own size filter). Pick by nearest centre so
+                # a tiny/malformed widget still snaps to the box it's inside.
+                if bh <= 0 or not (0.6 <= bw / bh <= 1.6):
+                    continue                   # not square-ish -> not a checkbox
+                if not (5.0 <= bw <= 20.0 and 5.0 <= bh <= 20.0):
+                    continue                   # not checkbox-sized -> skip
+                dist = abs((bx0 + bx1) / 2.0 - cx) + abs((by0 + by1) / 2.0 - cy)
+                if dist < best_dist:
+                    best_dist, best = dist, (bx0, by0, bx1, by1)
+                continue
+            ix0, iy0 = max(x0, bx0), max(y0, by0)
+            ix1, iy1 = min(x1, bx1), min(y1, by1)
+            inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+            union = area + bw * bh - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best = iou, (bx0, by0, bx1, by1)
+        return best if best is not None else rect
+
+    def add_form_field(self, page_index: int, rect: tuple, kind: str,
+                       name: str | None = None) -> "FormFieldSpec":
+        """Stage ONE authored field (one undo command, clears redo, dirties).
+        ``kind`` is 'text' | 'checkbox'; ``name`` (/T) must be unique across
+        working widgets AND staged specs -- when omitted/blank a unique default
+        ('Field N') is assigned. ``rect`` is unrotated text space. Returns the
+        new spec."""
+        if kind not in _AUTHORED_FIELD_KINDS:
+            raise ValueError(f"unsupported form field kind: {kind!r}")
+        name = (name or "").strip() or self._suggest_field_name()
+        if name in self._form_field_names():
+            raise ValueError(f"duplicate form field name: {name!r}")
+        spec = FormFieldSpec(
+            page_index=page_index,
+            field_id=next(self._form_field_id_counter),
+            kind=kind, rect=tuple(rect), name=name,
+            value=(False if kind == "checkbox" else ""))
+        self._push_annot_command(spec.identity, "formfield_add", None, spec,
+                                 f"Add {kind} field")
+        return spec
+
+    def move_form_field(self, ref, dx: float, dy: float) -> None:
+        """Move a field by (dx, dy) text-space points (one undo). Works on an
+        authored field OR a pre-existing baked widget (staged widget edit)."""
+        wk = self._widget_edit_base(ref)
+        if wk is not None:
+            key, base = wk
+            cur = self._form_widget_edits.get(key)
+            x0, y0, x1, y1 = base.get("rect") or base["orig_rect"]
+            after = dict(base)
+            after["rect"] = (x0 + dx, y0 + dy, x1 + dx, y1 + dy)
+            self._push_annot_command(key, "widget_move", cur, after,
+                                     "Move field")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        x0, y0, x1, y1 = cur.rect
+        after = cur.with_changes(rect=(x0 + dx, y0 + dy, x1 + dx, y1 + dy))
+        self._push_annot_command(key, "formfield_move", cur, after,
+                                 f"Move {cur.kind} field")
+
+    _ALIGNED_MARKER = "PFFAligned"   # /Root key: this doc's fields are aligned
+
+    def _form_widgets_marked_aligned(self) -> bool:
+        """True if this document was already field-aligned in a prior app session
+        (the /Root marker read at load, before insert_pdf dropped it). Makes
+        autosnap a strict once-ever op so a user's later manual field edits stick.
+        """
+        return bool(getattr(self, "_loaded_aligned", False))
+
+    def _mark_form_widgets_aligned(self, target: "fitz.Document") -> None:
+        """Stamp the once-ever alignment marker into ``target``'s /Root so a
+        reopen of the saved file skips autosnap entirely."""
+        try:
+            target.xref_set_key(target.pdf_catalog(), self._ALIGNED_MARKER,
+                                "true")
+        except Exception:  # noqa: BLE001 - the marker is best-effort
+            pass
+
+    def autosnap_existing_widgets(self) -> int:
+        """Snap every PRE-EXISTING widget onto the box printed on the sheet so a
+        fillable form opens already clipped -- run ONCE, automatically, at doc
+        activation BEFORE the view builds its hotspots.
+
+        Deliberately a PURE MODEL op: it stages rect overrides straight into
+        ``_form_widget_edits`` (+ drops the affected ``_form_fields_cache``
+        pages) with NO undo command, NO dirty flag, and NO repaint. The
+        repaint-driven versions (mid-open, and deferred-on-open) churned the
+        page's QGraphicsRectItem hotspots and left a freed Python wrapper live in
+        the scene -> SIGSEGV on macOS 27 beta. Here there is no scene yet, so the
+        crash is structurally impossible. Idempotent (already-snapped fields
+        return the same rect) and re-derived each open; a save bakes it in.
+        Returns the number snapped."""
+        if self._autosnapped or not self.has_form:
+            return 0
+        self._autosnapped = True
+        # Snap a document ONCE, ever. If a prior session already aligned it (the
+        # marker is persisted into the saved PDF, see save_as), the user's field
+        # edits since are authoritative -- never re-snap them.
+        if self._form_widgets_marked_aligned():
+            return 0
+        import statistics
+        # Pass 1: snap each existing checkbox to its printed box (text fields are
+        # left alone -- snapping their auto-sized font blew the value up huge).
+        plan: list = []           # (pi, field, snapped_rect_or_None)
+        sizes: list = []          # sizes of the boxes we DID snap onto
+        for pi in range(self.page_count):
+            for f in self.form_fields(pi):
+                if f.kind != "checkbox" \
+                        or not self._is_existing_widget_identity(f.identity):
+                    continue
+                r = tuple(f.rect)
+                snapped = self.snap_field_rect(pi, r, square_only=True)
+                if snapped != r:
+                    plan.append((pi, f, snapped))
+                    sizes.append((snapped[2] - snapped[0],
+                                  snapped[3] - snapped[1]))
+                else:
+                    plan.append((pi, f, None))   # no box here -> size fallback
+        # Pass 2: a checkbox with NO printed box (a misplaced / boxless widget)
+        # would otherwise keep its original size and read as a different-sized
+        # mark. Give it the MEDIAN snapped box size, centred where it sits, so
+        # every checkbox mark is uniform.
+        med = ((statistics.median(w for w, _ in sizes),
+                statistics.median(h for _, h in sizes)) if sizes else None)
+        n = 0
+        touched: set = set()
+        for pi, f, target in plan:
+            r = tuple(f.rect)
+            if target is None:
+                if med is None:
+                    continue
+                mw, mh = med
+                cx, cy = (r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0
+                target = (cx - mw / 2, cy - mh / 2, cx + mw / 2, cy + mh / 2)
+                if self._rects_close(target, r):
+                    continue                     # already ~median size
+            key = (pi, "widgetedit", f.identity[3])
+            base = dict(self._form_widget_edits.get(key) or {
+                "orig_name": f.name, "orig_rect": r,
+                "rect": None, "name": None, "deleted": False})
+            base["rect"] = target
+            self._form_widget_edits[key] = base
+            n += 1
+            touched.add(pi)
+        for pi in touched:
+            self._form_fields_cache.pop(pi, None)
+        return n
+
+    def resize_form_field(self, ref, rect: tuple) -> None:
+        """Set a field's rect to EXACTLY ``rect`` (unrotated text space; one
+        undo). Works on an authored field OR a pre-existing baked widget (staged
+        widget edit). NO snapping: box-snapping is a one-time load normalization
+        (autosnap_existing_widgets / the Align button, which pre-snap the rect
+        themselves), never a per-edit force -- a manual resize must keep the size
+        the user dragged."""
+        wk = self._widget_edit_base(ref)
+        if wk is not None:
+            key, base = wk
+            cur = self._form_widget_edits.get(key)
+            after = dict(base)
+            after["rect"] = tuple(rect)
+            self._push_annot_command(key, "widget_resize", cur, after,
+                                     "Resize field")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        after = cur.with_changes(rect=tuple(rect))
+        self._push_annot_command(key, "formfield_resize", cur, after,
+                                 f"Resize {cur.kind} field")
+
+    def set_form_field_fontsize(self, ref, size: float) -> None:
+        """Set a TEXT field's display /DA font size (0 = auto-size; one undo).
+        Works on an authored field OR a pre-existing baked widget. Mirrors
+        resize_form_field's two-branch shape; the bake writes /DA so the value
+        renders at ``size``."""
+        size = max(0.0, float(size))
+        wk = self._widget_edit_base(ref)
+        if wk is not None:
+            key, base = wk
+            cur = self._form_widget_edits.get(key)
+            after = dict(base)
+            after["fontsize"] = size
+            self._push_annot_command(key, "widget_set_fontsize", cur, after,
+                                     "Set field font size")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        after = cur.with_changes(text_fontsize=size)
+        self._push_annot_command(key, "formfield_set_fontsize", cur, after,
+                                 "Set field font size")
+
+    def set_form_field_alignment(self, ref, align: int) -> None:
+        """Set a TEXT field's horizontal alignment (/Q: 0 left, 1 centre,
+        2 right; one undo). Works on an authored field OR a pre-existing baked
+        widget -- the widget-edit override is xref-keyed and the bake writes /Q.
+        Mirrors set_form_field_fontsize's two-branch shape."""
+        align = int(align)
+        if align not in (0, 1, 2):
+            align = 0
+        wk = self._widget_edit_base(ref)
+        if wk is not None:
+            key, base = wk
+            cur = self._form_widget_edits.get(key)
+            after = dict(base)
+            after["align"] = align
+            self._push_annot_command(key, "widget_set_align", cur, after,
+                                     "Align field")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        after = cur.with_changes(align=align)
+        self._push_annot_command(key, "formfield_set_align", cur, after,
+                                 "Align field")
+
+    def rename_form_field(self, ref, name: str) -> None:
+        """Rename a field's /T (validated unique; one undo). Works on an authored
+        field OR a PRE-EXISTING baked widget: the widget-edit override is keyed
+        by the widget's stable XREF (not its name), and the bake matches the
+        target by its ORIGINAL name+rect before writing the new /T -- so a rename
+        never breaks its refs. Drops any staged fill keyed to the OLD name."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("form field requires a non-empty name")
+        wk = self._widget_edit_base(ref)
+        if wk is not None:                       # pre-existing widget
+            key, base = wk
+            orig = base.get("orig_name")
+            if name != orig and name in self._form_field_names():
+                raise ValueError(f"duplicate form field name: {name!r}")
+            cur = self._form_widget_edits.get(key)
+            after = dict(base)
+            after["name"] = name if name != orig else None
+            self._push_annot_command(key, "widget_rename", cur, after,
+                                     "Rename field")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        if name != cur.name and name in self._form_field_names():
+            raise ValueError(f"duplicate form field name: {name!r}")
+        self._form_edits.pop((cur.page_index, "form", cur.name), None)
+        after = cur.with_changes(name=name)
+        self._push_annot_command(key, "formfield_rename", cur, after,
+                                 "Rename field")
+
+    def set_form_field_kind(self, ref, kind: str) -> None:
+        """Retype an authored field among the authored kinds (one undo). A
+        staged retype is free; the value resets to the new kind's default and
+        any old-typed staged fill is dropped (its value no longer fits)."""
+        if kind not in _AUTHORED_FIELD_KINDS:
+            raise ValueError(f"unsupported form field kind: {kind!r}")
+        if self._widget_edit_base(ref) is not None:
+            raise ValueError("retyping a pre-existing field is not supported yet")
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        self._form_edits.pop((cur.page_index, "form", cur.name), None)
+        after = cur.with_changes(
+            kind=kind, value=(False if kind == "checkbox" else ""))
+        self._push_annot_command(key, "formfield_set_kind", cur, after,
+                                 f"Set field type {kind}")
+
+    def delete_form_field(self, ref) -> None:
+        """Delete a field (one undo; undo restores it). Works on an authored
+        field OR a pre-existing baked widget (staged widget-delete). Drops any
+        staged fill under its name so it does not orphan."""
+        wk = self._widget_edit_base(ref)
+        if wk is not None:
+            key, base = wk
+            cur = self._form_widget_edits.get(key)
+            self._form_edits.pop((key[0], "form", base["orig_name"]), None)
+            after = dict(base)
+            after["deleted"] = True
+            self._push_annot_command(key, "widget_delete", cur, after,
+                                     "Delete field")
+            return
+        key = self._form_field_key_for(ref)
+        cur = self._form_authoring.get(key)
+        if cur is None:
+            raise ValueError(f"no authored form field for {key!r}")
+        self._form_edits.pop((cur.page_index, "form", cur.name), None)
+        self._push_annot_command(key, "formfield_delete", cur, None,
+                                 f"Delete {cur.kind} field")
+
+    def _apply_form_authoring(self, target: "fitz.Document",
+                              only_page: int | None = None) -> None:
+        """Realize every AUTHORED field as a real widget on ``target`` (the
+        fresh copy a bake seam opened). Called BEFORE ``_apply_form_values`` so
+        an authored-and-filled-in-session field's widget exists to take its
+        value. The FIRST ``add_widget`` on a non-form doc flips ``is_form_pdf``
+        0->N and auto-creates /AcroForm + /DR, and the widgets survive
+        tobytes / save / insert_pdf (verified PyMuPDF 1.27.2.3).
+
+        ponytail: rects are UNROTATED text space and passed straight through;
+        if a /Rotate 90/270 page ever lands a widget wrong, map it like
+        insert_image (unrotated rect + rotate=page.rotation) -- unverified, no
+        widget-create precedent, so v1 leaves it as the one known ceiling."""
+        # Replay edits to PRE-EXISTING widgets first (move/resize/rename/delete)
+        # -- called at every bake seam alongside the authored-field realize, so
+        # both ride every save/render copy.
+        self._apply_form_widget_edits(target, only_page)
+        if not self._form_authoring:
+            return
+        # Map each authored kind to its PyMuPDF widget type. 'date' is a TEXT
+        # widget (the text_format=DATE path is a verified no-op in PyMuPDF
+        # 1.27.2.3, so date is a labelled text field); 'signature' is an empty
+        # SIGNATURE placeholder box (no font, no value).
+        kind_to_type = {
+            "text": fitz.PDF_WIDGET_TYPE_TEXT,
+            "date": fitz.PDF_WIDGET_TYPE_TEXT,
+            "checkbox": fitz.PDF_WIDGET_TYPE_CHECKBOX,
+            "signature": fitz.PDF_WIDGET_TYPE_SIGNATURE,
+        }
+        for spec in self._form_authoring.values():
+            if only_page is not None and spec.page_index != only_page:
+                continue
+            w = fitz.Widget()
+            w.field_name = spec.name
+            w.field_type = kind_to_type.get(spec.kind,
+                                            fitz.PDF_WIDGET_TYPE_TEXT)
+            w.rect = fitz.Rect(spec.rect)
+            if spec.kind in ("text", "date"):
+                w.text_font = "Helv"
+                w.text_fontsize = float(getattr(spec, "text_fontsize", 0) or 0)
+            aw = target[spec.page_index].add_widget(w)
+            # Text alignment (/Q) is not a PyMuPDF Widget property -- write it on
+            # the widget xref after add_widget (0 left is the default, skip it).
+            align = int(getattr(spec, "align", 0) or 0)
+            if spec.kind in ("text", "date") and align:
+                xr = getattr(aw, "xref", None) or getattr(w, "xref", None)
+                if xr:
+                    try:
+                        target.xref_set_key(int(xr), "Q", str(align))
+                    except Exception:  # noqa: BLE001 - /Q is cosmetic
+                        pass
+
     # --- forms: AcroForm detect / enumerate / fill (forms §2) -------------
     @property
     def has_form(self) -> bool:
         """True when the working doc carries an AcroForm with fields.
-        ``is_form_pdf`` returns a truthy field COUNT (or False), so wrap."""
-        return bool(self.working.is_form_pdf)
+        ``is_form_pdf`` returns a truthy field COUNT (or False), so wrap.
+        Authored-but-unbaked fields (three-mode authoring) also count -- the
+        first staged field flips this true so Fill Form becomes available."""
+        return bool(self.working.is_form_pdf) or bool(self._form_authoring)
 
     @property
     def form_field_count(self) -> int:
         """The AcroForm field count (the status-badge number)."""
         return int(self.working.is_form_pdf or 0)
+
+    def _read_widget_q(self, xref: int) -> int:
+        """The widget's text /Q (0 left, 1 centre, 2 right); 0 when unset."""
+        try:
+            t, v = self.working.xref_get_key(int(xref), "Q")
+            return int(v) if t == "int" else 0
+        except Exception:  # noqa: BLE001 - a missing /Q just means left
+            return 0
 
     def form_fields(self, page_index: int) -> list["FormField"]:
         """One ``FormField`` PER WIDGET on ``page_index`` (radio kids are
@@ -7788,7 +8606,13 @@ class PDFDocument:
             kind = _WIDGET_KIND_BY_TYPE.get(w.field_type, "button")
             flags = int(w.field_flags or 0)
             if kind == "checkbox":
-                value: object = (w.field_value != "Off")
+                # Checked IFF the value equals the widget's ON state. A bare
+                # ``!= "Off"`` wrongly reads an unset /V ("" / None -- common in
+                # real forms) as checked, so the first click then UN-checks an
+                # already-"checked" box with no visible change. Compare to the
+                # real on-state instead (on_state() can be None -> unchecked).
+                on = w.on_state()
+                value: object = bool(on) and w.field_value == on
             elif kind == "radio":
                 value = radio_value[w.field_name]
             else:
@@ -7809,6 +8633,53 @@ class PDFDocument:
                 readonly=bool(flags & fitz.PDF_FIELD_IS_READ_ONLY),
                 text_fontsize=float(w.text_fontsize or 0.0),
                 max_len=int(w.text_maxlen or 0),
+                align=(self._read_widget_q(w.xref) if kind == "text" else 0),
+            ))
+        # Apply staged edits to PRE-EXISTING widgets so the panel + canvas show
+        # the moved/resized geometry and drop deleted ones. Keyed by xref, which
+        # is stable within the working doc; rect changes keep identity (name +
+        # xref) so on-page selection survives a move.
+        if self._form_widget_edits:
+            kept: list[FormField] = []
+            for f in out:
+                ov = self._form_widget_edits.get(
+                    (page_index, "widgetedit", f.xref))
+                if ov is None:
+                    kept.append(f)
+                elif ov.get("deleted"):
+                    continue
+                else:
+                    changes = {}
+                    if ov.get("name"):
+                        # A staged rename (name-edit) -- reflect it so the panel,
+                        # the props section, and on-page selection all show the
+                        # new /T. Identity embeds the name, but the widget-edit
+                        # key stays xref-based, so refs survive the rename.
+                        changes["name"] = ov["name"]
+                    if ov.get("rect"):
+                        changes["rect"] = tuple(ov["rect"])
+                    if ov.get("fontsize") is not None:
+                        changes["text_fontsize"] = float(ov["fontsize"])
+                    if ov.get("align") is not None:
+                        changes["align"] = int(ov["align"])
+                    kept.append(replace(f, **changes) if changes else f)
+            out = kept
+        # Authored-but-unbaked fields (three-mode authoring): append each
+        # staged spec on this page as a read FormField view with a SYNTHETIC
+        # NEGATIVE xref (-field_id) so identity/group_key stay stable across
+        # repaints and page_view can tell authored (xref < 0) from baked.
+        for spec in self._form_authoring.values():
+            if spec.page_index != page_index:
+                continue
+            out.append(FormField(
+                page_index=page_index,
+                name=spec.name,
+                kind=spec.kind,
+                rect=tuple(spec.rect),
+                xref=-spec.field_id,
+                value=spec.value,
+                on_state=None,
+                text_fontsize=float(getattr(spec, "text_fontsize", 0) or 0),
             ))
         self._form_fields_cache[page_index] = out
         return out
@@ -7817,6 +8688,30 @@ class PDFDocument:
                              field: "FormField") -> object:
         """The field's CURRENT value: the staged one, else the baseline."""
         return self._form_edits.get(field.group_key, field.value)
+
+    def form_field_render_fontsize(self, field: "FormField",
+                                   text: str = "") -> float:
+        """The point size a TEXT field's value will render at, matching MuPDF's
+        auto-size, so the inline editor can show it WYSIWYG. An explicit /DA size
+        wins; otherwise MuPDF fits ~the field height for a single line (measured
+        ratio ~1.0), shrinking only when the string would overflow the width. A
+        multiline field auto-sizes per line, not to the whole box, so its height
+        is not a cap -- fall back to a readable default there."""
+        if field.text_fontsize and field.text_fontsize > 0:
+            return float(field.text_fontsize)
+        x0, y0, x1, y1 = field.rect
+        h = max(1.0, y1 - y0)
+        w = max(1.0, x1 - x0)
+        size = 12.0 if getattr(field, "multiline", False) else h
+        s = (text or "").replace("\n", " ")
+        if s:
+            try:
+                per_pt = fitz.get_text_length(s, fontname="helv", fontsize=1.0)
+            except Exception:  # noqa: BLE001 - metric lookup must not break UI
+                per_pt = 0.0
+            if per_pt > 0:
+                size = min(size, (w - 2.0) / per_pt)   # 2pt of horizontal pad
+        return max(2.0, size)
 
     def form_tab_order(self) -> list["FormField"]:
         """Every FILLABLE widget, all pages in order, fields in widget
@@ -7875,9 +8770,18 @@ class PDFDocument:
         self._push_command(key, field, "form", before, after, label)
 
     def _page_has_form_edits(self, page_index: int) -> bool:
-        """True when this page has staged form values -- the render
-        fast-path guard (forms §2)."""
-        return any(k[0] == page_index for k in self._form_edits)
+        """True when this page has ANY staged form change -- the render
+        fast-path guard (forms §2). Covers filled VALUES (``_form_edits``),
+        pre-existing-widget edits (rename / resize / fontsize / align / delete,
+        ``_form_widget_edits``), AND authored fields (``_form_authoring``); if
+        any is present the render bakes the form pipeline so the change shows on
+        the canvas instead of skipping to the plain fast path."""
+        if any(k[0] == page_index for k in self._form_edits):
+            return True
+        if any(k[0] == page_index for k in self._form_widget_edits):
+            return True
+        return any(spec.page_index == page_index
+                   for spec in self._form_authoring.values())
 
     def _apply_form_values(self, target: "fitz.Document",
                            only_page: int | None = None) -> None:
@@ -7899,15 +8803,79 @@ class PDFDocument:
                 continue
             by_page.setdefault(pi, {})[name] = value
         for pi, values in by_page.items():
-            for w in target[pi].widgets():
+            page = target[pi]                # hold the page (widgets weakref it)
+            for w in page.widgets():
                 if w.field_name not in values:
                     continue
                 value = values[w.field_name]
+                # A checkbox ships its OWN per-state appearance in /AP/N (the X /
+                # check / filled box the form was designed with). Point /AS at
+                # that existing stream instead of calling update(), which would
+                # REGENERATE a generic checkmark and discard the form's design.
+                if w.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                    self._set_button_state(target, w, bool(value))
+                    continue
                 if w.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
                     if w.on_state() != value:
                         continue        # only the matching kid is set
                 w.field_value = value
                 w.update()
+
+    @staticmethod
+    def _set_button_state(target: "fitz.Document", w, checked: bool) -> None:
+        """Set a checkbox to its OWN on/off appearance without regenerating it.
+        Real forms store a drawn appearance per state in /AP/N; writing /AS (and
+        /V) to point at the existing 'on' (or 'Off') stream renders THAT mark
+        unchanged. Only when the widget has no pre-drawn 'on' appearance does it
+        fall back to ``update()`` (MuPDF's generic checkmark)."""
+        on = w.on_state()
+        want = on if (checked and on) else "Off"
+        has_on_ap = False
+        if want != "Off":
+            try:
+                typ, val = target.xref_get_key(w.xref, "AP/N/" + want)
+                has_on_ap = typ not in (None, "null") and bool(val)
+            except Exception:  # noqa: BLE001 - a probe must not break the bake
+                has_on_ap = False
+        if want != "Off" and not has_on_ap:
+            w.field_value = (on or True) if checked else "Off"
+            w.update()
+            return
+        if want != "Off":
+            # Normalize the check mark. The form's per-box X paths inset by
+            # ~fixed POINTS against appearance BBoxes of varying height, so the X
+            # filled a different fraction of each box -> the marks read as
+            # different sizes. Rewrite the 'on' stream to an X inset by a fixed
+            # FRACTION of the BBox, so every checked box shows the same-proportion
+            # mark. Still the form's mark TYPE (a stroked X), never a generic tick.
+            PDFDocument._uniform_check_x(target, w.xref, want)
+        target.xref_set_key(w.xref, "AS", "/" + want)
+        target.xref_set_key(w.xref, "V", "/" + want)
+
+    @staticmethod
+    def _uniform_check_x(target: "fitz.Document", xref: int, state: str) -> None:
+        """Overwrite widget ``xref``'s /AP/N/``state`` appearance stream with an
+        X inscribed at a fixed 13% inset of its own BBox (so it scales uniformly
+        into any /Rect). No-op on any failure -- the original mark still renders."""
+        try:
+            typ, ref = target.xref_get_key(xref, "AP/N/" + state)
+            if typ != "xref":
+                return
+            sx = int(ref.split()[0])
+            btyp, bval = target.xref_get_key(sx, "BBox")
+            if btyp != "array":
+                return
+            n = [float(v) for v in bval.strip("[] ").split()]
+            bw, bh = n[2] - n[0], n[3] - n[1]
+            mx, my = 0.13 * bw, 0.13 * bh
+            lw = max(0.3, 0.09 * min(bw, bh))
+            x0, y0, x1, y1 = n[0] + mx, n[1] + my, n[2] - mx, n[3] - my
+            content = (f"q {lw:.3f} w 0 G "
+                       f"{x0:.3f} {y0:.3f} m {x1:.3f} {y1:.3f} l "
+                       f"{x0:.3f} {y1:.3f} m {x1:.3f} {y0:.3f} l S Q")
+            target.update_stream(sx, content.encode("latin-1"))
+        except Exception:  # noqa: BLE001 - never break the bake over a mark
+            pass
 
     # --- generalized undo / redo ----------------------------------------
     def undo(self) -> tuple[int, object] | None:
@@ -7982,6 +8950,12 @@ class PDFDocument:
         # shared return below hands the UI a ref with .page_index/.identity.
         return page, cmd.span
 
+    def history_depth(self) -> int:
+        """Current length of the universal model-history stack (``_undo``).
+        ``_ModelCommand.redo`` in ui/main_window.py reads this to tell whether a
+        replayed command actually pushed onto the model."""
+        return len(self._undo)
+
     @property
     def can_undo(self) -> bool:
         return bool(self._undo)
@@ -7997,7 +8971,7 @@ class PDFDocument:
         if isinstance(box, NewBox):
             cur = self._new_boxes.get(box.edit_key)
             return cur.text if cur is not None else box.text
-        edit = self._edits.get((page_index, box.key))
+        edit = self._edits.get(self._span_edit_key(page_index, box))
         return edit.effective_text(box) if edit is not None else box.text
 
     def editor_line_layout(self, page_index: int, box) -> list | None:
@@ -8017,7 +8991,7 @@ class PDFDocument:
             # which edits the block fine; the authoritative reflow happens in the
             # bake's paragraph raster on commit.
             return None
-        edit = self._edits.get((page_index, box.key))
+        edit = self._edits.get(self._span_edit_key(page_index, box))
         e = edit if edit is not None else Edit(span=box)
         result = self._wrap_for_edit_cached(page_index, box, e)
         out = []
@@ -8043,7 +9017,7 @@ class PDFDocument:
                 cur = self.seed_scan_style(cur)
             return {"font_family": cur.font_family, "size": cur.size,
                     "color": cur.color, "bold": cur.bold, "italic": cur.italic}
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         style = edit.style if edit is not None else StyleOverride()
         from .fonts import is_bold, is_italic
         orig_bold = is_bold(box.font, box.flags)
@@ -8315,7 +9289,15 @@ class PDFDocument:
             return False
         key = (box.edit_key if isinstance(box, NewBox)
                else self._span_edit_key(page_index, box))
-        return any(cmd.edit_key == key for cmd in unsaved)
+        # The undo list is MIXED: edit/box commands carry an ``edit_key``, but
+        # annotation + structural commands do NOT. ``getattr`` (not ``cmd.edit_key``)
+        # so a non-edit command on the stack -- e.g. an ``_AnnotCommand`` pushed by
+        # committing a highlight -- reads as "no match" instead of raising
+        # AttributeError. That AttributeError used to surface deep inside a paint
+        # (SpanHotspot.paint -> is_unsaved_edit -> here) and, escaping a Qt virtual
+        # override, took the whole process down (getOverride -> func_dealloc SIGSEGV
+        # on macOS 27 / PySide 6.11 -- the "highlighter crashes the app" bug).
+        return any(getattr(cmd, "edit_key", None) == key for cmd in unsaved)
 
     # --- document info / metadata (doc-tools M1) ---------------------------
     def metadata_fields(self) -> dict:
@@ -8515,7 +9497,10 @@ class PDFDocument:
             # Staged form values FIRST, before the per-page edit loop (forms
             # §2): the ONE seam, so save_as / export_text / optimize /
             # save_flattened all get fills for free. Probe-proven safe
-            # against the redactions below (§0).
+            # against the redactions below (§0). Authored fields realize FIRST
+            # (three-mode authoring) so an authored-and-filled field's widget
+            # exists to receive the fill just below.
+            self._apply_form_authoring(out)
             self._apply_form_values(out)
             engine = self.font_engine
 
@@ -8550,9 +9535,15 @@ class PDFDocument:
                 from .ocr import layer_io
                 _blob = layer_io.serialize_layer(self)
                 if _blob:
-                    out.embfile_add(layer_io.EMB_NAME, _blob)
-            except Exception:
-                pass
+                    # A reopened file already contains the embedded layer, so a
+                    # plain embfile_add raises ValueError('...already exists') and
+                    # the stale copy survives -- update in place when present.
+                    if layer_io.EMB_NAME in out.embfile_names():
+                        out.embfile_upd(layer_io.EMB_NAME, _blob)
+                    else:
+                        out.embfile_add(layer_io.EMB_NAME, _blob)
+            except Exception as _e:
+                dlog("OCR", "embed_layer_failed", err=repr(_e))
         except Exception:
             out.close()
             raise
@@ -8587,6 +9578,10 @@ class PDFDocument:
         originally encrypted file protected with its open password.
         """
         out = self._baked_copy()
+        if self._autosnapped:
+            # Persist the once-ever alignment marker so a reopen of this saved
+            # file never re-snaps -- the user's field edits are now authoritative.
+            self._mark_form_widgets_aligned(out)
         try:
             # Atomic write: stage to a temp file in the destination dir and
             # os.replace, so a mid-write crash never corrupts an existing
@@ -8719,8 +9714,15 @@ class PDFDocument:
         redact_rects += [
             fitz.Rect(bb) for s in extra_redact_spans for bb in s.redact_rects
         ]
+        # Parallel per-rect writing directions so the neighbor rescue can tell a
+        # same-direction residue (drop) from a cross-direction watermark overlap
+        # (redraw) -- see _overlapping_neighbors.
+        redact_dirs = [tuple(e.span.dir) for e in edits for _ in e.span.redact_rects]
+        redact_dirs += [
+            tuple(s.dir) for s in extra_redact_spans for _ in s.redact_rects
+        ]
         neighbors = self._overlapping_neighbors_cached(
-            out, page_index, edited_keys, redact_rects
+            out, page_index, edited_keys, redact_rects, redact_dirs
         )
 
         # Remove originals first (apply_redactions drops pre-registered fonts,
@@ -9091,24 +10093,29 @@ class PDFDocument:
                 t, b, i = run[0], run[1], run[2]
                 rs = run[3] if len(run) > 3 else None
                 ul = bool(rs.underline) if rs is not None else False
+                st = bool(rs.strike) if rs is not None else False
                 rf_run = PDFDocument._resolve_run(engine, page_index, span,
                                                   edit, t, b, i)
                 fname = PDFDocument._register_resolved(engine, page, rf_run,
                                                        registered)
                 w = engine.fitz_font_for(rf_run).text_length(t, fontsize=size)
-                drawn.append((t, fname, w, ul))
+                drawn.append((t, fname, w, ul, st))
                 total_w += w
             origin = PDFDocument._maybe_recenter(page, span, edit, origin,
                                                  total_w)
             x, y = origin
             uls: list = []
-            for t, fname, w, ul in drawn:
+            sts: list = []
+            for t, fname, w, ul, st in drawn:
                 PDFDocument._insert_run(shape, (x, y), t, size, fname, color,
                                         span.dir)
                 if ul:
                     uls.append(((x, y), w, span.dir))
+                if st:
+                    sts.append(((x, y), w, span.dir))
                 x += w
             PDFDocument._stroke_underlines(shape, uls, size, color)
+            PDFDocument._stroke_strikes(shape, sts, size, color)
             return
         rf = PDFDocument._resolve_for_edit(engine, page_index, span, edit, text)
         fontname = PDFDocument._register_resolved(engine, page, rf, registered)
@@ -9206,33 +10213,35 @@ class PDFDocument:
         if edit.runs:
             reg = registered if registered is not None else set()
 
-            def _fields(run):                    # (text, bold, italic, underline)
+            def _fields(run):                    # (text, bold, italic, underline, strike)
                 rs = run[3] if len(run) > 3 else None
                 return (run[0], run[1], run[2],
-                        bool(rs.underline) if rs is not None else False)
+                        bool(rs.underline) if rs is not None else False,
+                        bool(rs.strike) if rs is not None else False)
             # One resolve/register per distinct style key, with ALL of that
             # style's text so glyph-coverage checks see every character. The key
-            # includes underline so a seg carries it to the stroke pass; the face
-            # itself resolves off (bold, italic) only (underline is drawn, not a face).
+            # includes underline/strike so a seg carries them to the stroke pass; the
+            # face itself resolves off (bold, italic) only (they are drawn, not a face).
             by_style: dict[tuple, list] = {}
             for run in edit.runs:
-                t, b, i, ul = _fields(run)
-                by_style.setdefault((b, i, ul), []).append(t)
+                t, b, i, ul, st = _fields(run)
+                by_style.setdefault((b, i, ul, st), []).append(t)
             fonts: dict[tuple, object] = {}
             fnames: dict[tuple, str] = {}
             for style_key, parts in by_style.items():
-                b, i, _ul = style_key
+                b, i, _ul, _st = style_key
                 rf_k = PDFDocument._resolve_run(engine, page_index, box, edit,
                                                 "".join(parts), b, i)
                 fnames[style_key] = PDFDocument._register_resolved(
                     engine, page, rf_k, reg)
                 fonts[style_key] = engine.fitz_font_for(rf_k)
             result = wrap_rich(
-                [(t, (b, i, ul)) for t, b, i, ul in map(_fields, edit.runs)],
+                [(t, (b, i, ul, st)) for t, b, i, ul, st in map(_fields, edit.runs)],
                 fonts, size, left, first_y, width, alignment=align,
                 leading=leading, line_spacing=spacing,
             )
             uls: list = []
+            sts: list = []
             for ln in result.lines:
                 for seg in ln.segments:
                     PDFDocument._insert_run(
@@ -9242,7 +10251,11 @@ class PDFDocument:
                     if seg.style[2]:             # underline flag in the style key
                         w = fonts[seg.style].text_length(seg.text, fontsize=size)
                         uls.append(((seg.x, ln.origin[1]), w, (1.0, 0.0)))
+                    if seg.style[3]:             # strike flag in the style key
+                        w = fonts[seg.style].text_length(seg.text, fontsize=size)
+                        sts.append(((seg.x, ln.origin[1]), w, (1.0, 0.0)))
             PDFDocument._stroke_underlines(shape, uls, size, color)
+            PDFDocument._stroke_strikes(shape, sts, size, color)
             return
 
         font = engine.fitz_font_for(rf)
@@ -9329,7 +10342,7 @@ class PDFDocument:
             return cur.origin
         if isinstance(box, ExistingImage):
             return box.origin       # frozen file truth (moves are macros)
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None:
             return box.origin
         if getattr(box, "is_paragraph", False) or not box.is_horizontal:
@@ -9362,7 +10375,7 @@ class PDFDocument:
             return cur.rect
         if isinstance(box, ExistingImage):
             return box.rect         # frozen file truth (moves are macros)
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None or edit.is_noop:
             return box.bbox
         # A reflowing box (a ParagraphBox, OR any box the user RESIZED so box_w
@@ -9440,7 +10453,7 @@ class PDFDocument:
         # overflow cleanly instead of raising AttributeError for the UI to swallow.
         if isinstance(box, NewBox):
             return 0.0
-        edit = self._edits.get((page, box.key))
+        edit = self._edits.get(self._span_edit_key(page, box))
         if edit is None or edit.is_noop:
             return 0.0
         result = self._wrap_for_edit_cached(page, box, edit)
@@ -9503,6 +10516,7 @@ class PDFDocument:
         if not needs_edit_pipeline:
             out = fitz.open("pdf", self.working.tobytes())
             try:
+                self._apply_form_authoring(out, only_page=page_index)
                 self._apply_form_values(out, only_page=page_index)
                 return out[page_index].get_pixmap(
                     matrix=fitz.Matrix(zoom, zoom), alpha=False
@@ -9518,6 +10532,8 @@ class PDFDocument:
         try:
             # Staged form values land on the same fresh copy BEFORE the edit
             # pipeline (forms §2; probe-proven order-safe against redactions).
+            # Authored fields realize first so an in-session fill has a widget.
+            self._apply_form_authoring(out, only_page=page_index)
             self._apply_form_values(out, only_page=page_index)
             # The persistent engine (see save_as): a fresh FontEngine(out) here
             # cost ~5-7 ms of cold resolve + extract_font per edit per FRAME;
@@ -9722,6 +10738,7 @@ class PDFDocument:
         page_index: int,
         edited_keys: set[tuple],
         redact_rects: list["fitz.Rect"],
+        redact_dirs: list[tuple] | None = None,
     ) -> list[dict]:
         """Memoized ``_overlapping_neighbors`` for the instance bake pipeline
         (perf foundation M1b). Sound because the walk runs BEFORE this page's
@@ -9736,12 +10753,13 @@ class PDFDocument:
             page_index,
             frozenset(edited_keys),
             tuple(tuple(r) for r in redact_rects),
+            tuple(redact_dirs) if redact_dirs is not None else None,
         )
         hit = self._neighbors_cache.get(key)
         if hit is not None:
             return hit
         result = self._overlapping_neighbors(
-            out, page_index, edited_keys, redact_rects
+            out, page_index, edited_keys, redact_rects, redact_dirs
         )
         # FIFO cap: dicts iterate in insertion order, so evict the oldest. The
         # working set is tiny (the pages currently being re-rendered).
@@ -9756,6 +10774,7 @@ class PDFDocument:
         page_index: int,
         edited_keys: set[tuple],
         redact_rects: list["fitz.Rect"],
+        redact_dirs: list[tuple] | None = None,
     ) -> list[dict]:
         """Unedited spans on ``page_index`` whose ink overlaps a redaction rect.
 
@@ -9765,6 +10784,16 @@ class PDFDocument:
         after redaction so the rect does not silently truncate them. The overlap
         must be a real area intersection (more than a hairline touch) so spans
         that merely abut an edited rect are not needlessly redrawn.
+
+        ``redact_dirs`` (parallel to ``redact_rects``) carries each covering
+        rect's SOURCE-span writing direction. A neighbor mostly inside a rect is
+        normally dropped as residue (a duplicate of the box being removed), but
+        a rotated watermark's axis-aligned bbox blankets every horizontal body
+        line -- so a same->different direction overlap is never a same-box
+        duplicate (mirror of ``_merge_overlapping``'s direction gate). When a
+        neighbor's direction differs from EVERY covering rect's direction, it is
+        redrawn regardless of the overlap fraction. Absent ``redact_dirs`` the
+        old fraction-only behaviour is preserved.
         """
         page = out[page_index]
         raw = page.get_text("rawdict")
@@ -9792,13 +10821,29 @@ class PDFDocument:
                     # the residue bug). A span only edge-clipped (small fraction)
                     # is a distinct neighbor to redraw.
                     inside = 0.0
-                    for rect in redact_rects:
+                    cover_dirs: list[tuple] = []
+                    for ri, rect in enumerate(redact_rects):
                         inter = sbbox & rect
                         if not inter.is_empty:
                             inside += inter.get_area()
+                            if redact_dirs is not None:
+                                cover_dirs.append(redact_dirs[ri])
                     frac = min(inside / sarea, 1.0)
-                    if frac < 0.02 or frac >= 0.5:
+                    if frac < 0.02:
                         continue
+                    if frac >= 0.5:
+                        # >=50% inside = residue of the removed box ONLY when the
+                        # neighbor shares a covering rect's writing direction. A
+                        # cross-direction overlap (e.g. a diagonal watermark's
+                        # bbox blanketing this body line) is never a same-box
+                        # duplicate -- redraw it instead of erasing it.
+                        same_dir = any(
+                            abs(line_dir[0] - d[0]) <= 1e-3
+                            and abs(line_dir[1] - d[1]) <= 1e-3
+                            for d in cover_dirs
+                        )
+                        if same_dir or not cover_dirs:
+                            continue
                     neighbors.append({
                         "text": text,
                         "origin": tuple(span["origin"]),
@@ -9882,6 +10927,24 @@ class PDFDocument:
         shape.finish(color=color, width=max(0.4, 0.055 * size))
 
     @staticmethod
+    def _stroke_strikes(shape: "fitz.Shape", segs: list, size: float,
+                        color: tuple) -> None:
+        """Stroke a strikethrough THROUGH each run in ``segs`` = [(baseline_origin,
+        width, direction), ...] on the page's batch ``shape``. Twin of
+        ``_stroke_underlines`` but the line sits ~0.3*size ABOVE the baseline
+        (through the glyph body near x-height/2, at ``baseline_y - 0.3*size``),
+        PERPENDICULAR to the writing direction, thickness ~0.055*size. One
+        ``finish`` per call. No-op on an empty list."""
+        if not segs:
+            return
+        off = -0.3 * size                       # up-perpendicular (PDF y-down)
+        for (ox, oy), w, (dx, dy) in segs:
+            px, py = -dy * off, dx * off
+            shape.draw_line(fitz.Point(ox + px, oy + py),
+                            fitz.Point(ox + w * dx + px, oy + w * dy + py))
+        shape.finish(color=color, width=max(0.4, 0.055 * size))
+
+    @staticmethod
     def _face_name(prefix: str, buffer: bytes) -> str:
         """A registration name UNIQUE to a concrete face buffer.
 
@@ -9957,7 +11020,8 @@ class PDFDocument:
                   annots_map: dict | None = None,
                   overrides_map: dict | None = None,
                   images_map: dict | None = None,
-                  xim_map: dict | None = None) -> None:
+                  xim_map: dict | None = None,
+                  owner: "PDFDocument | None" = None) -> None:
         """Realize the staged edits in ``edits_map`` / ``newbox_map`` (and the
         staged annotations / overrides, annotations & markup §3.5, and the
         placed images + existing-image deletions, images & signatures §2.4)
@@ -10000,7 +11064,7 @@ class PDFDocument:
             PDFDocument._apply_page_edits_for(target, engine, pi, edits,
                                               newbox_map, annots_map,
                                               overrides_map, images_map,
-                                              xim_map)
+                                              xim_map, owner=owner)
 
     @staticmethod
     def _apply_page_edits_for(target: "fitz.Document", engine: "FontEngine",
@@ -10009,12 +11073,21 @@ class PDFDocument:
                               annots_map: dict | None = None,
                               overrides_map: dict | None = None,
                               images_map: dict | None = None,
-                              xim_map: dict | None = None) -> None:
+                              xim_map: dict | None = None,
+                              owner: "PDFDocument | None" = None) -> None:
         """``_apply_page_edits`` for ARBITRARY newbox/annot/image maps (used
         when baking a foreign doc whose staged state lives in the passed maps,
         not ``self``). The body mirrors ``_apply_page_edits`` exactly but
         draws the foreign maps' state for ``page_index`` instead of
-        ``self``'s -- keep BOTH in lockstep (the screen == save invariant)."""
+        ``self``'s -- keep BOTH in lockstep (the screen == save invariant).
+
+        ``owner`` is the PDFDocument whose ``_restore_line_in_cover`` (table-rule
+        redraw) applies to ``target``. Only ``_bake_pending_edits`` passes it
+        (its target IS ``self.working`` with aligned page indices), so a moved
+        OCR box that crossed a table rule bakes the rule back on structural ops
+        too. merge/split/extract leave it ``None`` -- their throwaway target's
+        indices don't align, so the surgical redraw would land on the wrong
+        page (behavior unchanged for them)."""
         page = target[page_index]
         # Existing-image deletions FIRST, mirroring ``_apply_page_edits``
         # exactly (images & signatures §2.4(1), M3).
@@ -10025,8 +11098,10 @@ class PDFDocument:
         edited_keys = {e.span.key for e in edits}
         redact_rects = [fitz.Rect(bb) for e in edits
                         for bb in e.span.redact_rects]
+        redact_dirs = [tuple(e.span.dir) for e in edits
+                       for _ in e.span.redact_rects]
         neighbors = PDFDocument._overlapping_neighbors(
-            target, page_index, edited_keys, redact_rects)
+            target, page_index, edited_keys, redact_rects, redact_dirs)
         for rect in redact_rects:
             page.add_redact_annot(rect)
         if redact_rects:
@@ -10064,12 +11139,21 @@ class PDFDocument:
                 if not covers:
                     page.draw_rect(fitz.Rect(x0, y0, x1, y1),
                                    color=(r, g, b), fill=(r, g, b), width=0)
+                    # Redraw the rule segment(s) the vacated box sat on, clipped
+                    # to the cover -- lockstep with _apply_page_edits. Only when
+                    # owner's page indices align with target (see docstring).
+                    if owner is not None:
+                        owner._restore_line_in_cover(
+                            page, (x0, y0, x1, y1), page_index)
                 # 0.3.0: blended raster for an edited scanned word / paragraph
                 # tile (see _apply_page_edits; keep both seams in lockstep).
                 if box.edit_image and box.edit_image_rect:
                     page.insert_image(fitz.Rect(box.edit_image_rect),
                                       stream=box.edit_image, keep_proportion=False,
                                       rotate=page.rotation)
+                    if owner is not None:
+                        owner._restore_line_in_cover(
+                            page, tuple(box.edit_image_rect), page_index)
                     continue
             if box.is_paragraph and box.render_mode == 3:
                 continue                # invisible paragraph overlay: scan shows
@@ -10110,12 +11194,17 @@ class PDFDocument:
         Qt. Box ids keep counting up so a later add stays unambiguous."""
         if not self._edits and not self._new_boxes and not self._images \
                 and not self._xim_deletes and not self._annots \
-                and not self._annot_overrides and not self._form_edits:
+                and not self._annot_overrides and not self._form_edits \
+                and not self._form_authoring:
             return
-        # Staged form fills bake FIRST, before the QGuiApplication guard
-        # (forms §2): ``_apply_form_values`` is pure MuPDF, so a form-only
-        # bake stays headless. Structural ops therefore bake fills into
-        # ``working`` exactly like text edits.
+        # Authored fields + staged fills bake FIRST, before the QGuiApplication
+        # guard (forms §2): both are pure MuPDF, so a form-only bake stays
+        # headless. Authoring realizes the widgets BEFORE the fills so an
+        # authored-and-filled field gets its value; then both maps clear (their
+        # _AnnotCommand entries drop off the history below like annots do).
+        if self._form_authoring:
+            self._apply_form_authoring(self.working)
+            self._form_authoring.clear()
         if self._form_edits:
             self._apply_form_values(self.working)
             self._form_edits.clear()
@@ -10134,7 +11223,7 @@ class PDFDocument:
             )
         self._bake_doc(self.working, self._edits, self._new_boxes,
                        self._annots, self._annot_overrides, self._images,
-                       self._xim_deletes)
+                       self._xim_deletes, owner=self)
         self._edits.clear()
         self._new_boxes.clear()
         # Baked images are now real ink in ``working`` (and staged
@@ -10169,6 +11258,7 @@ class PDFDocument:
         self._words_cache.clear()
         self._annot_records_cache.clear()
         self._form_fields_cache.clear()
+        self._snap_boxes_cache.clear()
         self._xim_cache.clear()
         # Border map is keyed to the scan render; a structural op can change page
         # geometry, so drop it (re-detected lazily on next move/bake).
@@ -10707,3 +11797,69 @@ class PDFDocument:
         saves target the new file. The window reloads the doc from ``path``
         afterward (which rebuilds spans/xrefs against the saved output)."""
         self.path = path
+
+
+# ponytail: one runnable check for three-mode field authoring -- flip + bake +
+# undo, Qt-free. Verifies is_form_pdf goes 0->2 on staged widgets and back to 0
+# on undo, and that add_widget widgets survive tobytes(). Bakes the SAME seam
+# order _baked_copy uses (authoring BEFORE fills) directly, since _baked_copy's
+# font resolver needs Qt and this asserts only the form logic this file owns.
+def demo() -> None:
+    import os
+    import tempfile
+
+    blank = fitz.open()
+    blank.new_page(width=612, height=792)
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    blank.save(path)
+    blank.close()
+
+    doc = PDFDocument(path)
+    try:
+        assert not doc.has_form, "blank doc should carry no form"
+        doc.add_form_field(0, (72, 72, 272, 96), "text", "full_name")
+        doc.add_form_field(0, (72, 120, 92, 140), "checkbox", "agree")
+        assert doc.has_form, "authored fields must flip has_form true"
+
+        authored = [f for f in doc.form_fields(0) if f.xref < 0]
+        assert len(authored) == 2, f"want 2 authored fields, got {len(authored)}"
+        assert {f.name for f in authored} == {"full_name", "agree"}
+        assert {f.xref for f in authored} == {-1, -2}, "synthetic negative xrefs"
+
+        try:
+            doc.add_form_field(0, (0, 0, 10, 10), "text", "full_name")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("duplicate /T must be rejected")
+
+        out = fitz.open("pdf", doc.working.tobytes())
+        try:
+            doc._apply_form_authoring(out)   # BEFORE fills, as every bake seam
+            doc._apply_form_values(out)
+            assert out.is_form_pdf == 2, \
+                f"baked is_form_pdf={out.is_form_pdf}, want 2"
+            data = out.tobytes()
+            assert data, "baked copy produced no bytes"
+            reopened = fitz.open("pdf", data)
+            try:
+                assert reopened.is_form_pdf == 2, \
+                    "authored widgets did not survive tobytes()"
+            finally:
+                reopened.close()
+        finally:
+            out.close()
+
+        doc.undo()
+        doc.undo()
+        assert not doc.has_form, "undo x2 must clear authored fields"
+        assert not doc.form_fields(0), "no authored fields should remain"
+    finally:
+        doc.close()
+        os.unlink(path)
+    print("document.py three-mode authoring self-check OK")
+
+
+if __name__ == "__main__":
+    demo()

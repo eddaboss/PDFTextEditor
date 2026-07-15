@@ -359,7 +359,7 @@ def test_size_scale_roundtrip(failures):
     es2 = doc.effective_style(0, box)
     check(failures, tag, abs(es2["size"] - 41.0) < 0.01,
           f"set_style(41) after resize -> effective size {es2['size']} (want 41)")
-    edit = doc._edits[(0, box.key)]
+    edit = doc._edits[doc._span_edit_key(0, box)]
     check(failures, tag, abs(doc._effective_size(box, edit) - 41.0) < 0.01,
           f"_effective_size {doc._effective_size(box, edit)} != 41 after resize+set")
 

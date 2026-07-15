@@ -140,8 +140,12 @@ def _update_check_due() -> bool:
 
 def main() -> int:
     # Fresh action debug log for this session (see debuglog.py): every significant
-    # action appends to /tmp/pdfte_debug.log so a bug can be read straight off the trace.
-    from . import debuglog
+    # action appends to /tmp/pdfte_debug.log so a bug can be read straight off the
+    # trace. DEV builds only -- the trace can carry truncated document text, which
+    # must never be written to disk in a stable (potentially PHI-handling) build.
+    # An explicit PDFTE_DEBUG_LOG path re-enables it anywhere (opt-in support).
+    from . import appconfig, debuglog
+    debuglog.set_enabled(appconfig.IS_DEV or bool(os.environ.get("PDFTE_DEBUG_LOG")))
     debuglog.new_session()
     # Must run before any window renders text so Core Graphics picks it up.
     _disable_macos_font_smoothing()
