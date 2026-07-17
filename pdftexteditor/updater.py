@@ -163,13 +163,52 @@ def _install_and_relaunch(src_dir, dst_dir, **kwargs) -> None:
         subprocess.Popen(["/bin/sh", "-c", 'sleep 5; /bin/rm -rf "$1"',
                           "sh", str(backup)])
     else:
-        # Windows: the running exe is locked, so tufup defers the swap to a script
-        # that waits for THIS process to exit before replacing files and
-        # relaunching. Its own sys.exit only kills our worker thread, hence the
-        # os._exit below that actually lets that script proceed.
+        # Windows: the running exe + _internal\*.dll are LOCKED, so the swap is
+        # deferred to a batch script that runs after we exit. tufup's DEFAULT
+        # script is broken for us twice over: it NEVER relaunches the app (so the
+        # updater just made the app vanish), and it fires robocopy in the same
+        # instant we os._exit, racing the file lock -- robocopy then can't
+        # overwrite the still-locked exe, so nothing lands in the install dir and
+        # the new build is stranded in the temp extract dir. We reuse tufup's
+        # launcher (it writes the .bat, opens it in a new console, and exits) but
+        # feed it our own template that (1) waits for THIS pid to exit, (2)
+        # robocopies with a log in the install dir, then (3) relaunches the app.
         from tufup.utils.platform_specific import install_update
+        exe = str(Path(sys.executable).resolve())
+        batch = (
+            "@echo off\n"
+            'set "LOG={dst_dir}\\update_install.log"\n'
+            'echo [tufup] waiting for pid {pid} to exit> "%LOG%"\n'
+            "set /a tries=0\n"
+            ":waitloop\n"
+            # `find` exits 1 once the pid is gone -> stop waiting. Cap the wait at
+            # ~3 min so a recycled pid landing on a long-lived process can't hang
+            # the relaunch forever; after the cap we proceed and let robocopy's
+            # own /r:5 retry handle a still-locked file.
+            'tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul || goto afterwait\n'
+            "set /a tries+=1\n"
+            "if %tries% geq 180 goto afterwait\n"
+            "timeout /t 1 /nobreak >nul\n"
+            "goto waitloop\n"
+            ":afterwait\n"
+            'echo [tufup] copying update files>> "%LOG%"\n'
+            # The SPACE before >> is required: robocopy_options ends in a digit
+            # (/w:2) and cmd.exe parses "2>>" as a stream-handle redirect, which
+            # mangles the command so nothing gets copied.
+            'robocopy "{src_dir}" "{dst_dir}" {robocopy_options} >> "%LOG%" 2>&1\n'
+            'echo [tufup] relaunching>> "%LOG%"\n'
+            'start "" "{exe}"\n'
+            "{delete_self}\n"
+        )
         try:
-            install_update(src_dir=src_dir, dst_dir=dst_dir, **kwargs)
+            install_update(
+                src_dir=src_dir, dst_dir=dst_dir,
+                batch_template=batch,
+                batch_template_extra_kwargs={"pid": os.getpid(), "exe": exe},
+                # /e copy tree (no /move: leave the extract dir intact so a failed
+                # run can retry); cap retries so a stuck lock can't hang forever.
+                robocopy_options_override=["/e", "/r:5", "/w:2"],
+            )
         except SystemExit:
             pass
     os._exit(0)
