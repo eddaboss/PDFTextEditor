@@ -7,7 +7,8 @@ rule that keeps the suites free of un-dismissable ``exec()`` modals.
 This module holds the M1 pair (Properties, Export Images), the M2 stamps pair
 (Watermark, Header & Footer), the M3 crop confirm step (Crop), and the M4
 security sheet (Security). Optimize deliberately has NO dialog (fixed flags,
-§2.8) and Print uses the native QPrintDialog.
+§2.8) and Print uses the native QPrintDialog on macOS, QPrintPreviewDialog on
+Windows (which has no native print-preview pane).
 """
 
 from __future__ import annotations

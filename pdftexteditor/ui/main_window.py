@@ -145,6 +145,11 @@ ZOOM_MIN = 0.25
 ZOOM_MAX = 6.0
 # Preset percentages for the zoom menu.
 ZOOM_PRESETS = (0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 4.00)
+# Dropdown caret in the zoom value's TEXT (hair space + a solid down triangle,
+# matching the original menu-indicator style): hugs the number and sits at mid
+# height, unlike U+2304 which drops to the baseline. The native indicator is
+# hidden in QSS so it can't double up or pull the value off-centre.
+_ZOOM_CARET = " ▾"
 
 
 def make_icon(name: str, color: str = theme.TOOLBAR_ICON) -> QIcon:
@@ -2163,6 +2168,7 @@ class MainWindow(QMainWindow):
         # Settings (Preferences on macOS). PreferencesRole migrates it to the
         # app menu on the native Mac menubar (Cmd+,); on Windows it shows in Help.
         self._settings_dialog = None
+        self._print_view = None
         self.act_preferences = mk("Settings…", QKeySequence("Ctrl+,"),
                                   self._show_settings)
         self.act_preferences.setMenuRole(QAction.MenuRole.PreferencesRole)
@@ -2411,7 +2417,8 @@ class MainWindow(QMainWindow):
         # join the File menu at the file_output anchor; Security joins the
         # Document menu at doc_file.
         self.act_print = mk(
-            "Print…", QKeySequence("Ctrl+P"), lambda: self._do_print())
+            "Print…", QKeySequence("Ctrl+P"), lambda: self._do_print(),
+            icon="printer")
         self.act_optimize = mk(
             "Save Optimized Copy…", None, lambda: self._do_optimize())
         self.act_security = mk(
@@ -2863,7 +2870,7 @@ class MainWindow(QMainWindow):
         # Fit Page / Fit Width / Actual Size + presets. (It used to just jump to
         # 100%, which hid the whole selector and Fit Page; the menu restores them.)
         self.zoom_button = QToolButton()
-        self.zoom_button.setText("100%")
+        self.zoom_button.setText("100%" + _ZOOM_CARET)
         self.zoom_button.setObjectName("ZoomButton")
         self.zoom_button.setToolTip("Zoom level")
         self.zoom_button.setCursor(Qt.PointingHandCursor)
@@ -2890,6 +2897,10 @@ class MainWindow(QMainWindow):
         rl.addWidget(zoombar)
         # Only the zoom bar hides in the empty state.
         self._zoom_group_actions: list[QAction] = [zoombar]
+
+        # Print: opens the in-app Clay print view (also on Cmd+P).
+        self.print_button = _global_btn(self.act_print, "Print")
+        rl.addWidget(self.print_button)
 
         # Share: reveal the saved file in Finder / Explorer (cross-platform).
         self.act_share = QAction("Reveal in Finder", self)
@@ -7514,99 +7525,196 @@ class MainWindow(QMainWindow):
             f"{doctools.human_size(after)} ({pct:+d}%)", 5000)
 
     def _do_print(self, printer: "QPrinter | None" = None) -> None:
-        """File > Print… (Cmd+P, ws6 §2.9). Dialog-seam rule: the native
-        QPrintDialog only opens when ``printer`` is None; tests inject a
-        PdfFormat QPrinter. Every page renders through ``render_with_edits``
-        -- the save pipeline -- so the print matches the saved file by
-        construction. Non-mutating, no undo."""
+        """File > Print… (Cmd+P, ws6 §2.9). Opens the Clay print view as an in-app
+        PAGE (swapped into the content stack, NOT a separate window): a live
+        preview plus a Destination / Pages / Copies / Color settings panel that
+        prints directly, with a "Use system dialog" button for the native OS
+        dialog. Seam rule: the view only opens when ``printer`` is None; tests
+        inject a PdfFormat QPrinter and render straight through. Every page renders
+        through ``render_with_edits`` -- the save pipeline -- so the print matches
+        the saved file. Non-mutating, no undo."""
         doc = self.document
         if doc is None:
             return
+        # Commit any open inline editor so its text is part of the bake -- and so
+        # the preview reflects it.
+        self._flush_open_editor()
         if printer is None:
             printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-            # Open the dialog ALREADY in the document's own orientation, so a
-            # landscape PDF shows Landscape pre-selected and the user no longer
-            # flips it for every file. A tiny page-1 probe render is
-            # rotation-aware (a /Rotate 90 page comes back wide), matching the
-            # per-page orientation the print loop uses.
+            # Open in the document's own orientation. A tiny page-1 probe render
+            # is rotation-aware (a /Rotate 90 page comes back wide).
             try:
                 probe = doc.render_with_edits(0, 0.25)
                 printer.setPageOrientation(
                     QPageLayout.Orientation.Landscape
                     if probe.width > probe.height
                     else QPageLayout.Orientation.Portrait)
-            except Exception:  # noqa: BLE001 - never block the dialog on a probe
+            except Exception:  # noqa: BLE001 - never block the view on a probe
                 pass
+            self._open_print_view(printer, doc)
+            return
+        # Injected printer (tests): render straight through, then report -- the
+        # "Sent N pages" toast is part of this seam's contract.
+        n = self._paint_pages(printer)
+        if n:
+            self._toast(
+                f"Sent {n} page{'s' if n != 1 else ''} to the printer", 4000)
+
+    def _open_print_view(self, printer: "QPrinter", doc) -> None:
+        """Show the Clay print view as a FULL-WINDOW overlay -- above the left
+        Format dock, the Pages dock, the toolbar and the status bar -- so it's a
+        focused in-app print page, not a separate window."""
+        from .print_preview import ClayPrintPreview
+
+        # Re-opening Print (e.g. Cmd+P again while the overlay is up) must not
+        # stack a second overlay and orphan the first -- tear any live one down.
+        self._close_print_view()
+
+        def _sent_toast(n: int) -> None:
+            if n:
+                self._toast(
+                    f"Sent {n} page{'s' if n != 1 else ''} to the printer", 4000)
+
+        def do_print() -> None:
+            # Read the view's selections BEFORE tearing it down.
+            pages, gray = view.selected_pages, view.grayscale
+            orient, scale, nup = view.orientation, view.scale_mode, view.nup
+            self._close_print_view()
+            _sent_toast(self._paint_pages(
+                printer, pages=pages, grayscale=gray, orientation=orient,
+                scale_mode=scale, nup=nup))
+
+        def do_system() -> None:
+            # Hand off to the native OS print dialog (advanced options / preview).
+            self._close_print_view()
             dlg = QPrintDialog(printer, self)
             dlg.setMinMax(1, doc.page_count)
-            if dlg.exec() != QDialog.Accepted:
-                return
-        # Commit any open inline editor so its text is part of the bake.
-        self._flush_open_editor()
-        # The dialog's selected range (fromPage/toPage are 1-based; 0 = all).
-        first, last = printer.fromPage(), printer.toPage()
-        if first <= 0:
-            first, last = 1, doc.page_count
-        last = min(doc.page_count, last if last > 0 else doc.page_count)
-        if last < first:
-            return
-        # Render at the printer's resolution, capped at 600 dpi: a 1200 dpi
-        # HighResolution device would mean ~5100px-wide page buffers for no
-        # visible gain (probe-verified the cap renders cleanly).
+            if dlg.exec() == QDialog.Accepted:
+                _sent_toast(self._paint_pages(printer))
+
+        view = ClayPrintPreview(
+            printer, doc, subtitle=self._print_subtitle(doc),
+            on_print=do_print, on_cancel=self._close_print_view,
+            on_system=do_system, parent=self)
+        self._print_view = view
+        view.setGeometry(self.rect())   # cover the ENTIRE window
+        view.raise_()
+        view.show()
+        view.setFocus()
+
+    def _close_print_view(self) -> None:
+        """Tear down the print overlay and return to the editor."""
+        if self._print_view is not None:
+            self._print_view.hide()
+            self._print_view.deleteLater()
+            self._print_view = None
+
+    def _print_subtitle(self, doc) -> str:
+        """Header line for the Clay preview: filename (if saved) + page count."""
+        n = doc.page_count
+        pages = f"{n} page{'s' if n != 1 else ''}"
+        path = getattr(doc, "path", None)
+        return f"{os.path.basename(path)} · {pages}" if path else pages
+
+    def _paint_pages(self, printer: "QPrinter", pages=None,
+                     grayscale: bool = False, orientation=None,
+                     scale_mode: str = "fit", nup: int = 1) -> int:
+        """Render the selected pages onto ``printer`` through the save pipeline;
+        return the number of document pages painted (0 on nothing/failure).
+
+        ``pages``      explicit 0-based indices; None -> printer fromPage/toPage.
+        ``grayscale``  convert each page to greyscale (honoured on every platform,
+                       unlike QPrinter.setColorMode which is a no-op on macOS).
+        ``orientation``force a QPageLayout.Orientation; None = auto per sheet.
+        ``scale_mode`` "fit" (fill the printable area) or "actual" (1:1 size,
+                       clipped) -- ignored for N-up.
+        ``nup``        document pages per physical sheet (1/2/4/6/9), in a grid.
+        Shared by the print view and the injected-printer test seam."""
+        doc = self.document
+        if doc is None:
+            return 0
+        if pages is None:
+            # The dialog's selected range (fromPage/toPage are 1-based; 0 = all).
+            first, last = printer.fromPage(), printer.toPage()
+            if first <= 0:
+                first, last = 1, doc.page_count
+            last = min(doc.page_count, last if last > 0 else doc.page_count)
+            if last < first:
+                return 0
+            pages = list(range(first - 1, last))
+        pages = [p for p in pages if 0 <= p < doc.page_count]
+        if not pages:
+            return 0
+
+        _Orient = QPageLayout.Orientation
+        # Render at the printer's resolution, capped at 600 dpi (a 1200 dpi device
+        # would mean ~5100px page buffers for no visible gain).
         zoom = min(printer.resolution(), 600) / 72.0
-        pages = list(range(first - 1, last))
+        # "actual size" maps image px 1:1 to device px; we rendered at the capped
+        # resolution, so scale up when the device is finer than the cap.
+        actual_scale = printer.resolution() / min(printer.resolution(), 600)
+        rows, cols = {1: (1, 1), 2: (1, 2), 4: (2, 2),
+                      6: (2, 3), 9: (3, 3)}.get(nup, (1, 1))
+        sheets = [pages[k:k + nup] for k in range(0, len(pages), nup)]
 
-        def _orientation_for(pix) -> "QPageLayout.Orientation":
-            # The rendered pixmap is rotation-aware (a /Rotate 90 page comes
-            # back wide), so its own aspect is the source of truth.
-            return (QPageLayout.Orientation.Landscape if pix.width > pix.height
-                    else QPageLayout.Orientation.Portrait)
+        def _render(i):
+            pix = doc.render_with_edits(i, zoom)
+            # .copy() detaches from pix.samples so the buffer may die.
+            img = QImage(bytes(pix.samples), pix.width, pix.height,
+                         pix.stride, QImage.Format.Format_RGB888).copy()
+            if grayscale:
+                img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+            return img
 
-        # AUTO-ORIENT: match the printer to the page's real shape so a landscape
-        # certificate prints landscape WITHOUT the user hand-picking it (and so
-        # a manual choice is not silently overridden by a portrait default that
-        # then shrinks the wide page). Orientation MUST be set before
-        # painter.begin for the first page; it is re-set per page before each
-        # newPage so a mixed-orientation document prints each page correctly.
-        # Rendering every page can take a while; show the wait cursor (restored
-        # on every exit path below, including the painter-begin failure).
+        def _sheet_orient(imgs):
+            # AUTO-ORIENT (None): a 1-up sheet follows its page's real shape (a
+            # /Rotate 90 page renders wide); an N-up sheet follows its grid.
+            if orientation is not None:
+                return orientation
+            if nup == 1:
+                im = imgs[0]
+                return _Orient.Landscape if im.width() > im.height() else _Orient.Portrait
+            return _Orient.Landscape if cols > rows else _Orient.Portrait
+
+        # Rendering every page can take a while; show the wait cursor (restored on
+        # every exit path). Orientation MUST be set before painter.begin.
         QGuiApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
-        first_pix = doc.render_with_edits(pages[0], zoom)
-        printer.setPageOrientation(_orientation_for(first_pix))
+        first_imgs = [_render(p) for p in sheets[0]]
+        printer.setPageOrientation(_sheet_orient(first_imgs))
 
         painter = QPainter()
         if not painter.begin(printer):
             QGuiApplication.restoreOverrideCursor()
             self._flash_error("Could not start the print job.")
-            return
+            return 0
         try:
-            for k, i in enumerate(pages):
-                pix = first_pix if k == 0 else doc.render_with_edits(i, zoom)
-                if k:
-                    printer.setPageOrientation(_orientation_for(pix))
+            for si, sheet in enumerate(sheets):
+                imgs = first_imgs if si == 0 else [_render(p) for p in sheet]
+                if si:
+                    printer.setPageOrientation(_sheet_orient(imgs))
                     printer.newPage()
-                # .copy() detaches from pix.samples so the buffer may die.
-                img = QImage(bytes(pix.samples), pix.width, pix.height,
-                             pix.stride, QImage.Format.Format_RGB888).copy()
-                # Scale into the printable area preserving aspect, centered;
-                # painter coords originate at the page rect's top-left.
+                # Painter origin is the printable area's top-left.
                 area = printer.pageRect(QPrinter.Unit.DevicePixel)
-                scale = min(area.width() / img.width(),
-                            area.height() / img.height())
-                w = img.width() * scale
-                h = img.height() * scale
-                painter.drawImage(
-                    QRectF((area.width() - w) / 2.0,
-                           (area.height() - h) / 2.0, w, h), img)
+                cw, ch = area.width() / cols, area.height() / rows
+                pad = 0.03 * min(cw, ch) if nup > 1 else 0.0
+                for idx, img in enumerate(imgs):
+                    r, c = divmod(idx, cols)
+                    cx, cy = c * cw, r * ch
+                    aw, ah = cw - 2 * pad, ch - 2 * pad
+                    if nup == 1 and scale_mode == "actual":
+                        s = actual_scale
+                    else:
+                        s = min(aw / img.width(), ah / img.height())
+                    w, h = img.width() * s, img.height() * s
+                    painter.drawImage(
+                        QRectF(cx + (cw - w) / 2.0, cy + (ch - h) / 2.0, w, h), img)
         except Exception as exc:  # noqa: BLE001 - surface a render failure
             self._flash_error(f"Print failed: {exc}")
-            return
+            return 0
         finally:
             painter.end()
             QGuiApplication.restoreOverrideCursor()
-        n = last - first + 1
-        self._toast(
-            f"Sent {n} page{'s' if n != 1 else ''} to the printer", 4000)
+        return len(pages)
 
     # --- page-range parsing + small prompt -------------------------------
     @staticmethod
@@ -8031,7 +8139,7 @@ class MainWindow(QMainWindow):
                 self._zoom_in_btn.setEnabled(False)
             return
         z = self.view_zoom()
-        self.zoom_button.setText(f"{int(round(z * 100))}%")
+        self.zoom_button.setText(f"{int(round(z * 100))}%" + _ZOOM_CARET)
         # Disable a step button at the real engine limit, so - / + dim exactly
         # when zoom_out / zoom_in can no longer change the value (a tiny epsilon
         # absorbs float rounding from the *1.25 / /1.25 steps).
@@ -8162,6 +8270,8 @@ class MainWindow(QMainWindow):
         self._position_empty_state()
         self._apply_responsive_chrome()
         self._kick_persist()
+        if self._print_view is not None:      # keep the print overlay full-window
+            self._print_view.setGeometry(self.rect())
 
     def _pages_dock_should_show(self) -> bool:
         """The Pages sidebar shows only with a document open, the user's toggle

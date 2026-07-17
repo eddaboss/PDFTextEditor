@@ -561,12 +561,15 @@ def global_stylesheet() -> str:
     QFrame#ZoomBar QToolButton#ZoomStepBtn:disabled {{ color: {TEXT_TERTIARY}; }}
     QFrame#ZoomBar QToolButton#ZoomButton {{
         border: none; background: transparent;
-        min-width: 58px; padding: 0px 2px 0px 6px; color: {TEXT_PRIMARY};
+        /* The caret is part of the value TEXT (see _ZOOM_CARET), so "NN% v" is
+           one unit -- min-width slack centres the whole thing between - and +. */
+        min-width: 52px; padding: 0px 4px; color: {TEXT_PRIMARY};
     }}
-    /* Show a small dropdown caret so the % reads as the zoom selector. */
+    /* The dropdown caret lives in the button TEXT (see _ZOOM_CARET) so the whole
+       "NN% v" centres between the - and + steps; the native menu-indicator is
+       hidden because its asymmetric reserved space pulls the value off-centre. */
     QFrame#ZoomBar QToolButton#ZoomButton::menu-indicator {{
-        subcontrol-origin: padding; subcontrol-position: right center;
-        right: 3px; width: 8px; height: 8px;
+        image: none; width: 0px;
     }}
     QFrame#ZoomBar QToolButton#ZoomButton:hover {{
         background: {WASH_HOVER}; border-radius: {BUTTON_RADIUS}px;
